@@ -1,0 +1,77 @@
+name: batch-contract
+
+# Shared automated evidence for the v4 batch-runner contract.
+# The suite runs the public script CLIs in isolated temporary workspaces with
+# fake OpenFOAM commands. The job needs no OpenFOAM installation.
+
+on:
+  push:
+    paths:
+      - 'src/run_batch.sh'
+      - 'src/master_batch/setup_cases.sh'
+      - 'src/master_batch/run_mesh_cases.sh'
+      - 'src/master_batch/run_flow_cases.sh'
+      - 'src/master_batch/run_transport_cases.sh'
+      - 'src/master_batch/run_post_processing_cases.sh'
+      - 'tests/**'
+      - '.github/workflows/batch-contract.yml'
+  pull_request:
+    paths:
+      - 'src/run_batch.sh'
+      - 'src/master_batch/setup_cases.sh'
+      - 'src/master_batch/run_mesh_cases.sh'
+      - 'src/master_batch/run_flow_cases.sh'
+      - 'src/master_batch/run_transport_cases.sh'
+      - 'src/master_batch/run_post_processing_cases.sh'
+      - 'tests/**'
+      - '.github/workflows/batch-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  contract-tests:
+    name: v4 batch-runner contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Report the runner environment
+        run: |
+          set -euo pipefail
+          echo "Bash version : ${BASH_VERSION}"
+          echo "Commit       : ${GITHUB_SHA}"
+          if command -v checkMesh >/dev/null 2>&1; then
+            echo "OpenFOAM     : present in PATH"
+          else
+            echo "OpenFOAM     : absent (the contract tests use fake commands)"
+          fi
+
+      - name: Check the contract-test harness syntax
+        run: |
+          set -euo pipefail
+          while IFS= read -r script; do
+            bash -n "$script"
+            echo "syntax OK: $script"
+          done < <(find tests -type f -name '*.sh' | sort)
+
+      - name: Run the v4 contract tests
+        run: bash tests/run_contract_tests.sh
+
+      - name: Confirm that the working tree is unchanged
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "The contract suite changed the working tree:" >&2
+            git status --porcelain >&2
+            exit 1
+          fi
+          echo "The working tree is unchanged."
