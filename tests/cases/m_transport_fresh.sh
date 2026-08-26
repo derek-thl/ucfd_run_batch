@@ -76,6 +76,7 @@ mkdir -p "${flow_dir}/3000"
 printf 'flow-U\n' > "${flow_dir}/3000/U"   # no nut and no phi
 make_transport_case "$trd_dir" 2 T 300
 printf 'stale-nut\n' > "${trd_dir}/0/nut"
+printf 'stale-phi\n' > "${trd_dir}/0/phi"
 
 out="$(cd "$workspace" && FAKE_SOLVER_TIMES="60 120 300" \
         bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 \
@@ -83,7 +84,9 @@ out="$(cd "$workspace" && FAKE_SOLVER_TIMES="60 120 300" \
 
 assert_status 0 "$status" "transport must succeed without optional flow fields: $out"
 assert_file_missing "${trd_dir}/0/nut" \
-    "a stale optional field is removed when flow does not provide it"
+    "a stale nut is removed when flow does not provide nut (Section 17.6.11)"
+assert_file_missing "${trd_dir}/0/phi" \
+    "a stale phi is removed when flow does not provide phi (Section 17.6.11)"
 
 # ---- endTime must cover the largest requested save time ----------------------
 

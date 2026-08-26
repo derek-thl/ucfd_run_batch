@@ -5,6 +5,11 @@ CASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${CASE_DIR}/../lib/harness.sh"
 source "${CASE_DIR}/../lib/assert.sh"
 
+# Every scenario runs in its own new temporary workspace, including this
+# read-only scenario. The workspace also isolates any tool side effects.
+workspace="$(new_workspace syntax)"
+cd "$workspace"
+
 scripts=(
     "$RUN_BATCH"
     "$SETUP_SCRIPT"
