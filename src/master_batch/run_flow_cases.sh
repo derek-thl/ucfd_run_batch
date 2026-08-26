@@ -395,7 +395,11 @@ solve_current_case() {
     need_cmd decomposePar
     need_cmd mpirun
     need_cmd renumberMesh
-    need_cmd reconstructPar
+    # reconstructPar is required only when the selected reconstruction mode
+    # can execute it. RECONSTRUCT_MODE=none never calls reconstructPar, so the
+    # documented none mode must not depend on the disabled command. This
+    # matches the transport runner's conditional check.
+    [[ "$RECONSTRUCT_MODE" == "none" ]] || need_cmd reconstructPar
     need_cmd checkMesh
 
     # Detect fresh vs continue
