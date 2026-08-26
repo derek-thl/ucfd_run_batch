@@ -784,7 +784,12 @@ dispatch_row() {
     SEEN_CASES["$transport_name"]=1
 
     if [[ ! -d "$flow_dir" ]]; then
-        append_summary "$csv_abs" "$row_no" "$case_root" "${flow_name}|${transport_name}" "$transport_dir" "skipped" "flow case directory not found: $flow_dir"
+        # v4 Sections 17.4 and 23.P: a requested transport case without its
+        # required flow case is a failed case, not a skipped case. The failure
+        # artifact makes the stage exit non-zero.
+        append_summary "$csv_abs" "$row_no" "$case_root" "${flow_name}|${transport_name}" "$transport_dir" "failed" "flow case directory not found: $flow_dir"
+        mark_failed "$transport_name"
+        info "TRANSPORT FAILED: $transport_name | missing required flow case: $flow_dir"
         return 0
     fi
 

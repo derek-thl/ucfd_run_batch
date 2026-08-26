@@ -513,6 +513,10 @@ process_case() {
             "$case_dir" \
             "failed" \
             "case directory not found"
+
+        # v4 Sections 18.5 and 23.P: a missing requested case is a failed case.
+        # The failure artifact makes the stage exit non-zero.
+        echo "$case_id" >>"$FAIL_FILE"
         return 1
     fi
 
