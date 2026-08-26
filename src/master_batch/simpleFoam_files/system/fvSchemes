@@ -1,0 +1,72 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+ddtSchemes
+{
+    default         steadyState;
+}
+
+gradSchemes
+{
+    // Base scheme
+    default         Gauss linear;
+
+    // Limited gradients for transported fields
+    limited         cellLimited Gauss linear 1;
+
+    grad(U)         $limited;
+    grad(k)         $limited;
+    grad(omega)     $limited;
+    grad(epsilon)   $limited;    // harmless if epsilon not used
+}
+
+divSchemes
+{
+    default         none;
+
+    // Momentum: bounded 2nd-order, using grad(U) defined above
+    div(phi,U)      bounded Gauss linearUpwindV grad(U);
+
+    // Turbulence scalars: bounded 2nd-order; consistent with your BPG
+    div(phi,k)          bounded Gauss linearUpwind grad(k);
+    div(phi,omega)      bounded Gauss linearUpwind grad(omega);
+    div(phi,epsilon)    bounded Gauss linearUpwind grad(epsilon); // for k-ε runs
+
+    // Viscous term
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+
+laplacianSchemes
+{
+    default         Gauss linear corrected;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         corrected;
+}
+
+wallDist
+{
+    method          meshWave;
+}
+
+// ************************************************************************* //

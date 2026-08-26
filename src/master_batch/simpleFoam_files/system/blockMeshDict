@@ -1,0 +1,94 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+scale 1;
+
+// ---- Derived extents (all scalars) ---------------------------------------
+xMin        <xMin>;     // inlet
+xMax        <xMax>;     // outlet
+yMin        <yMin>;     // side -
+yMax        <yMax>;     // side +
+zMin        <zMin>;     // ground
+zMax        <zMax>;     // top
+
+// ---- Cell counts ----------------------------------------------------------
+nx    <nx>;
+ny    <ny>;
+nz    <nz>;
+
+// ---- Mesh -----------------------------------------------------------------
+vertices
+(
+    ($xMin $yMin $zMin)   // 0
+    ($xMax $yMin $zMin)   // 1
+    ($xMax $yMax $zMin)   // 2
+    ($xMin $yMax $zMin)   // 3
+
+    ($xMin $yMin $zMax)   // 4
+    ($xMax $yMin $zMax)   // 5
+    ($xMax $yMax $zMax)   // 6
+    ($xMin $yMax $zMax)   // 7
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) ($nx $ny $nz) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    inlet
+    {
+        type patch;              // x = xMin
+        faces ( (0 3 7 4) );
+    }
+
+    outlet
+    {
+        type patch;              // x = xMax
+        faces ( (1 5 6 2) );
+    }
+
+    sideMinusY
+    {
+        type symmetry;           // y = yMin (use slip/patch if preferred)
+        faces ( (0 4 5 1) );
+    }
+
+    sidePlusY
+    {
+        type symmetry;           // y = yMax
+        faces ( (3 2 6 7) );
+    }
+
+    ground
+    {
+        type wall;               // z = zMin
+        faces ( (0 1 2 3) );
+    }
+
+    top
+    {
+        type patch;               // z = zMax (symmetryPlane/slip common)
+        faces ( (4 7 6 5) );
+    }
+);
+
+mergePatchPairs();

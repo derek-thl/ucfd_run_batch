@@ -1,0 +1,991 @@
+#!/usr/bin/env bash
+
+# run_batch.sh v4 (2026-08-26)
+# Purpose: Run a UCFD batch pipeline based on parameters defined in CSV files.
+
+set -Eeuo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Backward-compatible environment overrides.
+MASTER_BATCH_DIR="${MASTER_BATCH_DIR:-${SCRIPT_DIR}/master_batch}"
+OUTPUT_ROOT="${RUN_BATCH_OUTPUT_DIR:-${SCRIPT_DIR}}"
+OVERWRITE="${RUN_BATCH_OVERWRITE:-0}"
+
+PARALLEL_JOBS=""
+SETUP_JOBS=""
+MESH_JOBS=""
+FLOW_JOBS=""
+TRANSPORT_JOBS=""
+POST_JOBS=""
+BATCH_JOBS=1
+KEEP_GOING=0
+SKIP_POST=0
+DRY_RUN=0
+SAVE_TIMES="60,120,300"
+SCALAR_FIELD="${SCALAR_FIELD:-T}"
+
+# Stage selection. With no --stage option, keep the v2 full-pipeline behavior.
+STAGE_SELECTION_EXPLICIT=0
+STAGE_TOKENS=()
+RUN_SETUP=0
+RUN_MESH=0
+RUN_FLOW=0
+RUN_TRANSPORT=0
+RUN_POST=0
+POST_REQUIRED=0
+
+INPUT_CSVS=()
+INPUT_CSVS_ABS=()
+BATCH_NUMBERS=()
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] %-5s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+}
+
+info() { log INFO "$@"; }
+warn() { log WARN "$@" >&2; }
+error() { log ERROR "$@" >&2; }
+die() { error "$*"; exit 1; }
+
+usage() {
+    cat <<EOF_USAGE
+Usage:
+  bash run_batch.sh [options] <batch_csv> [<batch_csv> ...]
+
+Default pipeline:
+  setup -> mesh -> flow -> transport -> post-processing
+
+Stage selection:
+  -s, --stage <STAGE>     Run only selected stage(s). May be repeated or comma-separated.
+                           Valid names: setup, mesh, flow, transport, post-processing, all
+                           Aliases for post-processing: post, postprocess, post_processing
+
+                           If setup is selected, batch_<id> is initialized from the master
+                           template before selected stages run.
+
+                           If setup is NOT selected, batch_<id> must already exist and is
+                           reused without being recreated or deleted.
+
+Options:
+  -j, --jobs <N>          Default parallel case count for selected stages.
+      --setup-jobs <N>    Override -j for setup only.
+      --mesh-jobs <N>     Override -j for mesh only.
+      --flow-jobs <N>     Override -j for flow only.
+      --transport-jobs <N> Override -j for transport only.
+      --post-jobs <N>     Override -j for post-processing only.
+  -B, --batch-jobs <N>    Number of whole batches allowed to run concurrently.
+                           Default: 1 (sequential batches).
+  -m, --master-dir <DIR>  Template directory used when setup is selected.
+                           Default: ${SCRIPT_DIR}/master_batch
+  -o, --output-dir <DIR>  Parent directory for batch_<id> directories.
+                           Default: ${SCRIPT_DIR}
+  -f, --overwrite         Replace an existing non-empty batch_<id> directory.
+                           Valid only when setup is selected.
+      --keep-going        Continue with other batches after a batch fails.
+      --skip-post         Skip post-processing in the default/all pipeline.
+      --save-times <LIST> Transport save times, comma-separated integers.
+                           Default: ${SAVE_TIMES}
+      --scalar-field <N>  Transport scalar field name shared by setup, transport, and post.
+                           Default: ${SCALAR_FIELD}
+  -n, --dry-run           Validate everything and print the execution plan only.
+  -h, --help              Show this help.
+
+Environment compatibility:
+  MASTER_BATCH_DIR        Same purpose as --master-dir.
+  RUN_BATCH_OUTPUT_DIR    Same purpose as --output-dir.
+  RUN_BATCH_OVERWRITE=1   Same purpose as --overwrite.
+
+Examples:
+  # Full pipeline (same default behavior as v2).
+  bash run_batch.sh -j 8 output_batch_3.csv
+
+  # Run setup only and initialize batch_3.
+  bash run_batch.sh --stage setup output_batch_3.csv
+
+  # Reuse existing batch_3 and run mesh only.
+  bash run_batch.sh --stage mesh -j 8 output_batch_3.csv
+
+  # Run flow then transport on existing batches.
+  bash run_batch.sh --stage flow,transport -j 8 \
+      output_batch_3.csv output_batch_4.csv
+
+  # Run post-processing only on an existing batch.
+  bash run_batch.sh --stage post-processing output_batch_3.csv
+
+  # Initialize a fresh batch and run only setup + mesh.
+  bash run_batch.sh --overwrite --stage setup,mesh -j 8 output_batch_3.csv
+
+  # Validate a transport-only continuation without running it.
+  bash run_batch.sh --dry-run --stage transport output_batch_3.csv
+EOF_USAGE
+}
+
+require_positive_integer() {
+    local value="$1"
+    local option="$2"
+
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) ||
+        die "$option must be an integer >= 1; got: $value"
+}
+
+canonicalize_existing_file() {
+    local path="$1"
+    local resolved
+
+    resolved="$(readlink -f -- "$path" 2>/dev/null || true)"
+    [[ -n "$resolved" && -f "$resolved" ]] || return 1
+    printf '%s\n' "$resolved"
+}
+
+canonicalize_path() {
+    realpath -m -- "$1"
+}
+
+extract_batch_number() {
+    local filename="$1"
+    local stem="${filename%.*}"
+
+    if [[ "$filename" =~ [Bb][Aa][Tt][Cc][Hh][_-]?([0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$stem" =~ ([0-9]+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+find_post_script_in_dir() {
+    local dir="$1"
+    local candidate
+    local candidates=(
+        "run_post_processing_cases.sh"
+        "run_postprocess_cases.sh"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "${dir}/${candidate}" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stage_script_path() {
+    local script="$1"
+    local batch_dir="$2"
+
+    # Prefer one authoritative current version from master_batch. This prevents
+    # old scripts copied into existing batch_* directories from drifting behind
+    # run_batch.sh. Fall back to batch-local scripts for backward compatibility.
+    if [[ -d "$MASTER_BATCH_DIR" && -f "${MASTER_BATCH_DIR}/${script}" ]]; then
+        printf '%s\n' "${MASTER_BATCH_DIR}/${script}"
+        return 0
+    fi
+    if [[ -f "${batch_dir}/${script}" ]]; then
+        printf '%s\n' "${batch_dir}/${script}"
+        return 0
+    fi
+    return 1
+}
+
+post_script_path() {
+    local batch_dir="$1"
+    local name=""
+    if [[ -d "$MASTER_BATCH_DIR" ]] && name="$(find_post_script_in_dir "$MASTER_BATCH_DIR" || true)" && [[ -n "$name" ]]; then
+        printf '%s\n' "${MASTER_BATCH_DIR}/${name}"
+        return 0
+    fi
+    if name="$(find_post_script_in_dir "$batch_dir" || true)" && [[ -n "$name" ]]; then
+        printf '%s\n' "${batch_dir}/${name}"
+        return 0
+    fi
+    return 1
+}
+
+validate_selected_scripts_for_batch() {
+    local batch_dir="$1" path=""
+    if (( RUN_SETUP == 1 )); then
+        path="$(stage_script_path setup_cases.sh "$batch_dir" || true)"
+        [[ -n "$path" ]] || die "Selected setup stage script not found in master or batch: $batch_dir"
+    fi
+    if (( RUN_MESH == 1 )); then
+        path="$(stage_script_path run_mesh_cases.sh "$batch_dir" || true)"
+        [[ -n "$path" ]] || die "Selected mesh stage script not found in master or batch: $batch_dir"
+    fi
+    if (( RUN_FLOW == 1 )); then
+        path="$(stage_script_path run_flow_cases.sh "$batch_dir" || true)"
+        [[ -n "$path" ]] || die "Selected flow stage script not found in master or batch: $batch_dir"
+    fi
+    if (( RUN_TRANSPORT == 1 )); then
+        path="$(stage_script_path run_transport_cases.sh "$batch_dir" || true)"
+        [[ -n "$path" ]] || die "Selected transport stage script not found in master or batch: $batch_dir"
+    fi
+    if (( RUN_POST == 1 )); then
+        path="$(post_script_path "$batch_dir" || true)"
+        if [[ -z "$path" && "$POST_REQUIRED" == "1" ]]; then
+            die "Selected post-processing stage script not found in master or batch: $batch_dir"
+        fi
+    fi
+}
+
+print_command() {
+    local arg
+    printf '    '
+    for arg in "$@"; do
+        printf '%q ' "$arg"
+    done
+    printf '\n'
+}
+
+format_seconds() {
+    local total="$1"
+    printf '%02d:%02d:%02d' \
+        "$(( total / 3600 ))" \
+        "$(( (total % 3600) / 60 ))" \
+        "$(( total % 60 ))"
+}
+
+stage_job_count() {
+    local stage="$1"
+    local override=""
+    case "$stage" in
+        setup) override="$SETUP_JOBS" ;;
+        mesh) override="$MESH_JOBS" ;;
+        flow) override="$FLOW_JOBS" ;;
+        transport) override="$TRANSPORT_JOBS" ;;
+        post) override="$POST_JOBS" ;;
+        *) die "Internal error: unknown stage for job count: $stage" ;;
+    esac
+    printf '%s\n' "${override:-$PARALLEL_JOBS}"
+}
+
+build_job_args() {
+    local stage="$1"
+    local jobs
+    jobs="$(stage_job_count "$stage")"
+    STAGE_JOB_ARGS=()
+    [[ -z "$jobs" ]] || STAGE_JOB_ARGS=(-j "$jobs")
+}
+
+detect_np_from_dict() {
+    local dict="$1"
+    [[ -f "$dict" ]] || return 1
+    awk '
+        /^[[:space:]]*numberOfSubdomains[[:space:]]+/ {
+            gsub(/;/, "", $2); print $2; exit
+        }
+    ' "$dict"
+}
+
+mpi_ranks_hint() {
+    local dict="" np=""
+    if (( RUN_SETUP == 1 )); then
+        dict="${MASTER_BATCH_DIR}/simpleFoam_files/system/decomposeParDict"
+    elif (( ${#BATCH_NUMBERS[@]} > 0 )); then
+        dict="$(find "${OUTPUT_ROOT}/batch_${BATCH_NUMBERS[0]}" -path '*/flow/system/decomposeParDict' -type f -print -quit 2>/dev/null || true)"
+    fi
+    [[ -n "$dict" ]] || return 1
+    np="$(detect_np_from_dict "$dict" || true)"
+    [[ "$np" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$np"
+}
+
+run_stage() {
+    local script="$1"
+    shift
+    local started=$SECONDS
+    local rc
+    local display="${script##*/}"
+
+    [[ -f "$script" ]] || {
+        error "Stage script not found: $script"
+        return 127
+    }
+
+    info "Stage start   : $display"
+    info "Stage source  : $script"
+    info "Stage command : bash $(printf '%q ' "$script")$(printf '%q ' "$@")"
+
+    if bash "$script" "$@"; then
+        info "Stage done    : $display ($(format_seconds "$(( SECONDS - started ))"))"
+        return 0
+    else
+        rc=$?
+        error "Stage failed  : $display (exit=$rc, elapsed=$(format_seconds "$(( SECONDS - started ))"))"
+        return "$rc"
+    fi
+}
+
+normalize_stage_selection() {
+    local raw
+    local token
+    local normalized
+    local saw_explicit_post=0
+    local -A requested=()
+
+    if (( ${#STAGE_TOKENS[@]} == 0 )); then
+        requested[setup]=1
+        requested[mesh]=1
+        requested[flow]=1
+        requested[transport]=1
+        if (( SKIP_POST == 0 )); then
+            requested[post]=1
+        fi
+    else
+        STAGE_SELECTION_EXPLICIT=1
+
+        for raw in "${STAGE_TOKENS[@]}"; do
+            IFS=',' read -r -a parts <<< "$raw"
+            for token in "${parts[@]}"; do
+                token="${token//[[:space:]]/}"
+                [[ -n "$token" ]] || die "Empty stage name in --stage '$raw'."
+
+                case "${token,,}" in
+                    setup)
+                        normalized="setup"
+                        ;;
+                    mesh)
+                        normalized="mesh"
+                        ;;
+                    flow)
+                        normalized="flow"
+                        ;;
+                    transport)
+                        normalized="transport"
+                        ;;
+                    post|postprocess|post-processing|post_processing)
+                        normalized="post"
+                        saw_explicit_post=1
+                        ;;
+                    all)
+                        requested[setup]=1
+                        requested[mesh]=1
+                        requested[flow]=1
+                        requested[transport]=1
+                        if (( SKIP_POST == 0 )); then
+                            requested[post]=1
+                        fi
+                        continue
+                        ;;
+                    *)
+                        die "Unknown stage '$token'. Valid stages: setup, mesh, flow, transport, post-processing, all."
+                        ;;
+                esac
+
+                requested["$normalized"]=1
+            done
+        done
+    fi
+
+    if (( SKIP_POST == 1 && saw_explicit_post == 1 )); then
+        die "--skip-post conflicts with an explicit --stage post-processing request."
+    fi
+
+    RUN_SETUP="${requested[setup]:-0}"
+    RUN_MESH="${requested[mesh]:-0}"
+    RUN_FLOW="${requested[flow]:-0}"
+    RUN_TRANSPORT="${requested[transport]:-0}"
+    RUN_POST="${requested[post]:-0}"
+
+    # An explicitly selected post stage must exist; the default full pipeline
+    # keeps v2 compatibility and may skip post-processing when no script exists.
+    if (( STAGE_SELECTION_EXPLICIT == 1 && RUN_POST == 1 )); then
+        POST_REQUIRED=1
+    fi
+
+    if (( RUN_SETUP == 0 && OVERWRITE == 1 )); then
+        die "--overwrite cannot be used when setup is not selected. Independent later-stage runs reuse the existing batch directory."
+    fi
+}
+
+selected_stage_summary() {
+    local -a names=()
+    local name
+    local summary=""
+
+    (( RUN_SETUP == 1 )) && names+=(setup)
+    (( RUN_MESH == 1 )) && names+=(mesh)
+    (( RUN_FLOW == 1 )) && names+=(flow)
+    (( RUN_TRANSPORT == 1 )) && names+=(transport)
+    (( RUN_POST == 1 )) && names+=(post-processing)
+
+    for name in "${names[@]}"; do
+        if [[ -n "$summary" ]]; then
+            summary+=" -> "
+        fi
+        summary+="$name"
+    done
+    printf '%s' "$summary"
+}
+
+validate_selected_scripts_in_dir() {
+    local dir="$1"
+    local context="$2"
+    local post_script=""
+
+    (( RUN_SETUP == 0 )) || [[ -f "${dir}/setup_cases.sh" ]] ||
+        die "Selected setup stage script not found in ${context}: ${dir}/setup_cases.sh"
+
+    (( RUN_MESH == 0 )) || [[ -f "${dir}/run_mesh_cases.sh" ]] ||
+        die "Selected mesh stage script not found in ${context}: ${dir}/run_mesh_cases.sh"
+
+    (( RUN_FLOW == 0 )) || [[ -f "${dir}/run_flow_cases.sh" ]] ||
+        die "Selected flow stage script not found in ${context}: ${dir}/run_flow_cases.sh"
+
+    (( RUN_TRANSPORT == 0 )) || [[ -f "${dir}/run_transport_cases.sh" ]] ||
+        die "Selected transport stage script not found in ${context}: ${dir}/run_transport_cases.sh"
+
+    if (( RUN_POST == 1 )); then
+        if post_script="$(find_post_script_in_dir "$dir")"; then
+            :
+        elif (( POST_REQUIRED == 1 )); then
+            die "Selected post-processing stage script not found in ${context}: $dir"
+        else
+            warn "No post-processing script found in ${context}; post-processing will be skipped."
+        fi
+    fi
+}
+
+preflight() {
+    local input
+    local input_abs
+    local filename
+    local batch_number
+    local batch_dir
+    local local_batch_csv
+    local -A seen_batch_dirs=()
+
+    OUTPUT_ROOT="$(canonicalize_path "$OUTPUT_ROOT")"
+    MASTER_BATCH_DIR="$(canonicalize_path "$MASTER_BATCH_DIR")"
+
+    if (( RUN_SETUP == 1 )); then
+        [[ -d "$MASTER_BATCH_DIR" ]] ||
+            die "Master batch directory not found: $MASTER_BATCH_DIR. Use --master-dir <DIR> if needed."
+        validate_selected_scripts_in_dir "$MASTER_BATCH_DIR" "master batch"
+    fi
+
+    INPUT_CSVS_ABS=()
+    BATCH_NUMBERS=()
+
+    for input in "${INPUT_CSVS[@]}"; do
+        input_abs="$(canonicalize_existing_file "$input" || true)"
+        [[ -n "$input_abs" ]] || die "Batch CSV not found: $input"
+
+        filename="$(basename -- "$input_abs")"
+        [[ "${filename,,}" == *.csv ]] ||
+            die "Input must have a .csv extension: $input_abs"
+
+        batch_number="$(extract_batch_number "$filename" || true)"
+        [[ -n "$batch_number" ]] ||
+            die "Cannot determine batch ID from filename: $filename. Recommended form: output_batch_<id>.csv"
+
+        batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
+        local_batch_csv="${batch_dir}/${filename}"
+
+        if [[ -n "${seen_batch_dirs[$batch_dir]:-}" ]]; then
+            die "Duplicate batch destination detected: $batch_dir. Inputs '${seen_batch_dirs[$batch_dir]}' and '$input_abs' resolve to the same batch ID."
+        fi
+        seen_batch_dirs["$batch_dir"]="$input_abs"
+
+        if (( RUN_SETUP == 1 )); then
+            [[ "$batch_dir" != "$MASTER_BATCH_DIR" ]] ||
+                die "Unsafe configuration: output batch directory equals master batch directory: $batch_dir"
+
+            case "$input_abs" in
+                "$batch_dir"/*)
+                    die "Input CSV is inside its destination batch directory: $input_abs. Move the source CSV outside $batch_dir before running setup."
+                    ;;
+            esac
+
+            if [[ -d "$batch_dir" && -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" && "$OVERWRITE" != "1" ]]; then
+                die "Batch directory already exists and is not empty: $batch_dir. Use --overwrite to replace it, or omit setup to reuse it."
+            fi
+        else
+            [[ -d "$batch_dir" ]] ||
+                die "Existing batch directory required because setup is not selected: $batch_dir"
+
+            [[ -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] ||
+                die "Existing batch directory is empty: $batch_dir"
+
+            validate_selected_scripts_for_batch "$batch_dir"
+
+            # Prefer the copy already stored with the batch. If it exists, ensure
+            # the caller did not accidentally supply a different CSV with the same name.
+            if [[ -f "$local_batch_csv" && "$input_abs" != "$local_batch_csv" ]]; then
+                cmp -s -- "$input_abs" "$local_batch_csv" ||
+                    die "CSV mismatch for existing batch_${batch_number}: '$input_abs' differs from '$local_batch_csv'. Use the CSV that created this batch or run setup again with --overwrite."
+            fi
+        fi
+
+        INPUT_CSVS_ABS+=("$input_abs")
+        BATCH_NUMBERS+=("$batch_number")
+    done
+
+    if (( DRY_RUN == 0 && RUN_SETUP == 1 )); then
+        mkdir -p -- "$OUTPUT_ROOT" || die "Cannot create output directory: $OUTPUT_ROOT"
+    fi
+
+    info "Preflight PASS"
+    info "Batch count     : ${#INPUT_CSVS_ABS[@]}"
+    info "Selected stages : $(selected_stage_summary)"
+    if (( RUN_SETUP == 1 )); then
+        info "Workspace mode  : initialize from master template"
+        info "Master batch    : $MASTER_BATCH_DIR"
+    else
+        info "Workspace mode  : reuse existing batch directories"
+    fi
+    info "Output root     : $OUTPUT_ROOT"
+    if [[ -d "$MASTER_BATCH_DIR" ]]; then
+        info "Stage scripts   : prefer $MASTER_BATCH_DIR; fallback to batch-local"
+    else
+        info "Stage scripts   : batch-local (master directory unavailable)"
+    fi
+    info "Case jobs       : ${PARALLEL_JOBS:-stage default}"
+    [[ -z "$SETUP_JOBS" ]] || info "Setup jobs      : $SETUP_JOBS"
+    [[ -z "$MESH_JOBS" ]] || info "Mesh jobs       : $MESH_JOBS"
+    [[ -z "$FLOW_JOBS" ]] || info "Flow jobs       : $FLOW_JOBS"
+    [[ -z "$TRANSPORT_JOBS" ]] || info "Transport jobs  : $TRANSPORT_JOBS"
+    [[ -z "$POST_JOBS" ]] || info "Post jobs       : $POST_JOBS"
+    info "Batch jobs      : $BATCH_JOBS"
+    info "Overwrite       : $OVERWRITE"
+    info "Keep going      : $KEEP_GOING"
+    (( RUN_TRANSPORT == 0 )) || info "Save times      : $SAVE_TIMES"
+    if (( RUN_SETUP == 1 || RUN_TRANSPORT == 1 || RUN_POST == 1 )); then
+        info "Scalar field    : $SCALAR_FIELD"
+    fi
+
+    local cpu_count np_hint stage_jobs max_cases max_mpi
+    cpu_count="$(nproc 2>/dev/null || echo '?')"
+    np_hint="$(mpi_ranks_hint || true)"
+    max_cases=0
+    if (( RUN_MESH == 1 )); then
+        stage_jobs="$(stage_job_count mesh)"
+        [[ "$stage_jobs" =~ ^[0-9]+$ ]] && (( stage_jobs > max_cases )) && max_cases="$stage_jobs"
+    fi
+    if (( RUN_FLOW == 1 )); then
+        stage_jobs="$(stage_job_count flow)"
+        [[ "$stage_jobs" =~ ^[0-9]+$ ]] && (( stage_jobs > max_cases )) && max_cases="$stage_jobs"
+    fi
+    if (( RUN_TRANSPORT == 1 )); then
+        stage_jobs="$(stage_job_count transport)"
+        [[ "$stage_jobs" =~ ^[0-9]+$ ]] && (( stage_jobs > max_cases )) && max_cases="$stage_jobs"
+    fi
+    if (( max_cases > 0 )); then
+        if [[ "$np_hint" =~ ^[0-9]+$ ]]; then
+            max_mpi=$(( BATCH_JOBS * max_cases * np_hint ))
+            info "MPI ranks/case  : ~${np_hint} (detected hint)"
+            info "Peak MPI ranks  : ~${BATCH_JOBS} x ${max_cases} x ${np_hint} = ${max_mpi}"
+            if [[ "$cpu_count" =~ ^[0-9]+$ ]] && (( max_mpi > cpu_count )); then
+                warn "Probable CPU oversubscription: peak MPI ranks ~${max_mpi} > logical CPUs ${cpu_count}. Consider reducing --batch-jobs or stage case jobs."
+            fi
+        elif (( BATCH_JOBS > 1 )); then
+            warn "Batch and case parallelism are both enabled. MPI ranks/case could not be detected; actual load is batch_jobs x case_jobs x numberOfSubdomains."
+        fi
+    fi
+}
+
+print_batch_plan() {
+    local input_csv_abs="$1"
+    local batch_number="$2"
+    local batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
+    local csv_basename
+    local batch_csv_path
+    local local_batch_csv
+    local -a job_args=()
+    local post_script=""
+
+    csv_basename="$(basename -- "$input_csv_abs")"
+    local_batch_csv="${batch_dir}/${csv_basename}"
+
+    info "------------------------------------------------------------"
+    info "DRY-RUN batch_${batch_number}"
+    info "Input CSV       : $input_csv_abs"
+    info "Destination     : $batch_dir"
+    info "Selected stages : $(selected_stage_summary)"
+
+    if (( RUN_SETUP == 1 )); then
+        batch_csv_path="$local_batch_csv"
+        if [[ -d "$batch_dir" && "$OVERWRITE" == "1" ]]; then
+            print_command rm -rf -- "$batch_dir"
+        fi
+        print_command mkdir -p -- "$batch_dir"
+        print_command cp -a --reflink=auto "${MASTER_BATCH_DIR}/." "${batch_dir}/"
+        print_command cp -f -- "$input_csv_abs" "$batch_csv_path"
+    else
+        if [[ -f "$local_batch_csv" ]]; then
+            batch_csv_path="$local_batch_csv"
+        else
+            batch_csv_path="$input_csv_abs"
+            info "Batch CSV copy  : not present; selected stages will use source CSV directly"
+        fi
+    fi
+
+    if (( RUN_SETUP == 1 )); then build_job_args setup; post_script="$(stage_script_path setup_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_MESH == 1 )); then build_job_args mesh; post_script="$(stage_script_path run_mesh_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_FLOW == 1 )); then build_job_args flow; post_script="$(stage_script_path run_flow_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_TRANSPORT == 1 )); then build_job_args transport; post_script="$(stage_script_path run_transport_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}" --save-times "$SAVE_TIMES"; fi
+
+    if (( RUN_POST == 1 )); then
+        post_script="$(post_script_path "$batch_dir" || true)"
+        [[ -z "$post_script" ]] || { build_job_args post; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; }
+    fi
+}
+
+run_batch() (
+    local input_csv_abs="$1"
+    local batch_number="$2"
+    local ordinal="$3"
+    local total="$4"
+    local csv_basename
+    local batch_dir
+    local batch_csv_path
+    local local_batch_csv
+    local post_script=""
+    local started=$SECONDS
+    local -a job_args=()
+
+    csv_basename="$(basename -- "$input_csv_abs")"
+    batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
+    local_batch_csv="${batch_dir}/${csv_basename}"
+
+    info "============================================================"
+    info "Batch ${ordinal}/${total}: batch_${batch_number}"
+    info "Input CSV       : $input_csv_abs"
+    info "Batch directory : $batch_dir"
+    info "Selected stages : $(selected_stage_summary)"
+
+    if (( RUN_SETUP == 1 )); then
+        if [[ -d "$batch_dir" && -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+            if [[ "$OVERWRITE" == "1" ]]; then
+                info "Overwrite enabled: removing $batch_dir"
+                rm -rf -- "$batch_dir" || {
+                    error "Failed to remove batch directory: $batch_dir"
+                    return 1
+                }
+            else
+                error "Batch directory became non-empty after preflight: $batch_dir"
+                return 1
+            fi
+        fi
+
+        mkdir -p -- "$batch_dir" || {
+            error "Failed to create batch directory: $batch_dir"
+            return 1
+        }
+
+        info "Copy template   : $MASTER_BATCH_DIR -> $batch_dir"
+        cp -a --reflink=auto "${MASTER_BATCH_DIR}/." "${batch_dir}/" || {
+            error "Failed to copy master batch template into: $batch_dir"
+            return 1
+        }
+
+        info "Copy CSV        : $csv_basename"
+        cp -f -- "$input_csv_abs" "$local_batch_csv" || {
+            error "Failed to copy CSV into batch directory: $local_batch_csv"
+            return 1
+        }
+        batch_csv_path="$local_batch_csv"
+    else
+        if [[ -f "$local_batch_csv" ]]; then
+            batch_csv_path="$local_batch_csv"
+            info "Reuse batch CSV : $batch_csv_path"
+        else
+            batch_csv_path="$input_csv_abs"
+            warn "No CSV copy found in batch directory; using source CSV directly: $batch_csv_path"
+        fi
+    fi
+
+    cd -- "$batch_dir" || {
+        error "Cannot enter batch directory: $batch_dir"
+        return 1
+    }
+
+    export BATCH_CSV="$csv_basename"
+    export BATCH_CSV_PATH="$batch_csv_path"
+    export BATCH_NUMBER="$batch_number"
+    export BATCH_DIR="$batch_dir"
+    export SCALAR_FIELD
+
+    if (( RUN_SETUP == 1 )); then
+        build_job_args setup
+        post_script="$(stage_script_path setup_cases.sh "$PWD")"
+        run_stage "$post_script" \
+            -i "$BATCH_CSV_PATH" \
+            "${STAGE_JOB_ARGS[@]}" || return $?
+    fi
+
+    if (( RUN_MESH == 1 )); then
+        build_job_args mesh
+        post_script="$(stage_script_path run_mesh_cases.sh "$PWD")"
+        run_stage "$post_script" \
+            -i "$BATCH_CSV_PATH" \
+            "${STAGE_JOB_ARGS[@]}" || return $?
+    fi
+
+    if (( RUN_FLOW == 1 )); then
+        build_job_args flow
+        post_script="$(stage_script_path run_flow_cases.sh "$PWD")"
+        run_stage "$post_script" \
+            -i "$BATCH_CSV_PATH" \
+            "${STAGE_JOB_ARGS[@]}" || return $?
+    fi
+
+    if (( RUN_TRANSPORT == 1 )); then
+        build_job_args transport
+        post_script="$(stage_script_path run_transport_cases.sh "$PWD")"
+        run_stage "$post_script" \
+            -i "$BATCH_CSV_PATH" \
+            "${STAGE_JOB_ARGS[@]}" \
+            --save-times "$SAVE_TIMES" || return $?
+    fi
+
+    if (( RUN_POST == 1 )); then
+        if post_script="$(post_script_path "$PWD")"; then
+            build_job_args post
+            run_stage "$post_script" \
+                -i "$BATCH_CSV_PATH" \
+                "${STAGE_JOB_ARGS[@]}" || return $?
+        elif (( POST_REQUIRED == 1 )); then
+            error "Requested post-processing stage script not found in master or batch directory: $PWD"
+            return 127
+        else
+            warn "No post-processing script found in batch directory. Skip."
+        fi
+    fi
+
+    info "Batch finished  : batch_${batch_number} ($(format_seconds "$(( SECONDS - started ))"))"
+)
+
+run_all_batches_sequential() {
+    local i
+    local rc
+    local failures=0
+    local total="${#INPUT_CSVS_ABS[@]}"
+
+    for (( i = 0; i < total; i++ )); do
+        if run_batch "${INPUT_CSVS_ABS[$i]}" "${BATCH_NUMBERS[$i]}" "$(( i + 1 ))" "$total"; then
+            :
+        else
+            rc=$?
+            (( failures += 1 ))
+            error "Batch failed: batch_${BATCH_NUMBERS[$i]} (exit=$rc)"
+            if (( KEEP_GOING == 0 )); then
+                error "Stop after first failed batch. Use --keep-going to continue other batches."
+                return "$rc"
+            fi
+        fi
+    done
+
+    (( failures == 0 )) || {
+        error "$failures batch(es) failed."
+        return 1
+    }
+}
+
+run_all_batches_parallel() {
+    local i
+    local running=0
+    local failures=0
+    local launched=0
+    local total="${#INPUT_CSVS_ABS[@]}"
+
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        die "--batch-jobs > 1 requires Bash >= 4.3. Current: ${BASH_VERSION}"
+    fi
+
+    info "Batch-level parallel execution enabled: max $BATCH_JOBS concurrent batches"
+
+    for (( i = 0; i < total; i++ )); do
+        run_batch "${INPUT_CSVS_ABS[$i]}" "${BATCH_NUMBERS[$i]}" "$(( i + 1 ))" "$total" &
+        (( running += 1 ))
+        (( launched += 1 ))
+
+        if (( running >= BATCH_JOBS )); then
+            if wait -n; then
+                :
+            else
+                (( failures += 1 ))
+            fi
+            running=$(( running - 1 ))
+
+            if (( failures > 0 && KEEP_GOING == 0 )); then
+                warn "A batch failed. Stop launching new batches; already-running batches will finish."
+                break
+            fi
+        fi
+    done
+
+    while (( running > 0 )); do
+        if wait -n; then
+            :
+        else
+            (( failures += 1 ))
+        fi
+        running=$(( running - 1 ))
+    done
+
+    if (( launched < total )); then
+        warn "$(( total - launched )) batch(es) were not started because a previous batch failed."
+    fi
+
+    (( failures == 0 && launched == total )) || {
+        error "Parallel batch execution did not complete successfully: failures=$failures, launched=$launched/$total"
+        return 1
+    }
+}
+
+main() {
+    local end_of_options=0
+
+    (( $# >= 1 )) || {
+        usage
+        exit 1
+    }
+
+    while (( $# > 0 )); do
+        if (( end_of_options == 1 )); then
+            INPUT_CSVS+=("$1")
+            shift
+            continue
+        fi
+
+        case "$1" in
+            -s|--stage|--stages)
+                (( $# >= 2 )) || die "$1 requires a stage name or comma-separated stage list."
+                STAGE_TOKENS+=("$2")
+                shift 2
+                ;;
+            -j|--jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                PARALLEL_JOBS="$2"
+                shift 2
+                ;;
+            --setup-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                SETUP_JOBS="$2"; shift 2 ;;
+            --mesh-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                MESH_JOBS="$2"; shift 2 ;;
+            --flow-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                FLOW_JOBS="$2"; shift 2 ;;
+            --transport-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                TRANSPORT_JOBS="$2"; shift 2 ;;
+            --post-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                POST_JOBS="$2"; shift 2 ;;
+            -B|--batch-jobs)
+                (( $# >= 2 )) || die "$1 requires a value."
+                BATCH_JOBS="$2"
+                shift 2
+                ;;
+            -m|--master-dir)
+                (( $# >= 2 )) || die "$1 requires a directory."
+                MASTER_BATCH_DIR="$2"
+                shift 2
+                ;;
+            -o|--output-dir)
+                (( $# >= 2 )) || die "$1 requires a directory."
+                OUTPUT_ROOT="$2"
+                shift 2
+                ;;
+            -f|--overwrite)
+                OVERWRITE=1
+                shift
+                ;;
+            --keep-going)
+                KEEP_GOING=1
+                shift
+                ;;
+            --skip-post)
+                SKIP_POST=1
+                shift
+                ;;
+            --save-times)
+                (( $# >= 2 )) || die "$1 requires a comma-separated list."
+                SAVE_TIMES="$2"
+                shift 2
+                ;;
+            --scalar-field)
+                (( $# >= 2 )) || die "$1 requires a field name."
+                SCALAR_FIELD="$2"
+                shift 2
+                ;;
+            -n|--dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                end_of_options=1
+                shift
+                ;;
+            -*)
+                die "Unknown option: $1. Use -h for help."
+                ;;
+            *)
+                INPUT_CSVS+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    (( ${#INPUT_CSVS[@]} >= 1 )) || {
+        usage
+        exit 1
+    }
+
+    if [[ -n "$PARALLEL_JOBS" ]]; then
+        require_positive_integer "$PARALLEL_JOBS" "--jobs"
+    fi
+    [[ -z "$SETUP_JOBS" ]] || require_positive_integer "$SETUP_JOBS" "--setup-jobs"
+    [[ -z "$MESH_JOBS" ]] || require_positive_integer "$MESH_JOBS" "--mesh-jobs"
+    [[ -z "$FLOW_JOBS" ]] || require_positive_integer "$FLOW_JOBS" "--flow-jobs"
+    [[ -z "$TRANSPORT_JOBS" ]] || require_positive_integer "$TRANSPORT_JOBS" "--transport-jobs"
+    [[ -z "$POST_JOBS" ]] || require_positive_integer "$POST_JOBS" "--post-jobs"
+    require_positive_integer "$BATCH_JOBS" "--batch-jobs"
+
+    [[ "$OVERWRITE" == "0" || "$OVERWRITE" == "1" ]] ||
+        die "RUN_BATCH_OVERWRITE must be 0 or 1; got: $OVERWRITE"
+
+    [[ "$SAVE_TIMES" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+        die "--save-times must be comma-separated non-negative integers, e.g. 60,120,300; got: $SAVE_TIMES"
+    [[ "$SCALAR_FIELD" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+        die "--scalar-field must be a valid OpenFOAM field token; got: $SCALAR_FIELD"
+
+    normalize_stage_selection
+    preflight
+
+    if (( DRY_RUN == 1 )); then
+        local i
+        local total="${#INPUT_CSVS_ABS[@]}"
+        for (( i = 0; i < total; i++ )); do
+            print_batch_plan "${INPUT_CSVS_ABS[$i]}" "${BATCH_NUMBERS[$i]}"
+        done
+        info "DRY-RUN complete. No simulations were run."
+        exit 0
+    fi
+
+    if (( BATCH_JOBS == 1 )); then
+        run_all_batches_sequential
+    else
+        run_all_batches_parallel
+    fi
+
+    info "All requested batches and stages finished successfully."
+}
+
+main "$@"

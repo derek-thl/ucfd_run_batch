@@ -1,0 +1,316 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      epsilon;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+epsilonInlet    1;   // placeholder for init/outlet/walls (must be > 0)
+
+tLen      0.252;   // Turbulence length scale at vent: 0.07*Dh (Dh: vent width in m)
+tLenCT    0.673;   // Turbulence length scale at CT exhaust
+
+dimensions        [0 2 -3 0 0 0 0];   // epsilon: m^2/s^3
+
+internalField     uniform $epsilonInlet ;
+
+boundaryField
+{
+    inlet
+    {
+        // Atmospheric boundary layer inlet for epsilon (match 0/U & 0/k)
+        type            atmBoundaryLayerInletEpsilon;
+
+        // Flow and vertical directions
+        flowDir         (1 0 0);      // wind along +x
+        zDir            (0 0 1);      // vertical is +z
+
+        // Reference wind and ABL parameters (match 0/U & 0/k)
+        Uref            0;      // m/s at reference height
+        Zref            10;           // reference height [m]
+        z0              uniform 0.10; // roughness length [m]
+        d               uniform 0;    // displacement height [m]
+        zGround         uniform 0;    // ground elevation [m]
+
+        // Model constants (explicit for clarity)
+        kappa           0.41;
+        Cmu             0.09;
+
+        // Required placeholder (not used after first update); field is set by the BC
+        value           uniform $epsilonInlet ;
+    }
+
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform $epsilonInlet;
+        value           uniform $epsilonInlet;
+    }
+    
+    ground
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+
+    top
+    {
+        type            zeroGradient;
+    }
+    
+    // f18p1
+    f18p1_cup_exhaust
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p1_cup_intake_a
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p1_cup_intake_b
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p1_cup_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p1_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+
+    f18p1_oai_a1     { type zeroGradient; }
+    f18p1_oai_a2     { type zeroGradient; }
+    f18p1_oai_b1     { type zeroGradient; }
+    f18p1_oai_b2     { type zeroGradient; }
+
+    f18p1_aex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_aex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_seb_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_seb_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_sex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_sex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_voc_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p1_voc_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+
+    // f18p2
+    f18p2_cup_exhaust
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p2_cup_intake_a
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p2_cup_intake_b
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p2_cup_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p2_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+
+    f18p2_oai_a1     { type zeroGradient; }
+    f18p2_oai_a2     { type zeroGradient; }
+    f18p2_oai_b1     { type zeroGradient; }
+    f18p2_oai_b2     { type zeroGradient; }
+
+    f18p2_aex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_aex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_seb_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_seb_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_sex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_sex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_voc_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p2_voc_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+
+    // f18p3
+    f18p3_cup_exhaust
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p3_cup_intake_a
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p3_cup_intake_b
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p3_cup_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+    f18p3_main
+    {
+        type    epsilonWallFunction;
+        value   uniform $epsilonInlet;
+    }
+
+    f18p3_oai_a1     { type zeroGradient; }
+    f18p3_oai_a2     { type zeroGradient; }
+    f18p3_oai_b1     { type zeroGradient; }
+    f18p3_oai_b2     { type zeroGradient; }
+
+    f18p3_aex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_aex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_seb_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_seb_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_sex_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_sex_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_voc_a
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+    f18p3_voc_b
+    {
+        type            turbulentMixingLengthDissipationRateInlet;
+        mixingLength    $tLen;
+        value           uniform $epsilonInlet;
+    }
+
+    #includeEtc "caseDicts/setConstraintTypes"
+}
+// ************************************************************************* //

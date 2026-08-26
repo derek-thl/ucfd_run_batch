@@ -1,0 +1,737 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+#includeEtc "caseDicts/mesh/generation/snappyHexMeshDict.cfg"
+
+castellatedMesh on;
+snap            <snap_ctrl>;
+addLayers       on;
+
+geometry
+{
+    f18p1_aex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_aex_a;
+    }
+    
+    f18p1_aex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_aex_b;
+    }
+
+    f18p1_cup_exhaust.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_cup_exhaust;
+    }
+
+    f18p1_cup_intake_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_cup_intake_a;
+    }
+
+    f18p1_cup_intake_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_cup_intake_b;
+    }
+
+    f18p1_cup_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_cup_main;
+    }
+
+    f18p1_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_main;
+    }
+
+    f18p1_oai_a1.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_oai_a1;
+    }
+    
+    
+    f18p1_oai_a2.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_oai_a2;
+    }
+    
+    f18p1_oai_b1.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_oai_b1;
+    }
+    
+    f18p1_oai_b2.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_oai_b2;
+    }
+
+    f18p1_seb_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_seb_a;
+    }
+    
+    f18p1_seb_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_seb_b;
+    }
+    
+    f18p1_sex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_sex_a;
+    }
+    
+    f18p1_sex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_sex_b;
+    }
+    
+    f18p1_voc_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_voc_a;
+    }
+    
+    f18p1_voc_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p1_voc_b;
+    }
+
+    f18p2_aex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_aex_a;
+    }
+    
+    f18p2_aex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_aex_b;
+    }
+
+    f18p2_cup_exhaust.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_cup_exhaust;
+    }
+
+    f18p2_cup_intake_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_cup_intake_a;
+    }
+
+    f18p2_cup_intake_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_cup_intake_b;
+    }
+
+    f18p2_cup_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_cup_main;
+    }
+
+    f18p2_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_main;
+    }
+
+    f18p2_oai_a1.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_oai_a1;
+    }
+    
+    
+    f18p2_oai_a2.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_oai_a2;
+    }
+    
+    f18p2_oai_b1.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_oai_b1;
+    }
+    
+    f18p2_oai_b2.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_oai_b2;
+    }
+
+    f18p2_seb_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_seb_a;
+    }
+    
+    f18p2_seb_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_seb_b;
+    }
+    
+    f18p2_sex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_sex_a;
+    }
+    
+    f18p2_sex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_sex_b;
+    }
+    
+    f18p2_voc_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_voc_a;
+    }
+    
+    f18p2_voc_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p2_voc_b;
+    }
+
+    f18p3_aex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_aex_a;
+    }
+    
+    f18p3_aex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_aex_b;
+    }
+
+    f18p3_cup_exhaust.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_cup_exhaust;
+    }
+
+    f18p3_cup_intake_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_cup_intake_a;
+    }
+
+    f18p3_cup_intake_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_cup_intake_b;
+    }
+
+    f18p3_cup_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_cup_main;
+    }
+
+    f18p3_main.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_main;
+    }
+
+    f18p3_oai_a1.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_oai_a1;
+    }
+    
+    
+    f18p3_oai_a2.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_oai_a2;
+    }
+    
+    f18p3_oai_b1.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_oai_b1;
+    }
+    
+    f18p3_oai_b2.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_oai_b2;
+    }
+
+    f18p3_seb_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_seb_a;
+    }
+    
+    f18p3_seb_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_seb_b;
+    }
+    
+    f18p3_sex_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_sex_a;
+    }
+    
+    f18p3_sex_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_sex_b;
+    }
+    
+    f18p3_voc_a.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_voc_a;
+    }
+    
+    f18p3_voc_b.stl
+    {
+        type triSurfaceMesh;
+        name f18p3_voc_b;
+    }
+
+    refinementDomain
+    {
+        type searchableCylinder; point1 <scP1>; point2 <scP2>; radius <R_refine>;
+    }
+
+    refineGroundPlane
+    {
+        type searchableDisk; origin <sdOrg>; normal (0 0 1); radius <R_refine>;
+    }
+}
+
+
+castellatedMeshControls
+{
+    resolveFeatureAngle 165;  // ignore micro-creases
+
+    features
+    (
+
+        {
+            file  "f18p1_main.eMesh";
+            level 4;
+        }
+
+        {
+            file  "f18p1_cup_main.eMesh";
+            level 4;
+        }
+
+        {
+            file  "f18p2_main.eMesh";
+            level 4;
+        }
+
+        {
+            file  "f18p2_cup_main.eMesh";
+            level 4;
+        }
+
+        {
+            file  "f18p3_main.eMesh";
+            level 4;
+        }
+
+        {
+            file  "f18p3_cup_main.eMesh";
+            level 4;
+        }
+
+    );
+
+    refinementSurfaces
+    {
+
+        // f18p1
+        f18p1_cup_exhaust
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p1_cup_intake_a
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p1_cup_intake_b
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p1_cup_main
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p1_main
+        {
+            level (4 4);  
+            patchInfo { type wall; }
+        }
+        f18p1_oai_a1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_oai_a2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_oai_b1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_oai_b2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_aex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_aex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_seb_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_seb_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_sex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_sex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_voc_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p1_voc_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+
+        // f18p2
+        f18p2_cup_exhaust
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p2_cup_intake_a
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p2_cup_intake_b
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p2_cup_main
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p2_main
+        {
+            level (4 4);  
+            patchInfo { type wall; }
+        }
+        f18p2_oai_a1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_oai_a2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_oai_b1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_oai_b2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_aex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_aex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_seb_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_seb_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_sex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_sex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_voc_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p2_voc_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+
+        // f18p3
+        f18p3_cup_exhaust
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p3_cup_intake_a
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p3_cup_intake_b
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p3_cup_main
+        {
+            level (4 4);   
+            patchInfo { type wall; }
+        }
+        f18p3_main
+        {
+            level (4 4);  
+            patchInfo { type wall; }
+        }
+        f18p3_oai_a1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_oai_a2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_oai_b1
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_oai_b2
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_aex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_aex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_seb_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_seb_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_sex_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_sex_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_voc_a
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+        f18p3_voc_b
+        {
+            level (4 4);
+            patchInfo { type patch; faceType baffle; regionType patch; }
+        }
+    }
+
+    refinementRegions
+    {
+        refinementDomain
+        {
+            mode inside;
+            levels ((1E15 2));
+        }
+
+        refineGroundPlane
+        {
+            mode distance;
+            levels ( (160 1) );   // 0–160m: L1 
+        }
+    }
+
+    locationInMesh (<cx> <cy> <H_refine>);
+
+    nCellsBetweenLevels 12;
+    minRefinementCells  10;
+    maxLocalCells       5000000;
+    maxGlobalCells     80000000;
+}
+
+snapControls
+{
+    implicitFeatureSnap     false;
+    explicitFeatureSnap     true;
+    multiRegionFeatureSnap  false;
+    nSmoothPatch            5;
+    nFeatureSnapIter        5;
+    nSmoothSurfaceNormals   3;
+    tolerance               2.0;
+    nSolveIter              100;
+    nRelaxIter              5;
+}
+
+addLayersControls
+{
+    // --- Global Layer Controls ---
+    relativeSizes       true; // Use relative size (ratio of cell size) or false for absolute distance
+    expansionRatio      1.2;  // Growth rate of layers
+    firstLayerThickness 0.1;  // Thickness of the layer furthest from the wall (relative to background cell)
+    minThickness        0.03;  // Minimum thickness to allow layer generation
+    
+    // ... (Keep your existing settings: featureAngle, nLayerIter, etc.)
+    featureAngle        89.9;
+    slipFeatureAngle    30;
+    nLayerIter          50;
+    nRelaxedIter        20;
+    nRelaxIter          5;
+    nGrow               0;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals      3;
+    nSmoothThickness    10;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle  90;
+    nMedialAxisIter     10;
+    nBufferCellsNoExtrude 0;
+    additionalReporting false;
+
+    // --- Specific Layer Definitions ---
+    layers
+    {
+        ground
+        {
+            nSurfaceLayers 3;
+        }
+    }
+}
+
+meshQualityControls { }  // keep defaults from cfg
+
+debugFlags 
+( 
+    // featureSeeds 
+    // attraction 
+    // layerInfo 
+); 
+
+writeFlags 
+( 
+    noRefinement 
+    // scalarLevels 
+    // layerSets 
+    // layerFields 
+);
+
+mergeTolerance 1e-5;     // safer with ~1e-4 m near-duplicates

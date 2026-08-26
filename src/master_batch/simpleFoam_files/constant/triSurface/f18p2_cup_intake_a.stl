@@ -1,0 +1,16 @@
+solid 
+facet normal -0 1 0
+ outer loop
+  vertex 142.7267 -1087.1556 32.324955
+  vertex 142.7267 -1087.1556 25.324957
+  vertex 74.7267 -1087.1556 32.32495
+ endloop
+endfacet
+facet normal 0 1 -0
+ outer loop
+  vertex 74.7267 -1087.1556 32.32495
+  vertex 142.7267 -1087.1556 25.324957
+  vertex 74.7267 -1087.1556 25.324955
+ endloop
+endfacet
+endsolid 

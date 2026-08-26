@@ -1,0 +1,81 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      nut;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+dimensions      [0 2 -1 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    inlet               { type calculated; value   uniform 0; }
+    outlet              { type calculated; value   uniform 0; }
+    ground              { type nutkWallFunction; value uniform 0; } 
+    top                 { type zeroGradient;}
+    
+    f18p1_cup_exhaust   { type nutkWallFunction; value uniform 0; }
+    f18p1_cup_intake_a  { type nutkWallFunction; value uniform 0; }
+    f18p1_cup_intake_b  { type nutkWallFunction; value uniform 0; }
+    f18p1_cup_main      { type nutkWallFunction; value uniform 0; } 
+    f18p1_main          { type nutkWallFunction; value uniform 0; }
+    f18p1_oai_a1        { type calculated; value   uniform 0; }
+    f18p1_oai_a2        { type calculated; value   uniform 0; }
+    f18p1_oai_b1        { type calculated; value   uniform 0; }
+    f18p1_oai_b2        { type calculated; value   uniform 0; }
+    f18p1_aex_a         { type calculated; value   uniform 0; }
+    f18p1_aex_b         { type calculated; value   uniform 0; }
+    f18p1_seb_a         { type calculated; value   uniform 0; }
+    f18p1_seb_b         { type calculated; value   uniform 0; }
+    f18p1_sex_a         { type calculated; value   uniform 0; }
+    f18p1_sex_b         { type calculated; value   uniform 0; }
+    f18p1_voc_a         { type calculated; value   uniform 0; }
+    f18p1_voc_b         { type calculated; value   uniform 0; }
+    f18p2_cup_exhaust   { type nutkWallFunction; value uniform 0; }
+    f18p2_cup_intake_a  { type nutkWallFunction; value uniform 0; }
+    f18p2_cup_intake_b  { type nutkWallFunction; value uniform 0; }
+    f18p2_cup_main      { type nutkWallFunction; value uniform 0; } 
+    f18p2_main          { type nutkWallFunction; value uniform 0; }
+    f18p2_oai_a1        { type calculated; value   uniform 0; }
+    f18p2_oai_a2        { type calculated; value   uniform 0; }
+    f18p2_oai_b1        { type calculated; value   uniform 0; }
+    f18p2_oai_b2        { type calculated; value   uniform 0; }
+    f18p2_aex_a         { type calculated; value   uniform 0; }
+    f18p2_aex_b         { type calculated; value   uniform 0; }
+    f18p2_seb_a         { type calculated; value   uniform 0; }
+    f18p2_seb_b         { type calculated; value   uniform 0; }
+    f18p2_sex_a         { type calculated; value   uniform 0; }
+    f18p2_sex_b         { type calculated; value   uniform 0; }
+    f18p2_voc_a         { type calculated; value   uniform 0; }
+    f18p2_voc_b         { type calculated; value   uniform 0; }
+    f18p3_cup_exhaust   { type nutkWallFunction; value uniform 0; }
+    f18p3_cup_intake_a  { type nutkWallFunction; value uniform 0; }
+    f18p3_cup_intake_b  { type nutkWallFunction; value uniform 0; }
+    f18p3_cup_main      { type nutkWallFunction; value uniform 0; } 
+    f18p3_main          { type nutkWallFunction; value uniform 0; }
+    f18p3_oai_a1        { type calculated; value   uniform 0; }
+    f18p3_oai_a2        { type calculated; value   uniform 0; }
+    f18p3_oai_b1        { type calculated; value   uniform 0; }
+    f18p3_oai_b2        { type calculated; value   uniform 0; }
+    f18p3_aex_a         { type calculated; value   uniform 0; }
+    f18p3_aex_b         { type calculated; value   uniform 0; }
+    f18p3_seb_a         { type calculated; value   uniform 0; }
+    f18p3_seb_b         { type calculated; value   uniform 0; }
+    f18p3_sex_a         { type calculated; value   uniform 0; }
+    f18p3_sex_b         { type calculated; value   uniform 0; }
+    f18p3_voc_a         { type calculated; value   uniform 0; }
+    f18p3_voc_b         { type calculated; value   uniform 0; }
+
+    #includeEtc "caseDicts/setConstraintTypes"
+}
+// ************************************************************************* //

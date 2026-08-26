@@ -1,0 +1,82 @@
+{
+  "version": "0.1.0-example",
+  "frozen": true,
+  "fit_split": "train",
+  "warning": "Illustrative values only. Replace with statistics fitted on training data and the declared fit masks.",
+  "channels": {
+    "Ux": {
+      "method": "zscore",
+      "mean": 1.5,
+      "std": 3.0
+    },
+    "Uy": {
+      "method": "zscore",
+      "mean": 0.0,
+      "std": 0.2
+    },
+    "Uz": {
+      "method": "zscore",
+      "mean": 0.0,
+      "std": 3.0
+    },
+    "p": {
+      "method": "zscore",
+      "mean": 0.0,
+      "std": 1.0
+    },
+    "wallDistance": {
+      "method": "zscore",
+      "mean": 10.0,
+      "std": 20.0
+    },
+    "signed_distance": {
+      "method": "zscore",
+      "mean": 0.0,
+      "std": 20.0
+    },
+    "fluid_mask_channel": {
+      "method": "identity"
+    },
+    "solid_mask_channel": {
+      "method": "identity"
+    },
+    "near_wall_mask_channel": {
+      "method": "identity"
+    },
+    "wind_inlet_mask_channel": {
+      "method": "identity"
+    },
+    "wind_outlet_mask_channel": {
+      "method": "identity"
+    },
+    "wind_speed_mps": {
+      "method": "zscore",
+      "mean": 2.0,
+      "std": 1.5
+    },
+    "wind_dir_sin": {
+      "method": "identity"
+    },
+    "wind_dir_cos": {
+      "method": "identity"
+    },
+    "source_rate": {
+      "method": "log1p_zscore",
+      "mean": 0.0,
+      "std": 1.0,
+      "epsilon": 0.0
+    },
+    "stability_neutral": {
+      "method": "identity"
+    },
+    "stability_stable": {
+      "method": "identity"
+    },
+    "T": {
+      "method": "log1p_zscore",
+      "mean": 0.0,
+      "std": 1.0,
+      "epsilon": 0.0
+    }
+  }
+}

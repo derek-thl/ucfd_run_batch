@@ -1,0 +1,103 @@
+{
+  "version": "0.1.0-flow-training",
+  "source_assembly": {
+    "conflict_policy": "REGION_PRIORITY"
+  },
+
+  "coordinate_map": {
+    "source_length_unit": "m",
+    "target_length_unit": "m",
+    "length_scale": 1.0,
+    "rotation_source_to_target": [
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0]
+    ],
+    "translation_target_xyz": [0.0, 0.0, 0.0]
+  },
+  "grid": {
+    "physical_grid": {
+      "cell_center_origin_xyz": [-21.43, -1155.476, 31],
+      "spacing_xyz": [2.0, 2.0, 2.0],
+      "dimensions_xyz": [320, 320, 16]
+    },
+    "model_grid": {
+      "tensor_shape_zyx": [16, 320, 320],
+      "divisibility_zyx": [16, 16, 16],
+      "padding_alignment": "symmetric"
+    }
+  },
+  "fields": [
+    {
+      "source_name": "U",
+      "output_channels": ["Ux", "Uy", "Uz"],
+      "role": "INPUT",
+      "kind": "vector",
+      "expected_components": 3,
+      "required": true,
+      "preferred_source_association": "CELL",
+      "interpolation": "linear",
+      "extrapolation_policy": "MARK_INVALID",
+      "fill_value_physical": 0.0,
+      "source_unit": "m/s",
+      "target_unit": "m/s",
+      "value_scale": 1.0,
+      "value_offset": 0.0,
+      "rotate_vector": true,
+      "require_volumetric_source": true,
+      "minimum_valid_fraction": 0.1
+    },
+    {
+      "source_name": "p",
+      "output_channels": ["p"],
+      "role": "INPUT",
+      "kind": "continuous_scalar",
+      "expected_components": 1,
+      "required": true,
+      "preferred_source_association": "CELL",
+      "interpolation": "linear",
+      "extrapolation_policy": "MARK_INVALID",
+      "fill_value_physical": 0.0,
+      "source_unit": "OpenFOAM_case_unit",
+      "target_unit": "model_pressure_unit",
+      "value_scale": 1.0,
+      "value_offset": 0.0,
+      "require_volumetric_source": true,
+      "minimum_valid_fraction": 0.1
+    },
+    {
+      "source_name": "wallDistance",
+      "output_channels": ["wallDistance"],
+      "role": "INPUT",
+      "kind": "continuous_scalar",
+      "expected_components": 1,
+      "required": true,
+      "preferred_source_association": "CELL",
+      "interpolation": "linear",
+      "extrapolation_policy": "MARK_INVALID",
+      "fill_value_physical": 0.0,
+      "source_unit": "m",
+      "target_unit": "m"
+    }
+  ],
+  "derived_features": {
+    "fluid_reference_channel": "Ux",
+    "domain_mask_mode": "source_bounds",
+    "wall_distance_channel": "wallDistance",
+    "derive_signed_distance": false,
+    "output_channels": [],
+    "mask_channel_map": {}
+  },
+  "scenario_parameters": [],
+  "input_channels": ["Ux", "Uy", "Uz", "p", "wallDistance"],
+  "target_channels": [],
+  "padding": {
+    "channel_pad_values_physical": {
+      "Ux": 0.0,
+      "Uy": 0.0,
+      "Uz": 0.0,
+      "p": 0.0,
+      "wallDistance": 0.0
+    }
+  }
+}

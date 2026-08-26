@@ -1,0 +1,112 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (0 0 0);
+
+boundaryField
+{
+    // inlet      { type fixedValue; value uniform (10 0 0); }
+    inlet
+    {
+        // Atmospheric boundary layer inlet (log-law)
+        type            atmBoundaryLayerInletVelocity;
+
+        // Flow and vertical directions
+        flowDir         (1 0 0);      // wind along +x
+        zDir            (0 0 1);      // vertical is +z
+
+        // Reference wind and ABL parameters
+        Uref            0;      // m/s at reference height
+        Zref            10;           // reference height [m]
+        z0              uniform 0.10; // roughness length [m]
+        d               uniform 0;    // displacement height [m] (0 for open terrain)
+        zGround         uniform 0;    // domain ground elevation [m]
+
+        // Model constants (defaults, shown explicitly)
+        kappa           0.41;
+        Cmu             0.09;
+
+        // Initial value (not used after first update, but required)
+        value           uniform (0 0 0);
+    }
+
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (0 0 0);
+    }
+
+    ground              { type noSlip; }
+    top                 { type slip; }
+
+    f18p1_cup_exhaust   { type noSlip; }
+    f18p1_cup_intake_a  { type noSlip; }
+    f18p1_cup_intake_b  { type noSlip; }
+    f18p1_cup_main      { type noSlip; }
+    f18p1_main          { type noSlip; }
+    f18p1_oai_a1        { type fixedValue; value uniform (0 0 0); }
+    f18p1_oai_a2        { type fixedValue; value uniform (0 0 0); }
+    f18p1_oai_b1        { type fixedValue; value uniform (0 0 0); }
+    f18p1_oai_b2        { type fixedValue; value uniform (0 0 0); }
+    f18p1_aex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p1_aex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p1_seb_a         { type fixedValue; value uniform (0 0 0); }
+    f18p1_seb_b         { type fixedValue; value uniform (0 0 0); }
+    f18p1_sex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p1_sex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p1_voc_a         { type fixedValue; value uniform (0 0 0); }
+    f18p1_voc_b         { type fixedValue; value uniform (0 0 0); } 
+    f18p2_cup_exhaust   { type noSlip; }
+    f18p2_cup_intake_a  { type noSlip; }
+    f18p2_cup_intake_b  { type noSlip; }
+    f18p2_cup_main      { type noSlip; }
+    f18p2_main          { type noSlip; }
+    f18p2_oai_a1        { type fixedValue; value uniform (0 0 0); }
+    f18p2_oai_a2        { type fixedValue; value uniform (0 0 0); }
+    f18p2_oai_b1        { type fixedValue; value uniform (0 0 0); }
+    f18p2_oai_b2        { type fixedValue; value uniform (0 0 0); }
+    f18p2_aex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p2_aex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p2_seb_a         { type fixedValue; value uniform (0 0 0); }
+    f18p2_seb_b         { type fixedValue; value uniform (0 0 0); }
+    f18p2_sex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p2_sex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p2_voc_a         { type fixedValue; value uniform (0 0 0); }
+    f18p2_voc_b         { type fixedValue; value uniform (0 0 0); } 
+    f18p3_cup_exhaust   { type noSlip; }
+    f18p3_cup_intake_a  { type noSlip; }
+    f18p3_cup_intake_b  { type noSlip; }
+    f18p3_cup_main      { type noSlip; }
+    f18p3_main          { type noSlip; }
+    f18p3_oai_a1        { type fixedValue; value uniform (0 0 0); }
+    f18p3_oai_a2        { type fixedValue; value uniform (0 0 0); }
+    f18p3_oai_b1        { type fixedValue; value uniform (0 0 0); }
+    f18p3_oai_b2        { type fixedValue; value uniform (0 0 0); }
+    f18p3_aex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p3_aex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p3_seb_a         { type fixedValue; value uniform (0 0 0); }
+    f18p3_seb_b         { type fixedValue; value uniform (0 0 0); }
+    f18p3_sex_a         { type fixedValue; value uniform (0 0 0); }
+    f18p3_sex_b         { type fixedValue; value uniform (0 0 0); }
+    f18p3_voc_a         { type fixedValue; value uniform (0 0 0); }
+    f18p3_voc_b         { type fixedValue; value uniform (0 0 0); } 
+
+    #includeEtc "caseDicts/setConstraintTypes"
+}
+// ************************************************************************* //

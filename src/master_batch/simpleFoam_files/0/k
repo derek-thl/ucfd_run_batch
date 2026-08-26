@@ -1,0 +1,379 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           volScalarField;
+    object          k;
+}
+
+kInlet          1.5;   // approx k = 1.5*(I*U)^2 ; I = 0.1
+
+tInt_TE         0.1;
+
+tInt_CT         0.2;
+
+dimensions      [ 0 2 -2 0 0 0 0 ];
+
+internalField   uniform 1.5;
+
+boundaryField
+{
+    inlet
+    {
+        type            atmBoundaryLayerInletK;
+        flowDir         ( 1 0 0 );
+        zDir            ( 0 0 1 );
+        Uref            0.1;
+        Zref            10;
+        z0              uniform 0.1;
+        d               uniform 0;
+        zGround         uniform 0;
+        kappa           0.41;
+        Cmu             0.09;
+        value           uniform 1.5;
+    }
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform $kInlet;
+        value           uniform $kInlet;
+    }
+
+    ground
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    top
+    {
+        type            zeroGradient;
+    }
+    f18p1_cup_exhaust
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p1_cup_intake_a
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p1_cup_intake_b
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p1_cup_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p1_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p1_oai_a1
+    {
+        type            zeroGradient;
+    }
+    f18p1_oai_a2
+    {
+        type            zeroGradient;
+    }
+    f18p1_oai_b1
+    {
+        type            zeroGradient;
+    }
+    f18p1_oai_b2
+    {
+        type            zeroGradient;
+    }
+    f18p1_aex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_aex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_seb_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_seb_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_sex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_sex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_voc_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p1_voc_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_cup_exhaust
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p2_cup_intake_a
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p2_cup_intake_b
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p2_cup_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p2_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p2_oai_a1
+    {
+        type            zeroGradient;
+    }
+    f18p2_oai_a2
+    {
+        type            zeroGradient;
+    }
+    f18p2_oai_b1
+    {
+        type            zeroGradient;
+    }
+    f18p2_oai_b2
+    {
+        type            zeroGradient;
+    }
+    f18p2_aex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_aex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_seb_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_seb_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_sex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_sex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_voc_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p2_voc_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_cup_exhaust
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p3_cup_intake_a
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p3_cup_intake_b
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p3_cup_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p3_main
+    {
+        type            kqRWallFunction;
+        value           uniform 1.5;
+    }
+    f18p3_oai_a1
+    {
+        type            zeroGradient;
+    }
+    f18p3_oai_a2
+    {
+        type            zeroGradient;
+    }
+    f18p3_oai_b1
+    {
+        type            zeroGradient;
+    }
+    f18p3_oai_b2
+    {
+        type            zeroGradient;
+    }
+    f18p3_aex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_aex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_seb_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_seb_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_sex_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_sex_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_voc_a
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    f18p3_voc_b
+    {
+        type            turbulentIntensityKineticEnergyInlet;
+        intensity       0.1;
+        value           uniform 1.5;
+    }
+    cyclic
+    {
+        type            cyclic;
+    }
+    cyclicAMI
+    {
+        type            cyclicAMI;
+        value           uniform 1.5;
+    }
+    cyclicACMI
+    {
+        type            cyclicACMI;
+        value           uniform 1.5;
+    }
+    cyclicSlip
+    {
+        type            cyclicSlip;
+    }
+    empty
+    {
+        type            empty;
+    }
+    nonuniformTransformCyclic
+    {
+        type            nonuniformTransformCyclic;
+    }
+    processor
+    {
+        type            processor;
+    }
+    processorCyclic
+    {
+        type            processorCyclic;
+    }
+    symmetryPlane
+    {
+        type            symmetryPlane;
+    }
+    symmetry
+    {
+        type            symmetry;
+    }
+    wedge
+    {
+        type            wedge;
+    }
+    overset
+    {
+        type            overset;
+    }
+}
+
+
+// ************************************************************************* //

@@ -1,0 +1,59 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     scalarTransportDeffFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         300;       // adjust
+
+deltaT          1.0;        // keep Co < ~1; also consider diffusive limit
+
+adjustTimeStep  yes;
+
+maxCo           0.8;
+
+maxDeltaT       1;
+
+writeControl    adjustableRunTime;
+
+writeInterval   60;    // seconds of simulation time
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+libs
+(
+    "libfvOptions.so"           // enables fvOptions sources/sinks
+    "libatmosphericModels.so"   // provides atmBoundaryLayerInletVelocity
+);
+
+// ************************************************************************* //

@@ -1,0 +1,84 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2506                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      p;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+
+    inlet               { type zeroGradient; }
+    outlet              { type totalPressure; p0 uniform 0;}
+    ground              { type zeroGradient; }
+    top                 { type zeroGradient; }
+    f18p1_cup_exhaust   { type zeroGradient; }
+    f18p1_cup_intake_a  { type zeroGradient; }
+    f18p1_cup_intake_b  { type zeroGradient; }
+    f18p1_cup_main      { type zeroGradient; } 
+    f18p1_main          { type zeroGradient; }
+    f18p1_oai_a1        { type zeroGradient; }
+    f18p1_oai_a2        { type zeroGradient; }
+    f18p1_oai_b1        { type zeroGradient; }
+    f18p1_oai_b2        { type zeroGradient; }
+    f18p1_aex_a         { type zeroGradient; }
+    f18p1_aex_b         { type zeroGradient; }
+    f18p1_seb_a         { type zeroGradient; }
+    f18p1_seb_b         { type zeroGradient; }
+    f18p1_sex_a         { type zeroGradient; }
+    f18p1_sex_b         { type zeroGradient; }
+    f18p1_voc_a         { type zeroGradient; }
+    f18p1_voc_b         { type zeroGradient; }
+    f18p2_cup_exhaust   { type zeroGradient; }
+    f18p2_cup_intake_a  { type zeroGradient; }
+    f18p2_cup_intake_b  { type zeroGradient; }
+    f18p2_cup_main      { type zeroGradient; } 
+    f18p2_main          { type zeroGradient; }
+    f18p2_oai_a1        { type zeroGradient; }
+    f18p2_oai_a2        { type zeroGradient; }
+    f18p2_oai_b1        { type zeroGradient; }
+    f18p2_oai_b2        { type zeroGradient; }
+    f18p2_aex_a         { type zeroGradient; }
+    f18p2_aex_b         { type zeroGradient; }
+    f18p2_seb_a         { type zeroGradient; }
+    f18p2_seb_b         { type zeroGradient; }
+    f18p2_sex_a         { type zeroGradient; }
+    f18p2_sex_b         { type zeroGradient; }
+    f18p2_voc_a         { type zeroGradient; }
+    f18p2_voc_b         { type zeroGradient; }
+    f18p3_cup_exhaust   { type zeroGradient; }
+    f18p3_cup_intake_a  { type zeroGradient; }
+    f18p3_cup_intake_b  { type zeroGradient; }
+    f18p3_cup_main      { type zeroGradient; } 
+    f18p3_main          { type zeroGradient; }
+    f18p3_oai_a1        { type zeroGradient; }
+    f18p3_oai_a2        { type zeroGradient; }
+    f18p3_oai_b1        { type zeroGradient; }
+    f18p3_oai_b2        { type zeroGradient; }
+    f18p3_aex_a         { type zeroGradient; }
+    f18p3_aex_b         { type zeroGradient; }
+    f18p3_seb_a         { type zeroGradient; }
+    f18p3_seb_b         { type zeroGradient; }
+    f18p3_sex_a         { type zeroGradient; }
+    f18p3_sex_b         { type zeroGradient; }
+    f18p3_voc_a         { type zeroGradient; }
+    f18p3_voc_b         { type zeroGradient; }
+
+    #includeEtc "caseDicts/setConstraintTypes"
+}
+
+
+// ************************************************************************* //

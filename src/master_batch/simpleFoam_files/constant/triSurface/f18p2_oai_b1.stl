@@ -1,0 +1,37 @@
+solid 
+facet normal 1 0 -0
+ outer loop
+  vertex 236.06305 -886.0564 36.000008
+  vertex 236.06305 -886.0564 30.000006
+  vertex 236.06305 -883.0564 30.000006
+ endloop
+endfacet
+facet normal 1 0 0
+ outer loop
+  vertex 236.06305 -883.0564 30.000006
+  vertex 236.06305 -877.0564 30.000006
+  vertex 236.06305 -886.0564 36.000008
+ endloop
+endfacet
+facet normal 1 0 0
+ outer loop
+  vertex 236.06305 -886.0564 36.000008
+  vertex 236.06305 -877.0564 30.000006
+  vertex 236.06305 -845.6814 30.000008
+ endloop
+endfacet
+facet normal 1 0 0
+ outer loop
+  vertex 236.06305 -886.0564 36.000008
+  vertex 236.06305 -845.6814 30.000008
+  vertex 236.06305 -808.5564 36.00001
+ endloop
+endfacet
+facet normal 1 0 -0
+ outer loop
+  vertex 236.06305 -808.5564 36.00001
+  vertex 236.06305 -845.6814 30.000008
+  vertex 236.06305 -808.5564 30.000008
+ endloop
+endfacet
+endsolid 
