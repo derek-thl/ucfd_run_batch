@@ -640,7 +640,9 @@ print_batch_plan() {
     fi
 }
 
-run_batch() (
+# run_batch_inner runs inside the run_batch subshell. The subshell keeps the
+# per-batch cd and the exported per-batch environment contained.
+run_batch_inner() {
     local input_csv_abs="$1"
     local batch_number="$2"
     local ordinal="$3"
@@ -650,7 +652,6 @@ run_batch() (
     local batch_csv_path
     local local_batch_csv
     local post_script=""
-    local started=$SECONDS
     local -a job_args=()
 
     csv_basename="$(basename -- "$input_csv_abs")"
@@ -664,14 +665,16 @@ run_batch() (
     info "Selected stages : $(selected_stage_summary)"
 
     if (( RUN_SETUP == 1 )); then
-        if [[ -d "$batch_dir" && -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        # v4 Section 7.1: overwrite removes every existing destination, empty
+        # or non-empty, before template initialization.
+        if [[ -d "$batch_dir" ]]; then
             if [[ "$OVERWRITE" == "1" ]]; then
                 info "Overwrite enabled: removing $batch_dir"
                 rm -rf -- "$batch_dir" || {
                     error "Failed to remove batch directory: $batch_dir"
                     return 1
                 }
-            else
+            elif [[ -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
                 error "Batch directory became non-empty after preflight: $batch_dir"
                 return 1
             fi
@@ -762,6 +765,21 @@ run_batch() (
         fi
     fi
 
+}
+
+run_batch() (
+    local batch_number="$2"
+    local started=$SECONDS
+    local rc=0
+
+    run_batch_inner "$@" || rc=$?
+
+    # v4 Section 19: successful and failed batches report elapsed time. The
+    # original child failure status is preserved.
+    if (( rc != 0 )); then
+        error "Batch failed    : batch_${batch_number} (exit=${rc}, elapsed=$(format_seconds "$(( SECONDS - started ))"))"
+        return "$rc"
+    fi
     info "Batch finished  : batch_${batch_number} ($(format_seconds "$(( SECONDS - started ))"))"
 )
 
