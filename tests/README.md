@@ -80,20 +80,29 @@ production files. This suite does not assert them:
 | Flow must not require `reconstructPar` when `RECONSTRUCT_MODE=none` | #7 |
 | Top-level overwrite must remove an existing empty destination | #5 |
 | Top-level logging must report batch elapsed time on failure | #5 |
+| Mesh and flow stages must propagate an OpenFOAM command failure | #9 |
+| Top-level help must display the documented `--stages` alias and the `--` end-of-options marker | #10 |
 
 After those Issues merge, the combined suite covers the complete Section 23
 matrix.
 
 ## Known contract gaps
 
-This gap appeared during the Issue #4 test work. The gap is not one of the five
-confirmed gaps in Specification #3. No Issue owns the gap now.
+These gaps appeared during the Issue #4 test work. They are not part of the
+five confirmed gaps in Specification #3. Each gap has a bounded proposal
+Issue. This suite does not assert them.
 
-- **Section 23.P, mesh and flow stages.** A failed OpenFOAM command inside
-  `run_mesh_cases.sh` or `run_flow_cases.sh` does not fail the case. The case
-  summary records `meshed` or `solved`, and the stage exits `0`.
+- **Section 23.P, mesh and flow stages. Owner: Issue #9.** A failed OpenFOAM
+  command inside `run_mesh_cases.sh` or `run_flow_cases.sh` does not fail the
+  case. The case summary records `meshed` or `solved`, and the stage exits `0`.
   Cause: the case body runs on the left side of a `||` list, so `set -e` has no
   effect inside the body, and a failed `run_tee` does not stop the case.
   The transport stage and the post-processing stage propagate a case failure
   correctly.
   `cases/p_failure_propagation.sh` covers only the conforming failure paths.
+- **Section 23.B, top-level help completeness. Owner: Issue #10.** The
+  `run_batch.sh` help does not display the documented `--stages` alias or the
+  `--` end-of-options marker from specification Section 6.4. Both forms work;
+  only the help text omits them. `cases/b_cli_help.sh` asserts every top-level
+  option form that the current help displays and does not assert `--stages`
+  or `--`.

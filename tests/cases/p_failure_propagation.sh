@@ -5,7 +5,7 @@
 # Two Section 23.P sub-cases are excluded because the production scripts do not
 # satisfy them yet:
 #   * a failed OpenFOAM command inside the mesh or flow stage is not propagated;
-#     see tests/README.md, "Known contract gaps".
+#     Issue #9 owns that gap. See tests/README.md, "Known contract gaps".
 #   * post-processing and transport missing-case handling belongs to Issue #6.
 set -euo pipefail
 CASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

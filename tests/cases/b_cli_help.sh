@@ -18,17 +18,22 @@ check_help() {
 
     local expected
     for expected in "$@"; do
-        assert_contains "$output" "$expected" \
+        assert_help_option "$output" "$expected" \
             "${script##*/} --help documents $expected"
     done
 }
 
 # Top-level v4 options from specification Section 6.4.
+#
+# Exclusion: the current top-level help does not display the documented
+# `--stages` alias or the `--` end-of-options marker. That is a confirmed
+# production documentation gap owned by Issue #10, not an Issue #4 harness
+# defect. See tests/README.md, "Known contract gaps".
 check_help "$RUN_BATCH" \
-    "--stage" "--jobs" "--setup-jobs" "--mesh-jobs" "--flow-jobs" \
-    "--transport-jobs" "--post-jobs" "--batch-jobs" "--master-dir" \
-    "--output-dir" "--overwrite" "--keep-going" "--skip-post" \
-    "--save-times" "--scalar-field" "--dry-run" "--help" \
+    "-s" "--stage" "-j" "--jobs" "--setup-jobs" "--mesh-jobs" "--flow-jobs" \
+    "--transport-jobs" "--post-jobs" "-B" "--batch-jobs" "-m" "--master-dir" \
+    "-o" "--output-dir" "-f" "--overwrite" "--keep-going" "--skip-post" \
+    "--save-times" "--scalar-field" "-n" "--dry-run" "-h" "--help" \
     "MASTER_BATCH_DIR" "RUN_BATCH_OUTPUT_DIR" "RUN_BATCH_OVERWRITE"
 
 # Setup direct CLI from specification Section 14.3.

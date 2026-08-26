@@ -78,3 +78,17 @@ assert_failure() {
     (( actual != 0 )) && return 0
     _fail "$message" "expected a non-zero exit status; got 0"
 }
+
+# assert_help_option <help_text> <option> <message>
+# Token-aware option check for help output. A longer option token cannot
+# satisfy a shorter option assertion. The option must appear delimited by
+# line start, whitespace, or a comma before it, and by whitespace, a comma,
+# '=', '<', or line end after it.
+assert_help_option() {
+    local help_text="$1" option="$2" message="$3"
+    if printf '%s\n' "$help_text" |
+        grep -Eq "(^|[[:space:]]|,)${option}([[:space:]]|,|=|<|$)"; then
+        return 0
+    fi
+    _fail "$message" "option token not found in help output: [$option]"
+}
