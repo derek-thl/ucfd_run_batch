@@ -668,7 +668,7 @@ A frontier changes when, for example:
 - a Pull Request merges;
 - a dependency becomes satisfied;
 - a task becomes blocked;
-- the immediate next actor changes;
+- the next actor changes;
 - safe parallel work changes;
 - Owner input becomes required;
 - a new `main` SHA changes admission state.
@@ -687,13 +687,19 @@ Every new frontier comment MUST contain:
 
 1. exact GitHub `main` SHA;
 2. Current actor;
-3. Immediate recipient / next actor;
+3. Next actor;
 4. completed actions;
 5. current tracking table;
 6. safe parallel work;
 7. authority exclusions;
 8. evidence links;
 9. Product Owner action now.
+
+Actor terms have these exact meanings:
+
+- `Current actor`: the author of the frontier-update comment.
+- `Next actor`: the immediate recipient of the Current actor's handoff.
+- `Next action`: the exact task that the Current actor assigns to the Next actor.
 
 The tracking table MUST contain the exact task assigned to the next actor.
 
@@ -714,7 +720,7 @@ Main SHA: `<EXACT_MAIN_SHA>`
 
 Current actor: `<GITHUB_ACCOUNT_OR_ROLE>`
 
-Immediate recipient: `<GITHUB_ACCOUNT_OR_ROLE>`
+Next actor: `<GITHUB_ACCOUNT_OR_ROLE>`
 
 ### Completed actions
 
