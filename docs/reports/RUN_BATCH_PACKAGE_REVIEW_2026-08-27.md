@@ -2,11 +2,14 @@
 
 - Author: `derek-implementer`
 - Date: 2026-08-27
-- Reviewed `main` SHA: `68fdbcc413b29f4ec2a0c43bb3930e98891af57f`
+- Code snapshot reviewed: `main` at `68fdbcc413b29f4ec2a0c43bb3930e98891af57f`
+- Workflow status as of: Issue #1 frontier `PR_15_SNAPSHOT_CORRECTIONS_REQUIRED`, 2026-08-27T14:28Z, when `main` was `121c8bebae663278c86299477fe54f9ddc85dba8`
 - Report Issue: #14
 - Classification: `DOCUMENTATION_ONLY`
 
 **Authority note.** This report is analysis. It grants no implementation authority. Each proposal in this report needs its own Product Owner approval and its own Architect-bounded Issue before implementation.
+
+**Snapshot note.** Two different times occur in this report. Every code observation, line count, and measurement describes the fixed snapshot `68fdbcc4`. Every Issue and Pull Request status describes the workflow status time above. A code observation at `68fdbcc4` stays true for that snapshot after a later merge changes `main`. Statements about status always name the status time or the exact commit.
 
 ---
 
@@ -14,7 +17,7 @@
 
 The package is a five-stage OpenFOAM batch pipeline (~5,100 lines of self-contained Bash across six scripts). It is governed by a strong written contract (`docs/RUN_BATCH_HANDOFF_SPEC.md`, v4) and, since Issue #4, a 16-scenario automated acceptance suite that runs in GitHub Actions without OpenFOAM.
 
-The current phase restores v4 conformance through small test-backed bug fixes. It is nearly complete: Pull Request #12 is in re-review; Issues #9 and #10 wait for Owner sequencing.
+The current phase restores v4 conformance through small test-backed bug fixes. At the status time it is nearly complete: Pull Request #12 merged as `121c8beb` and closed the Issue #6 scope; Pull Request #16 for Issue #9 is approved at exact commit `317b219b` and waits for the Owner merge; Issue #10 stays blocked until Issue #9 merges.
 
 The dominant defect class is **"failure produces success"**. Five of the seven confirmed defects are variants of it. All share one root cause: each stage runner re-implements its own job management, locking, summary output, and failure accounting, and each copy drifted independently. Measured duplication: 36 helper functions are defined in 2 to 6 scripts each.
 
@@ -37,7 +40,9 @@ The v4 specification (1,693 lines, 29 sections) is the normative contract. It ex
 | Compatibility (S28-29) | A definition-of-done list of every externally observable behavior; baseline fingerprints identify v4. |
 | Constraints (S5, S26-27) | GNU/Linux, Bash >= 4 (>= 4.3 for `-B > 1`), GNU coreutils, naive CSV. Non-goals (not required by v4): Python orchestrator, scheduler integration, common shell library, RFC CSV parsing. Section 26 allows them as separate reviewed future changes. Six recorded technical-debt items. |
 
-**Current implementation behavior** conforms after the merged fixes (#4, #5, #7), with three tracked residual gaps: mesh/flow command-failure propagation (Issue #9); the full Issue #6 scope in Pull Request #12 (a missing requested post-processing case and a missing transport flow prerequisite still produced false success at this base, plus failure-artifact write-error hardening; in re-review); and top-level help omissions (Issue #10); plus the documented Section 27 debt.
+**Implementation behavior at the `68fdbcc4` snapshot** conforms after the merged fixes (#4, #5, #7), with three residual gaps at that snapshot: mesh and flow command-failure propagation; a missing requested post-processing case and a missing transport flow prerequisite that still produced false success, plus unhardened failure-artifact write errors; and top-level help omissions. The documented Section 27 debt also applies.
+
+**Status of those gaps at the status time.** The second gap is closed: Pull Request #12 merged as `121c8beb` and completed the Issue #6 scope. The first gap has an approved fix that is not merged: Pull Request #16 for Issue #9 at exact commit `317b219b`. The third gap stays open as Issue #10, blocked until Issue #9 merges.
 
 ## 3. Current architecture
 
@@ -67,12 +72,14 @@ Six self-contained scripts. `run_batch.sh` (1,009 lines) parses and validates on
 
 Priorities: `P0` correctness/contract violation; `P1` major UX/reliability; `P2` maintainability/architecture debt; `P3` optional.
 
-| ID | Pri | Current behavior | Expected behavior | User impact | Root cause | Recommended change | Compat risk | Verification |
+The "Behavior at `68fdbcc4`" column describes the fixed code snapshot only. The "Recommended change" column names the workflow status at the status time in the report header.
+
+| ID | Pri | Behavior at `68fdbcc4` | Expected behavior | User impact | Root cause | Recommended change | Compat risk | Verification |
 |---|---|---|---|---|---|---|---|---|
-| G1 | P0 | Mesh/flow OpenFOAM command failure gives case `meshed`/`solved` and stage exit 0 | Failed case and non-zero stage (S23.P) | Silent bad results | Case body left of `\|\|` suppresses `set -e`; `die` exits the subshell past the failure handler | **Tracked: Issue #9** (approved, awaiting sequencing) | Low: restores documented behavior | Fake-command forced failures per stage |
-| G2 | P0 | At this base, a missing requested post case and a missing transport flow prerequisite produce false success, and an artifact write error can also give stage success | Missing prerequisites and write errors must fail the stage (S17.4, S18.5, S23.P) | False green runs | Missing-case paths skip the failure artifact; the lock release masked the append status; wait loops discarded child exits | **Tracked: Pull Request #12** (complete Issue #6 scope) at `31cfe967` (in re-review) | Low | Missing-case scenarios plus `/dev/full` artifact-write tests |
+| G1 | P0 | Mesh/flow OpenFOAM command failure gives case `meshed`/`solved` and stage exit 0 | Failed case and non-zero stage (S23.P) | Silent bad results | Case body left of `\|\|` suppresses `set -e`; `die` exits the subshell past the failure handler | **Tracked: Issue #9.** Pull Request #16 is approved at exact commit `317b219b` and is not merged at the status time | Low: restores documented behavior | Fake-command forced failures per stage |
+| G2 | P0 | A missing requested post case and a missing transport flow prerequisite produce false success, and an artifact write error can also give stage success | Missing prerequisites and write errors must fail the stage (S17.4, S18.5, S23.P) | False green runs | Missing-case paths skip the failure artifact; the lock release masked the append status; wait loops discarded child exits | **Closed at the status time.** Pull Request #12 carried the complete Issue #6 scope and merged as `121c8beb` | Low | Missing-case scenarios plus `/dev/full` artifact-write tests |
 | G3 | P1 | Setup exits 0 with failed rows (warn only) | Operator-visible failure signal | Partial workspaces look successful | Documented Section 27.2 exception | Owner decision Issue: align the setup exit with the other stages, or keep it and document it loudly | Medium: automation may depend on exit 0 | New 23.P sub-case for setup |
-| G4 | P1 | No consolidated end-of-run report | One per-batch/stage/case digest with failing-log paths | Slow failure triage | Reporting is owned per stage and never aggregated | Additive top-level report (`BEHAVIOR_CHANGE`; S15 guards artifacts) | Low: additive lines only | Golden-output contract test |
+| G4 | P1 | No consolidated end-of-run report | One per-batch/stage/case digest with failing-log paths | Slow failure triage | Reporting is owned per stage and never aggregated | Additive top-level report (`BEHAVIOR_CHANGE`; S19 is the applicable logging and summary contract, and S3.1 gives top-level logging to `run_batch.sh`; per-stage artifacts stay under S15.5, S16.6, S17.9, and S18.5) | Low: additive lines only | Golden-output contract test |
 | G5 | P1 | No read-only status view | `--status` reports marker/signature state per case | Manual marker inspection | S21 evidence is never surfaced | New read-only CLI mode (`BEHAVIOR_CHANGE`) | Low: zero writes | New CLI contract scenario |
 | G6 | P1 | Tools checked per stage at case start | Selected-stage tool preflight up front | Hours-late failures | `need_cmd` lives in runners only | Top-level advisory (or Owner-chosen hard) preflight | Low when advisory | Restricted-PATH preflight test |
 | G7 | P2 | 36 helpers duplicated 2-6x, drifted | One shared implementation per concern | Recurring defect class; triple fix cost | Copy-paste growth under the S3.3 SHOULD-level self-contained property | `master_batch/lib_batch_stage.sh`; a reviewed `SPEC_CHANGE` updates the S3.3/S26 deployment rules first, then extract one concern per Pull Request | Medium; mitigate with frozen runner CLIs and the full suite per PR | 16-scenario suite plus three focused suites green each PR |
@@ -131,7 +138,9 @@ User
 
 ### Current architecture pain points
 
-1. Weak error propagation in mesh and flow (Issue #9): the one remaining false-success path.
+These pain points describe the `68fdbcc4` snapshot.
+
+1. Weak error propagation in mesh and flow: the one remaining false-success path at that snapshot. Issue #9 tracks it, and Pull Request #16 holds an approved fix at commit `317b219b` that is not merged at the status time.
 2. Five copies of stage machinery: 36 functions with up to 6 definitions; four summary/lock/progress variants; per-file bug fixing.
 3. Single-channel workspace passing: the documented S8 cwd rule is the only workspace channel; `-O` is never forwarded, so direct invocation outside the orchestrator must reproduce the cwd convention by hand.
 4. Reporting never aggregates: failure triage crosses five CSVs with three column layouts.
@@ -189,7 +198,7 @@ Raw CLI arguments cross exactly one boundary (frontend to runners) in their alre
 CURRENT
    |
    v
-(1) Contract stabilization      PR #12, Issue #9, Issue #10, G3 decision
+(1) Contract stabilization      PR #12 merged, Issue #9 approved, Issue #10, G3 decision
    |
    v
 (2) CLI/UX normalization        G4 report, G5 status, G6 preflight, G9 save-times
@@ -219,14 +228,14 @@ A full rewrite or a Python migration is **not** recommended: the contract suite 
 |---|---|---|---|---|---|---|---|
 | I-A | ShellCheck in CI (G11) | `IMPLEMENTATION_ONLY` | `.github/workflows/batch-contract.yml`, `tests/**` | No source changes; no autofix | CI job green with a pinned version and curated directives | none | No production change |
 | I-B | Setup failure exit decision (G3) | `BEHAVIOR_CHANGE` | `src/master_batch/setup_cases.sh`, one focused test file, spec S14.8/S27.2 clause diff | No summary schema change | Failed row gives non-zero exit; skip rows unchanged | PR #12 merged | Exit-code consumers must be notified |
-| I-C | Consolidated run report (G4) | `BEHAVIOR_CHANGE` | `src/run_batch.sh`, focused test | No schema or exit-code changes | Report lists per-stage case counts and failing log paths; golden test | Phase (1) complete | Additive output only |
+| I-C | Consolidated run report (G4) | `BEHAVIOR_CHANGE` with a specification clause diff | `src/run_batch.sh`, focused test, `docs/RUN_BATCH_HANDOFF_SPEC.md` clauses S19 (top-level MUST-log list) and S23 (new acceptance sub-case) | No schema, marker, or exit-code changes; no stage-runner changes; no per-stage artifact changes under S15.5, S16.6, S17.9, S18.5 | Clause level: S19 gains the report block in the top-level MUST-log list and removes no existing line; S23 gains one sub-case that asserts every added line. Code level: the report lists per-stage case counts and failing log paths; a golden-output test asserts the exact block | Phase (1) complete; Owner approval of the S19 clause diff | Additive output only; existing log lines and their order stay unchanged |
 | I-D | `--status` mode (G5) | `BEHAVIOR_CHANGE` | `src/run_batch.sh`, focused test, spec S6.4 addition | No writes; no OpenFOAM calls | Marker-derived state per case; read-only proven by tree diff | I-C optional | New flag only |
-| I-E | Selected-stage tool preflight (G6) | `BEHAVIOR_CHANGE` | `src/run_batch.sh`, focused test | No per-case check removal | Missing tool named before stage 1 starts | Phase (1) complete | Advisory default |
+| I-E | Selected-stage tool preflight (G6) | `BEHAVIOR_CHANGE` with a specification clause diff | `src/run_batch.sh`, focused test, `docs/RUN_BATCH_HANDOFF_SPEC.md` clauses S19 (preflight result line), S5 (OpenFOAM tools in `PATH`), and S23 (new acceptance sub-case); S3.1 already gives preflight validation to `run_batch.sh` and needs no diff | No per-case `need_cmd` removal from any runner; no runner changes; no new hard failure in the advisory default | Clause level: S19 states the tool-preflight line, S5 states which commands each selected stage requires, and S23 gains one sub-case. Code level: a restricted-`PATH` test proves the missing tool is named before stage 1 starts and that the advisory default leaves every exit status unchanged | Phase (1) complete; Owner approval of the S19/S5 clause diff and of the advisory-versus-hard default | Advisory default; a hard-failure mode needs a separate Owner decision |
 | I-F | Explicit `-O` forwarding in addition to the S8 cwd rule (G8) | Design decision; `BEHAVIOR_CHANGE` with a reviewed S8/S9 contract note | `src/run_batch.sh`, stub-test assertion, spec S8/S9 note | No runner changes; the S8 cwd rule stays | Stubs record `-O <batch_dir>`; all suites green | Phase (1) complete; Owner adoption of G8 | Runner defaults and cwd behavior preserved |
 | I-G | Shared stage library (G7, G12) | `SPEC_CHANGE` plus behavior-preserving refactor series | Spec S3.3/S26 diff first, then per PR: `src/master_batch/lib_batch_stage.sh` plus one runner concern plus tests | No CLI, schema, or marker changes ever | Each PR: full shared and focused suites green | I-A, phase (1), Owner spec approval | Frozen runner interfaces |
 
 ## 11. Recommended first bounded implementation Issue
 
-**Land the in-flight work first:** the Architect re-review of Pull Request #12 at `31cfe9674cd2523187d7a6a6de47f021301608a1`, then Issues #9 and #10 in the Owner's sequence.
+**Land the in-flight work first.** At the status time, Pull Request #12 has merged as `121c8beb`. The remaining in-flight work is the Owner merge of Pull Request #16 at approved commit `317b219b` for Issue #9, then Issue #10 in the Owner's sequence.
 
 The first new item after that is **I-A (ShellCheck in CI)**: zero production risk, immediate review leverage, and it hardens the verification net that every later phase depends on.
