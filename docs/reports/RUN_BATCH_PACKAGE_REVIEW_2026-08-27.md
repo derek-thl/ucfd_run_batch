@@ -7,7 +7,9 @@
 - Report Issue: #14
 - Classification: `DOCUMENTATION_ONLY`
 
-**Authority note.** This report is analysis. It grants no implementation authority. Each proposal in this report needs its own Product Owner approval and its own Architect-bounded Issue before implementation.
+**Authority note.** This report is analysis. It grants no implementation authority. Each candidate in this report needs its own Product Owner approval and its own Architect-bounded Issue before implementation.
+
+Product Owner approval and an Architect-bounded Issue are not sufficient. Implementation starts only after the active Tracking Issue authorizes all of the following: the exact base SHA, the Implementer, the branch, the write allowlist, the tests, and the exclusions. A candidate in this report satisfies none of these conditions.
 
 **Snapshot note.** Two different times occur in this report. Every code observation, line count, and measurement describes the fixed snapshot `68fdbcc4`. Every Issue and Pull Request status describes the workflow status time above. A code observation at `68fdbcc4` stays true for that snapshot after a later merge changes `main`. Statements about status always name the status time or the exact commit.
 
@@ -190,7 +192,7 @@ Verification net on every PR: 16-scenario shared suite,
 three focused suites, ShellCheck.
 ```
 
-Raw CLI arguments cross exactly one boundary (frontend to runners) in their already-contract-tested form; everything else travels as normalized configuration. Runner CLIs and the exported environment stay byte-compatible, so old batches rerun unchanged.
+No raw CLI argument passes through unchanged from the user to a runner. `run_batch.sh` parses the top-level CLI, including the output root `-o`, and then constructs each stage-runner argument vector: `-i <csv>`, an optional `-j <n>`, and the stage options. The transport `--save-times` value is the one value that is forwarded unchanged, as a single value argument (S23.I). The runner workspace option `-O` is a different interface and is not forwarded; the workspace passes through the S8 cwd channel. Runner CLIs and the exported environment stay byte-compatible, so old batches rerun unchanged.
 
 ## 9. Current to target migration path
 
@@ -223,20 +225,28 @@ TARGET
 
 A full rewrite or a Python migration is **not** recommended: the contract suite proves the Bash implementation is testable, Section 26 lists a Python orchestrator as a non-goal, and no finding requires capabilities Bash lacks.
 
-## 10. Proposed bounded Issues
+## 10. Architecture decision candidates
 
-| # | Proposal | Classification | Write surface | Non-goals | Acceptance / tests | Dependencies | Compatibility requirement |
-|---|---|---|---|---|---|---|---|
-| I-A | ShellCheck in CI (G11) | `IMPLEMENTATION_ONLY` | `.github/workflows/batch-contract.yml`, `tests/**` | No source changes; no autofix | CI job green with a pinned version and curated directives | none | No production change |
-| I-B | Setup failure exit decision (G3) | `BEHAVIOR_CHANGE` | `src/master_batch/setup_cases.sh`, one focused test file, spec S14.8/S27.2 clause diff | No summary schema change | Failed row gives non-zero exit; skip rows unchanged | PR #12 merged | Exit-code consumers must be notified |
-| I-C | Consolidated run report (G4) | `BEHAVIOR_CHANGE` with a specification clause diff | `src/run_batch.sh`, focused test, `docs/RUN_BATCH_HANDOFF_SPEC.md` clauses S19 (top-level MUST-log list) and S23 (new acceptance sub-case) | No schema, marker, or exit-code changes; no stage-runner changes; no per-stage artifact changes under S15.5, S16.6, S17.9, S18.5 | Clause level: S19 gains the report block in the top-level MUST-log list and removes no existing line; S23 gains one sub-case. Because the S19 clause is MUST-level, acceptance must cover every run outcome: (a) a successful single-batch run prints the report with per-stage case counts and no failing-log paths; (b) a failed run prints the report, names every failed stage, and lists a log path per failed case; (c) a multi-batch run prints one report section per batch plus a run total, in the canonical batch order; (d) a `--keep-going` run reports every attempted batch, marks the failed batches, and keeps the final exit status non-zero; (e) a run stopped after the first failed batch reports the attempted batches only and does not invent rows for batches that never started. A golden-output test asserts the exact block for each case | Phase (1) complete; Owner approval of the S19 clause diff | Additive output only; existing log lines and their order stay unchanged |
-| I-D | `--status` mode (G5) | `BEHAVIOR_CHANGE` | `src/run_batch.sh`, focused test, spec S6.4 addition | No writes; no OpenFOAM calls | Marker-derived state per case; read-only proven by tree diff | I-C optional | New flag only |
-| I-E | Selected-stage tool preflight (G6) | `BEHAVIOR_CHANGE` with a specification clause diff | `src/run_batch.sh`, focused test, `docs/RUN_BATCH_HANDOFF_SPEC.md` clauses S19 (preflight result line), S5 (OpenFOAM tools in `PATH`), and S23 (new acceptance sub-case); S3.1 already gives preflight validation to `run_batch.sh` and needs no diff | No per-case `need_cmd` removal from any runner; no runner changes; no new hard failure in the advisory default | Clause level: S19 states the tool-preflight line, S5 states which commands each selected stage requires, and S23 gains one sub-case. Code level, one restricted-`PATH` case per selected stage: setup (`surfaceCheck`, `surfaceTransformPoints`, `foamDictionary`), mesh (`surfaceFeatureExtract`, `blockMesh`, `decomposePar`, `mpirun`, `snappyHexMesh`, `reconstructParMesh`, `checkMesh`, `foamDictionary`), flow (`decomposePar`, `mpirun`, `renumberMesh`, `checkMesh`, `foamDictionary`), transport (`decomposePar`, `mpirun`, `renumberMesh`), and post (`foamToVTK`). Dynamic prerequisites need their own cases: the flow and transport solver names come from `application` in each case `system/controlDict`, so the preflight must read the selected cases and must report the case when no solver can be detected; `reconstructPar` is required only when `RECONSTRUCT_MODE` is not `none`, so a `none` run must not report it missing; mesh continue mode must not require the fresh-only command set; and optional commands such as `foamListTimes` must never be reported as missing. Every case must also prove that the advisory default leaves the exit status unchanged | Phase (1) complete; Owner approval of the S19/S5 clause diff and of the advisory-versus-hard default | Advisory default; a hard-failure mode needs a separate Owner decision |
-| I-F | Explicit `-O` forwarding in addition to the S8 cwd rule (G8) | Design decision; `BEHAVIOR_CHANGE` with a reviewed S8/S9 contract note | `src/run_batch.sh`, stub-test assertion, spec S8/S9 note | No runner changes; the S8 cwd rule stays | Stubs record `-O <batch_dir>`; all suites green | Phase (1) complete; Owner adoption of G8 | Runner defaults and cwd behavior preserved |
-| I-G | Shared stage library (G7, G12) | `SPEC_CHANGE` plus behavior-preserving refactor series | Spec S3.3/S26 diff first, then per PR: `src/master_batch/lib_batch_stage.sh` plus one runner concern plus tests | No CLI, schema, or marker changes ever | Each PR: full shared and focused suites green | I-A, phase (1), Owner spec approval | Frozen runner interfaces |
+These candidates are not implementation contracts. They are architecture decisions that the Product Owner can select or reject. No candidate is authorized, and no candidate carries acceptance authority.
 
-## 11. Recommended first bounded implementation Issue
+This baseline keeps the intent, the candidate classification, the invariants, and the dependencies only. The exact positive, negative, failure, and regression cases, the acceptance matrices, the write allowlists, and the specification clause diffs belong to a dedicated bounded Issue. The Architect writes that Issue after the Product Owner selects the candidate.
+
+| ID | Architecture decision candidate | Intent | Candidate classification | Invariants | Dependencies |
+|---|---|---|---|---|---|
+| I-A | ShellCheck in CI (G11) | Add static analysis to the verification net | `IMPLEMENTATION_ONLY` | No production source change | none |
+| I-B | Setup failure exit decision (G3) | Align the setup exit status with the other stages, or keep and document the exception | `BEHAVIOR_CHANGE` | The summary schema stays unchanged | Pull Request #12 merged |
+| I-C | Consolidated run report (G4) | Give one end-of-run digest for triage | `BEHAVIOR_CHANGE` with a specification clause diff | Output stays additive; schemas, markers, and exit statuses stay unchanged | Phase (1) complete; Owner approval of the S19 clause diff |
+| I-D | `--status` mode (G5) | Report the marker state per case without writing | `BEHAVIOR_CHANGE` | The mode writes nothing and calls no OpenFOAM command | I-C optional |
+| I-E | Selected-stage tool preflight (G6) | Name a missing command before stage 1 starts | `BEHAVIOR_CHANGE` with a specification clause diff | No runner keeps fewer per-case checks; the advisory default changes no exit status | Phase (1) complete; Owner approval of the S19/S5 clause diff and of the advisory-versus-hard default |
+| I-F | Explicit `-O` forwarding in addition to the S8 cwd rule (G8) | Make the workspace binding visible in the stage command | `BEHAVIOR_CHANGE` with a reviewed S8/S9 contract note | No runner change; the S8 cwd rule stays | Phase (1) complete; Owner adoption of G8 |
+| I-G | Shared stage library (G7, G12) | Remove the duplicated stage machinery | `SPEC_CHANGE` plus a behavior-preserving refactor series | Runner CLIs, the exported environment, the schemas, and the markers stay frozen | I-A, phase (1), Owner approval of the S3.3/S26 diff |
+
+A candidate that the Product Owner selects still needs the full admission gate in the authority note above before implementation starts.
+
+## 11. Recommended first candidate
+
+This section recommends an order. It selects nothing and authorizes nothing.
 
 **Land the in-flight work first.** At the status time, Pull Request #12 has merged as `121c8beb`. The remaining in-flight work is the Owner merge of Pull Request #16 at approved commit `317b219b` for Issue #9, then Issue #10 in the Owner's sequence.
 
-The first new item after that is **I-A (ShellCheck in CI)**: zero production risk, immediate review leverage, and it hardens the verification net that every later phase depends on.
+The recommended first candidate after that work is **I-A (ShellCheck in CI)**: zero production risk, immediate review leverage, and it hardens the verification net that every later candidate depends on. If the Product Owner selects I-A, the Architect writes the bounded Issue, and the active Tracking Issue authorizes the base SHA, the Implementer, the branch, the write allowlist, the tests, and the exclusions.
