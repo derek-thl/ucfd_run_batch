@@ -179,4 +179,56 @@ assert_eq 1 "$(summary_status_count "$summary2" solved)" \
     "batch_2 transport succeeds under --keep-going"
 report "test_top_level_continues_with_keep_going"
 
+# ---- 6. post failure-artifact write error must not produce success --------------
+
+# /dev/full accepts open and truncate and fails every write with ENOSPC. A
+# failure-artifact symlink to /dev/full makes the artifact append fail while
+# stage setup still succeeds.
+[[ -c /dev/full ]] || _fail "/dev/full is required for the write-error scenarios"
+
+workspace="$(new_workspace post_artifact_error)"
+install_fakes "$workspace"
+assert_fakes_active
+make_csv "${workspace}/output_batch_1.csv" 9
+ln -s /dev/full "${workspace}/.run_post_processing_cases_failed"
+
+out="$(cd "$workspace" && timeout 120 \
+        bash "$POST_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+
+assert_failure "$status" "a post failure-artifact write error must not produce success"
+assert_contains "$out" "One or more post-processing jobs failed" \
+    "the stage reports the failure although the artifact append failed"
+summary="${workspace}/run_post_processing_cases_summary.csv"
+assert_eq 1 "$(summary_status_count "$summary" failed 3)" \
+    "the missing case is still summarized as failed"
+[[ ! -s "${workspace}/.run_post_processing_cases_failed" ]] ||
+    _fail "the scenario requires an empty failure artifact to prove the gate"
+report "test_post_failure_artifact_write_error_fails_stage"
+
+# ---- 7. transport failure-artifact write error must not produce success ----------
+
+# PROGRESS_INTERVAL is set very high so that show_progress never reads the
+# device-backed failure artifact during this scenario.
+workspace="$(new_workspace transport_artifact_error)"
+install_fakes "$workspace"
+assert_fakes_active
+make_csv "${workspace}/output_batch_1.csv" 9
+make_transport_case "${workspace}/case_9/trd" 2 T 300
+ln -s /dev/full "${workspace}/.run_transport_cases_failed"
+
+out="$(cd "$workspace" && env PROGRESS_INTERVAL=9999999999 timeout 120 \
+        bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 \
+        --save-times "60,120,300" 2>&1)" && status=0 || status=$?
+
+assert_failure "$status" "a transport failure-artifact write error must not produce success"
+assert_contains "$out" "One or more transport jobs failed" \
+    "the stage reports the failure although the artifact append failed"
+summary="${workspace}/run_transport_cases_summary.csv"
+assert_eq 1 "$(summary_status_count "$summary" failed)" \
+    "the missing-flow case is still summarized as failed"
+[[ ! -s "${workspace}/.run_transport_cases_failed" ]] ||
+    _fail "the scenario requires an empty failure artifact to prove the gate"
+report "test_transport_failure_artifact_write_error_fails_stage"
+
 printf '\nAll %s focused stage-failure contract tests passed.\n' "$PASS_COUNT"

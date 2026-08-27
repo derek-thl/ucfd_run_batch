@@ -570,12 +570,16 @@ process_case() {
     info "Finished $case_id: $vtk_dir"
 }
 
+# Failure counter for discarded child exits. A case job that fails without a
+# readable failure artifact must still make the stage non-zero.
+JOB_FAILURES=0
+
 wait_for_slot() {
     while (($(jobs -rp | wc -l) >= PARALLEL_JOBS)); do
         if ((BASH_VERSINFO[0] > 4 ||
              (BASH_VERSINFO[0] == 4 &&
               BASH_VERSINFO[1] >= 3))); then
-            wait -n || true
+            wait -n || JOB_FAILURES=$((JOB_FAILURES + 1))
         else
             sleep 0.5
         fi
@@ -587,7 +591,7 @@ wait_for_all_jobs() {
         if ((BASH_VERSINFO[0] > 4 ||
              (BASH_VERSINFO[0] == 4 &&
               BASH_VERSINFO[1] >= 3))); then
-            wait -n || true
+            wait -n || JOB_FAILURES=$((JOB_FAILURES + 1))
         else
             sleep 0.5
         fi
@@ -650,7 +654,16 @@ main() {
 
     wait_for_all_jobs
 
-    if [[ -s "$FAIL_FILE" ]]; then
+    # The final gate must not trust the failure artifact alone. A failed
+    # summary row or a discarded non-zero child exit must also make the stage
+    # non-zero, so a failure-artifact write error cannot produce success.
+    local failed_rows
+    failed_rows="$(
+        awk -F, 'NR > 1 { gsub(/"/, "", $3); if ($3 == "failed") c++ }
+                 END { print c + 0 }' "$SUMMARY_CSV"
+    )"
+
+    if [[ -s "$FAIL_FILE" ]] || ((failed_rows > 0)) || ((JOB_FAILURES > 0)); then
         die "One or more post-processing jobs failed. See $SUMMARY_CSV"
     fi
 
