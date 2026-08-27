@@ -353,10 +353,17 @@ run_step() {
     local stage="$1" msg="$2" log="${3:-}"
     shift 3
     set_case_stage "$stage" "$msg"
+    # run_step wraps required mesh commands only. The case body executes in an
+    # errexit-ignored context (Bash disables set -e on the left of ||), so a
+    # failed required command must stop the case explicitly (v4 Sections 15.5
+    # and 23.P). die exits the case subshell; the failure handler in
+    # mesh_one_case then records the failed case.
     if [[ -n "$log" ]]; then
-        run_tee "$log" "$@"
+        run_tee "$log" "$@" ||
+            die "Required mesh command failed: $1 (see log: $log)"
     else
-        run_cmd "$@"
+        run_cmd "$@" ||
+            die "Required mesh command failed: $1"
     fi
 }
 
@@ -527,7 +534,12 @@ mesh_one_case() {
     CASE_STATUS=""
     CASE_MESSAGE=""
 
-    {
+    # The case body runs in an explicit subshell. A die (exit) inside the body
+    # then terminates only the body and returns non-zero to this guard, so the
+    # failure handler below always records the failed case (v4 Section 23.P).
+    # A brace group here would let die exit the whole background job and skip
+    # the handler.
+    (
         set_case_stage "starting" "mesh job started"
         echo ">>> Start case: $case_name"
         echo ">>> Case dir  : $case_dir"
@@ -538,7 +550,7 @@ mesh_one_case() {
         cd "$case_dir"
         mesh_current_case
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "$CASE_STATUS" "$CASE_MESSAGE"
-    } > "$log_file" 2>&1 || {
+    ) > "$log_file" 2>&1 || {
         set_case_stage "failed" "mesh job failed; see log: $log_file"
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file"
         mark_failed "$case_name"
@@ -547,6 +559,13 @@ mesh_one_case() {
         return 1
     }
 
+    # The body subshell cannot export CASE_STATUS. The body's final
+    # set_case_stage wrote the status into the case state file; read it back
+    # for the console line before the state file is cleared.
+    CASE_STATUS="$(
+        awk -F= '$1 == "stage" { print substr($0, index($0, "=") + 1) }' \
+            "$(state_file)" 2>/dev/null | tail -n 1
+    )"
     info "MESH FINISHED: $case_name | status=${CASE_STATUS:-unknown} | log: $log_file"
     clear_case_stage
 }

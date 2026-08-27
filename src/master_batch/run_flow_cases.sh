@@ -304,7 +304,15 @@ run_cmd() {
 run_tee() {
     local logfile="$1"; shift
     echo ">>> [$PWD] $* (tee -> ${logfile})"
-    "$@" 2>&1 | tee "$logfile"
+    # run_tee wraps required flow commands only; optional diagnostics use
+    # run_cmd with an explicit || true. The case body executes in an
+    # errexit-ignored context (Bash disables set -e on the left of ||), so a
+    # failed required command must stop the case explicitly (v4 Sections 16.6
+    # and 23.P). die exits the case subshell; the failure handler in
+    # solve_one_case then records the failed case. pipefail keeps the
+    # command's own status through the tee pipeline.
+    "$@" 2>&1 | tee "$logfile" ||
+        die "Required flow command failed: $1 (see log: $logfile)"
 }
 
 dict_get() {
@@ -486,7 +494,12 @@ solve_one_case() {
     local csv_abs="$1" row_no="$2" case_id="$3" case_name="$4" case_dir="$5"
     local log_file="$LOG_DIR/$(safe_path_token "$case_name").log"
 
-    {
+    # The case body runs in an explicit subshell. A die (exit) inside the body
+    # then terminates only the body and returns non-zero to this guard, so the
+    # failure handler below always records the failed case (v4 Section 23.P).
+    # A brace group here would let die exit the whole background job and skip
+    # the handler.
+    (
         echo ">>> Start case: $case_name"
         echo ">>> Case dir  : $case_dir"
         echo ">>> CSV row   : $csv_abs:$row_no"
@@ -501,7 +514,7 @@ solve_one_case() {
         solve_current_case
 
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "$CASE_STATUS" "$CASE_MESSAGE"
-    } > "$log_file" 2>&1 || {
+    ) > "$log_file" 2>&1 || {
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file"
 
         local lock="${SUMMARY_CSV}.lockdir"

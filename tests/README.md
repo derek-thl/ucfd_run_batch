@@ -80,7 +80,6 @@ production files. This suite does not assert them:
 | Flow must not require `reconstructPar` when `RECONSTRUCT_MODE=none` | #7 |
 | Top-level overwrite must remove an existing empty destination | #5 |
 | Top-level logging must report batch elapsed time on failure | #5 |
-| Mesh and flow stages must propagate an OpenFOAM command failure | #9 |
 | Top-level help must display the documented `--stages` alias and the `--` end-of-options marker | #10 |
 
 After those Issues merge, the combined suite covers the complete Section 23
@@ -89,20 +88,21 @@ matrix.
 ## Known contract gaps
 
 These gaps appeared during the Issue #4 test work. They are not part of the
-five confirmed gaps in Specification #3. Each gap has a bounded proposal
-Issue. This suite does not assert them.
+five confirmed gaps in Specification #3.
 
-- **Section 23.P, mesh and flow stages. Owner: Issue #9.** A failed OpenFOAM
-  command inside `run_mesh_cases.sh` or `run_flow_cases.sh` does not fail the
-  case. The case summary records `meshed` or `solved`, and the stage exits `0`.
-  Cause: the case body runs on the left side of a `||` list, so `set -e` has no
-  effect inside the body, and a failed `run_tee` does not stop the case.
-  The transport stage and the post-processing stage propagate a case failure
-  correctly.
-  `cases/p_failure_propagation.sh` covers only the conforming failure paths.
+- **Section 23.P, mesh and flow stages. Restored by Issue #9.** A failed
+  required OpenFOAM command inside `run_mesh_cases.sh` or `run_flow_cases.sh`
+  previously did not fail the case: the case body runs on the left side of a
+  `||` list, so `set -e` has no effect inside the body, and a `die` exited the
+  whole background job past the failure handler. The Issue #9 correction runs
+  each case body in an explicit subshell and makes the required-command
+  wrappers (`run_step` in mesh, `run_tee` in flow) stop the case on failure.
+  `cases/p_failure_propagation.sh` now asserts a failed summary row, the
+  failure artifact, a non-zero stage, and no success marker for every required
+  fresh-mesh and fresh-flow command.
 - **Section 23.B, top-level help completeness. Owner: Issue #10.** The
   `run_batch.sh` help does not display the documented `--stages` alias or the
   `--` end-of-options marker from specification Section 6.4. Both forms work;
   only the help text omits them. `cases/b_cli_help.sh` asserts every top-level
   option form that the current help displays and does not assert `--stages`
-  or `--`.
+  or `--`. This suite does not assert the missing help forms.
