@@ -9,7 +9,7 @@
 
 **Authority note.** This report is analysis. It grants no implementation authority. Each candidate in this report needs its own Product Owner approval and its own Architect-bounded Issue before implementation.
 
-Product Owner approval and an Architect-bounded Issue are not sufficient. Implementation starts only after the active Tracking Issue authorizes all of the following: the exact base SHA, the Implementer, the branch, the write allowlist, the tests, and the exclusions. A candidate in this report satisfies none of these conditions.
+Product Owner approval and an Architect-bounded Issue are not sufficient. Implementation starts only after the active Tracking Issue authorizes all of the following: the Item, the exact base SHA, the branch, the write allowlist, the acceptance tests, the satisfied dependencies, the Implementer as the next actor, and the authority exclusions. A candidate in this report satisfies none of these conditions.
 
 **Snapshot note.** Two different times occur in this report. Every code observation, line count, and measurement describes the fixed snapshot `68fdbcc4`. Every Issue and Pull Request status describes the workflow status time above. A code observation at `68fdbcc4` stays true for that snapshot after a later merge changes `main`. Statements about status always name the status time or the exact commit.
 
