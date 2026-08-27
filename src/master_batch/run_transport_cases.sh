@@ -191,11 +191,15 @@ append_summary() {
     rmdir "$lock"
 }
 
+# mark_failed returns the failure-artifact append status. The lock release
+# must not replace a failed append with success, because a failure-artifact
+# write error must not produce stage success.
 mark_failed() {
-    local case_name="$1" lock="${SUMMARY_CSV}.lockdir"
+    local case_name="$1" lock="${SUMMARY_CSV}.lockdir" rc=0
     while ! mkdir "$lock" 2>/dev/null; do sleep 0.05; done
-    echo "$case_name" >> "$FAIL_FILE"
+    echo "$case_name" >> "$FAIL_FILE" || rc=$?
     rmdir "$lock"
+    return "$rc"
 }
 
 # ---- Arguments / config ------------------------------------------------------
@@ -469,11 +473,16 @@ show_progress() {
     shopt -u nullglob
 }
 
+# Failure-recording error counters. A non-zero child exit must not be hidden
+# when the failure artifact could not be written.
+FAIL_RECORD_ERRORS=0
+JOB_FAILURES=0
+
 wait_for_free_slot() {
     while (( $(jobs -rp | wc -l | tr -d ' ') >= PARALLEL_JOBS )); do
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
+            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
         else
             sleep 0.5
         fi
@@ -485,7 +494,7 @@ wait_for_all_jobs() {
         _LAST_PROGRESS_TIME=0
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
+            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
         else
             sleep 0.5
         fi
@@ -784,7 +793,14 @@ dispatch_row() {
     SEEN_CASES["$transport_name"]=1
 
     if [[ ! -d "$flow_dir" ]]; then
-        append_summary "$csv_abs" "$row_no" "$case_root" "${flow_name}|${transport_name}" "$transport_dir" "skipped" "flow case directory not found: $flow_dir"
+        # v4 Sections 17.4 and 23.P: a requested transport case without its
+        # required flow case is a failed case, not a skipped case. The failure
+        # artifact makes the stage exit non-zero. A failed artifact append is
+        # counted so that a write error cannot produce stage success.
+        append_summary "$csv_abs" "$row_no" "$case_root" "${flow_name}|${transport_name}" "$transport_dir" "failed" "flow case directory not found: $flow_dir"
+        mark_failed "$transport_name" ||
+            FAIL_RECORD_ERRORS=$(( FAIL_RECORD_ERRORS + 1 ))
+        info "TRANSPORT FAILED: $transport_name | missing required flow case: $flow_dir"
         return 0
     fi
 
@@ -868,7 +884,15 @@ main() {
     _LAST_PROGRESS_TIME=0
     show_progress
 
-    [[ ! -s "$FAIL_FILE" ]] || die "One or more transport jobs failed. See $SUMMARY_CSV and $LOG_DIR"
+    # The final gate must not trust the failure artifact alone. A failed
+    # summary row, a discarded non-zero child exit, or a failure-artifact
+    # write error must also make the stage non-zero.
+    local failed_rows
+    failed_rows="$(count_status '^failed$')"
+    if [[ -s "$FAIL_FILE" ]] || (( failed_rows > 0 )) ||
+       (( JOB_FAILURES > 0 )) || (( FAIL_RECORD_ERRORS > 0 )); then
+        die "One or more transport jobs failed. See $SUMMARY_CSV and $LOG_DIR"
+    fi
     rm -f "$FAIL_FILE"
     info "All transport jobs finished."
     info "Summary: $SUMMARY_CSV"
