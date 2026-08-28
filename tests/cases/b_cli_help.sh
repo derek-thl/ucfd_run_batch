@@ -24,16 +24,14 @@ check_help() {
 }
 
 # Top-level v4 options from specification Section 6.4.
-#
-# Exclusion: the current top-level help does not display the documented
-# `--stages` alias or the `--` end-of-options marker. That is a confirmed
-# production documentation gap owned by Issue #10, not an Issue #4 harness
-# defect. See tests/README.md, "Known contract gaps".
+# Every option and alias in the Section 6.4 table must appear, including the
+# `--stages` alias and the `--` end-of-options marker.
 check_help "$RUN_BATCH" \
-    "-s" "--stage" "-j" "--jobs" "--setup-jobs" "--mesh-jobs" "--flow-jobs" \
-    "--transport-jobs" "--post-jobs" "-B" "--batch-jobs" "-m" "--master-dir" \
-    "-o" "--output-dir" "-f" "--overwrite" "--keep-going" "--skip-post" \
-    "--save-times" "--scalar-field" "-n" "--dry-run" "-h" "--help" \
+    "-s" "--stage" "--stages" "-j" "--jobs" "--setup-jobs" "--mesh-jobs" \
+    "--flow-jobs" "--transport-jobs" "--post-jobs" "-B" "--batch-jobs" \
+    "-m" "--master-dir" "-o" "--output-dir" "-f" "--overwrite" "--keep-going" \
+    "--skip-post" "--save-times" "--scalar-field" "-n" "--dry-run" \
+    "-h" "--help" "--" \
     "MASTER_BATCH_DIR" "RUN_BATCH_OUTPUT_DIR" "RUN_BATCH_OVERWRITE"
 
 # Setup direct CLI from specification Section 14.3.
@@ -62,3 +60,35 @@ check_help "$POST_SCRIPT" \
     "-i" "-O" "--output-dir" "-j" "-h" "--help" \
     "POST_PARALLEL_JOBS" "SCALAR_FIELD" "FORCE_POST" \
     "BATCH_CSV_PATH" "BATCH_CSV"
+
+# ---- the parser still accepts the two newly documented forms ----------------
+#
+# Help text and parser behavior are separate contracts. Issue #10 changes help
+# text only. These dry-run scenarios prove that the parser behavior in
+# Section 6.4 is unchanged.
+
+parser_workspace="$(new_workspace helpparser)"
+use_stub_records "$parser_workspace"
+parser_master="${parser_workspace}/master_batch"
+parser_output="${parser_workspace}/out"
+make_stub_master "$parser_master" master
+mkdir -p "$parser_output"
+make_csv "${parser_workspace}/output_batch_1.csv" 0 1
+
+# `--stages` is the documented alias for `-s` and `--stage`.
+out="$(bash "$RUN_BATCH" --dry-run --stages setup,mesh \
+        -m "$parser_master" -o "$parser_output" \
+        "${parser_workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+
+assert_status 0 "$status" "--stages must remain accepted by the parser: $out"
+assert_contains "$out" "Selected stages : setup -> mesh" \
+    "--stages selects the same stages as --stage"
+
+# `--` ends option parsing. The remaining arguments are CSV paths.
+out="$(bash "$RUN_BATCH" --dry-run --stage setup \
+        -m "$parser_master" -o "$parser_output" \
+        -- "${parser_workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+
+assert_status 0 "$status" "-- must remain accepted as the end-of-options marker: $out"
+assert_contains "$out" "Batch count     : 1" \
+    "the argument after -- is read as a CSV path"
