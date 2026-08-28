@@ -440,8 +440,8 @@ Use one of these review states:
 
 ```text
 CHANGES_REQUESTED_AT_<COMMIT_SHA>
-APPROVED_COMMIT_<COMMIT_SHA>
-BLOCKED_<REASON>
+ARCHITECT_APPROVED_AT_<COMMIT_SHA>
+BLOCKED_BY_<CAUSE>
 ```
 
 Approval applies only to the reviewed commit.
@@ -688,12 +688,13 @@ Every new frontier comment MUST contain:
 1. exact GitHub `main` SHA;
 2. Current actor;
 3. Next actor;
-4. completed actions;
-5. current tracking table;
-6. safe parallel work;
-7. authority exclusions;
-8. evidence links;
-9. Product Owner action now.
+4. Next action;
+5. completed actions;
+6. current tracking table;
+7. safe parallel work;
+8. authority exclusions;
+9. evidence links;
+10. Product Owner action now.
 
 Actor terms have these exact meanings:
 
@@ -721,6 +722,8 @@ Main SHA: `<EXACT_MAIN_SHA>`
 Current actor: `<GITHUB_ACCOUNT_OR_ROLE>`
 
 Next actor: `<GITHUB_ACCOUNT_OR_ROLE>`
+
+Next action: <exact task for the Next actor>
 
 ### Completed actions
 
@@ -778,22 +781,26 @@ Do not combine independent Items into one row.
 
 `Evidence` MUST identify a GitHub object.
 
-Recommended states:
+Use these exact state forms when applicable:
+
+```text
+BLOCKED_BY_<CAUSE>
+CHANGES_REQUESTED_AT_<SHA>
+READY_FOR_IMPLEMENTATION_AT_<SHA>
+READY_FOR_REVIEW_AT_<SHA>
+ARCHITECT_APPROVED_AT_<SHA>
+MERGED_COMPLETE_AT_<SHA>
+SAFE_PARALLEL_AT_<SHA>
+```
+
+Additional recommended states:
 
 ```text
 OWNER_INPUT_REQUIRED
 ARCHITECT_REVIEW_REQUIRED
-READY_FOR_IMPLEMENTATION_AT_<SHA>
 IN_IMPLEMENTATION_AT_<SHA>
 PR_OPEN_<PR_NUMBER>_AT_<SHA>
-CHANGES_REQUESTED_AT_<COMMIT_SHA>
-APPROVED_COMMIT_<COMMIT_SHA>
 READY_TO_MERGE_<PR_NUMBER>_<COMMIT_SHA>
-MERGED_AT_<MAIN_SHA>
-BLOCKED_BY_<ITEM>
-BLOCKED_BY_OWNER_INPUT
-BLOCKED_BY_CI
-SAFE_PARALLEL_AT_<SHA>
 COMPLETE_AT_<MAIN_SHA>
 ```
 
@@ -841,6 +848,12 @@ When implementation is ready for review, the Implementer MUST:
 6. report limitations or deviations;
 7. append a frontier comment with the Architect as next actor.
 
+Recommended token:
+
+```text
+READY_FOR_REVIEW_AT_<EXACT_HEAD_SHA>
+```
+
 ### Architect Review -> Implementer or Owner
 
 For blocking review:
@@ -859,7 +872,7 @@ Each blocking finding MUST state:
 For approval:
 
 ```text
-APPROVED_COMMIT_<EXACT_COMMIT_SHA>
+ARCHITECT_APPROVED_AT_<EXACT_COMMIT_SHA>
 ```
 
 The Architect then appends a frontier comment with the exact next actor.
@@ -870,7 +883,7 @@ After merge:
 
 1. obtain the exact current GitHub `main` SHA;
 2. verify required Actions;
-3. mark the Item `MERGED_AT_<MAIN_SHA>`;
+3. mark the Item `MERGED_COMPLETE_AT_<MAIN_SHA>`;
 4. update dependency rows;
 5. identify newly unblocked work;
 6. identify safe parallel work;
@@ -996,6 +1009,41 @@ No Agent may silently change the approved batch-runner contract.
 Every execution-frontier change must leave an append-only GitHub record.
 
 GitHub `main` plus GitHub execution evidence is the final shared truth.
+
+---
+
+## 31. TDD and Validation Evidence
+
+Production behavior work MUST follow test-driven development when the implementation contract requires it:
+
+1. add or identify a failing test that encodes the required behavior;
+2. show the failing result;
+3. implement the bounded change;
+4. show the passing result.
+
+Documentation-only work does not require a test-first step.
+
+Every implementation Pull Request MUST publish validation evidence:
+
+- the exact validation commands;
+- the concise results;
+- the GitHub Actions results at the exact head commit.
+
+A validation claim without a GitHub-visible command result is not evidence.
+
+---
+
+## 32. Blocker Escalation
+
+When required work exceeds granted authority, the acting Agent MUST:
+
+1. stop the affected scope;
+2. keep completed authorized work intact;
+3. publish a precise blocker state such as `BLOCKED_BY_SCOPE_EXPANSION` in a new frontier comment;
+4. name the blocked Item, the exact cause, and the required authority;
+5. hand the Item to the role that owns the decision: the Architect for contract gaps, the Product Owner for scope or priority decisions.
+
+A blocker is a normal workflow state. An Agent MUST NOT widen its own authority to avoid a blocker.
 
 ---
 
