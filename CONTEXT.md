@@ -1,31 +1,31 @@
 # UCFD Batch Runner
 
-This context covers the UCFD OpenFOAM batch execution scripts in `src/`. The project automates DOE simulation batches through a fixed stage pipeline.
+This context covers UCFD OpenFOAM batch simulation execution. The project automates DOE simulation batches through a fixed stage pipeline.
 
-The normative technical contract is `docs/RUN_BATCH_HANDOFF_SPEC.md`. The normative authority contract is `AGENTS.md`. This file defines only the stable project language.
+The normative technical contract is `docs/RUN_BATCH_HANDOFF_SPEC.md`. The normative authority contract is `AGENTS.md`. This file defines only the stable project language. Implementation and behavior stay in the technical contract.
 
 ## Language
 
 ### Batch execution
 
 **UCFD Batch Runner**:
-The script family that runs DOE batches of UCFD OpenFOAM cases through the fixed stage pipeline.
+The tool that runs DOE batches of UCFD OpenFOAM simulation Cases through the fixed Stage pipeline.
 _Avoid_: batch system, pipeline tool
 
 **DOE Batch CSV**:
-One input CSV file that defines one batch. Each data row defines one Case.
+One input table that defines one batch. Each data row defines one Case.
 _Avoid_: input file, experiment sheet
 
 **Batch ID**:
-The numeric identifier that the Orchestrator extracts from a DOE Batch CSV filename. Two DOE Batch CSVs must not resolve to the same Batch ID in one run.
+The unique identifier of one batch.
 _Avoid_: batch number, run number
 
 **Batch Workspace**:
-The generated `batch_<id>` directory that holds the Cases and artifacts of one batch.
+The working area that holds the Cases and Failure Artifacts of one batch.
 _Avoid_: output folder, run directory
 
 **Case**:
-One simulation configuration from one DOE Batch CSV row, materialized as one case directory inside a Batch Workspace.
+One simulation configuration that comes from one DOE Batch CSV row.
 _Avoid_: job, run, sample
 
 **Stage**:
@@ -33,15 +33,15 @@ One step of the fixed pipeline: setup, mesh, flow, transport, post-processing.
 _Avoid_: phase, step, task
 
 **Stage Runner**:
-The script that executes one Stage for the Cases of one batch: `setup_cases.sh`, `run_mesh_cases.sh`, `run_flow_cases.sh`, `run_transport_cases.sh`, or `run_post_processing_cases.sh`.
+The execution unit that performs one Stage for the Cases of one batch.
 _Avoid_: worker, stage script (in prose)
 
 **Orchestrator**:
-`run_batch.sh`. The top-level script that selects DOE Batch CSVs, resolves Batch Workspaces, orders Stages, and controls concurrency.
+The top-level component that coordinates the Batch Workspaces, Stages, and Stage Runners of every requested batch.
 _Avoid_: wrapper, driver, main script
 
 **Failure Artifact**:
-A file that a Stage Runner or the Orchestrator writes to record a Case, Stage, or batch failure, for example a stage failure file, a summary, or a log.
+A record that documents a Case, Stage, or batch failure.
 _Avoid_: error file, crash dump
 
 ### Collaboration
