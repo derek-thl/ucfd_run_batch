@@ -60,7 +60,8 @@ Default pipeline:
   setup -> mesh -> flow -> transport -> post-processing
 
 Stage selection:
-  -s, --stage <STAGE>     Run only selected stage(s). May be repeated or comma-separated.
+  -s, --stage, --stages <STAGE>
+                          Run only selected stage(s). May be repeated or comma-separated.
                            Valid names: setup, mesh, flow, transport, post-processing, all
                            Aliases for post-processing: post, postprocess, post_processing
 
@@ -93,6 +94,7 @@ Options:
                            Default: ${SCALAR_FIELD}
   -n, --dry-run           Validate everything and print the execution plan only.
   -h, --help              Show this help.
+      --                  End option parsing. Remaining arguments are CSV paths.
 
 Environment compatibility:
   MASTER_BATCH_DIR        Same purpose as --master-dir.

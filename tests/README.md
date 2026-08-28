@@ -80,7 +80,6 @@ production files. This suite does not assert them:
 | Flow must not require `reconstructPar` when `RECONSTRUCT_MODE=none` | #7 |
 | Top-level overwrite must remove an existing empty destination | #5 |
 | Top-level logging must report batch elapsed time on failure | #5 |
-| Top-level help must display the documented `--stages` alias and the `--` end-of-options marker | #10 |
 
 After those Issues merge, the combined suite covers the complete Section 23
 matrix.
@@ -100,9 +99,11 @@ five confirmed gaps in Specification #3.
   `cases/p_failure_propagation.sh` now asserts a failed summary row, the
   failure artifact, a non-zero stage, and no success marker for every required
   fresh-mesh and fresh-flow command.
-- **Section 23.B, top-level help completeness. Owner: Issue #10.** The
-  `run_batch.sh` help does not display the documented `--stages` alias or the
-  `--` end-of-options marker from specification Section 6.4. Both forms work;
-  only the help text omits them. `cases/b_cli_help.sh` asserts every top-level
-  option form that the current help displays and does not assert `--stages`
-  or `--`. This suite does not assert the missing help forms.
+- **Section 23.B, top-level help completeness. Closed by Issue #10.** The
+  `run_batch.sh` help previously did not display the documented `--stages`
+  alias or the `--` end-of-options marker from specification Section 6.4. Both
+  forms always worked in the parser; only the help text omitted them. The
+  Issue #10 correction adds both forms to the help text and changes no parsing
+  or runtime behavior. `cases/b_cli_help.sh` now asserts every option and alias
+  in the Section 6.4 table, and it also proves by dry-run that the parser still
+  accepts `--stages` and `--`.
