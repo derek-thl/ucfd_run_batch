@@ -34,12 +34,21 @@ die() {
 
 CURRENT_FILE=""
 
+# The EXIT trap keeps the command status when cleanup succeeds. A failed
+# removal of the temporary diagnostic file makes the final status non-zero
+# (Issue #19 failure behavior).
 cleanup() {
+    local status=$?
     if [[ -n "$CURRENT_FILE" && -f "$CURRENT_FILE" ]]; then
-        rm -f -- "$CURRENT_FILE" ||
-            printf 'shellcheck-baseline: WARN: could not remove %s\n' \
+        if ! rm -f -- "$CURRENT_FILE"; then
+            printf 'shellcheck-baseline: ERROR: could not remove the temporary diagnostic file %s\n' \
                 "$CURRENT_FILE" >&2
+            if (( status == 0 )); then
+                status=1
+            fi
+        fi
     fi
+    exit "$status"
 }
 trap cleanup EXIT
 
