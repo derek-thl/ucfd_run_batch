@@ -358,6 +358,166 @@ out="$(cd "$workspace" && PATH="$setup_path" bash "$SETUP_SCRIPT" \
 assert_failure "$status" "a missing required command must stay non-zero"
 assert_contains "$out" "'surfaceCheck' not found in PATH" "the missing command is named"
 
+# A failure-artifact append failure must not produce setup success.
+#
+# `.setup_cases_failed` points at /dev/full. The stage runner can create and
+# truncate the artifact, but every append fails, and the artifact stays empty.
+# The final status must not come from the artifact size alone.
+
+make_setup_workspace setup_appendfail
+write_setup_csv "${workspace}/output_batch_1.csv" "bad_1,not_a_number,270.0"
+ln -s /dev/full "${workspace}/.setup_cases_failed"
+
+# Prove that the scenario is not vacuous.
+( : > "${workspace}/.setup_cases_failed" ) ||
+    _fail "the append-failure scenario needs a truncatable /dev/full artifact"
+if ( echo probe >> "${workspace}/.setup_cases_failed" ) 2>/dev/null; then
+    _fail "the append-failure scenario needs an append that fails"
+fi
+if [[ -s "${workspace}/.setup_cases_failed" ]]; then
+    _fail "the append-failure scenario needs an artifact that stays empty"
+fi
+
+out="$(cd "$workspace" && bash "$SETUP_SCRIPT" -i output_batch_1.csv -O . -j 1 --dry-run 2>&1)" \
+    && status=0 || status=$?
+
+assert_failure "$status" \
+    "a failed setup row must stay non-zero when the failure artifact append fails"
+assert_eq 1 "$(summary_status_count "${workspace}/setup_cases_summary.csv" failed 9)" \
+    "the setup summary still records the failed row"
+
+# ---- stage level: a mixed non-dry-run setup invocation (Issue #24) ---------------
+
+# make_setup_bases <workspace> - flow and transport base folders that the setup
+# stage runner can copy and prepare without an OpenFOAM installation.
+make_setup_bases() {
+    local root="$1" flow="${1}/simpleFoam_files" transport="${1}/scalarTransportDeffFoam_files"
+    local field
+
+    mkdir -p "${flow}/0" "${flow}/system" "${flow}/constant/triSurface"
+    for field in U p k nut epsilon; do
+        printf 'FoamFile { object %s; }\n' "$field" > "${flow}/0/${field}"
+    done
+
+    cat > "${flow}/system/controlDict" <<'DICT'
+FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
+application     simpleFoam;
+endTime         3000;
+DICT
+
+    cat > "${flow}/constant/turbulenceProperties" <<'DICT'
+FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+simulationType      RAS;
+DICT
+
+    cat > "${flow}/system/blockMeshDict" <<'DICT'
+FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }
+vertices ( <xMin> <yMin> <zMin> <xMax> <yMax> <zMax> );
+blocks   ( hex ( <nx> <ny> <nz> ) );
+DICT
+
+    printf 'FoamFile { object snappyHexMeshDict; }\nsnap <snap_ctrl>;\n' \
+        > "${flow}/system/snappyHexMeshDict"
+    printf 'solid f18p2\nendsolid f18p2\n' > "${flow}/constant/triSurface/f18p2_all.stl"
+
+    mkdir -p "${transport}/0" "${transport}/system"
+    printf 'FoamFile { object T; }\n' > "${transport}/0/T"
+    printf 'FoamFile { object controlDict; }\napplication scalarTransportDeffFoam;\n' \
+        > "${transport}/system/controlDict"
+
+    : "$root"
+}
+
+# make_setup_command_stubs <workspace> - the OpenFOAM commands that the setup
+# stage runner requires. The stubs give the exact log text that the stage runner
+# parses. The stubs never need an OpenFOAM installation.
+make_setup_command_stubs() {
+    local bin_dir="${1}/_setup_bin"
+    mkdir -p "$bin_dir"
+
+    cat > "${bin_dir}/surfaceTransformPoints" <<'STUB'
+#!/usr/bin/env bash
+echo "Set centre of rotation to (100 200 0)"
+exit 0
+STUB
+
+    cat > "${bin_dir}/surfaceCheck" <<'STUB'
+#!/usr/bin/env bash
+echo "Overall bounds (0 0 0) (10 10 10)"
+exit 0
+STUB
+
+    cat > "${bin_dir}/foamDictionary" <<'STUB'
+#!/usr/bin/env bash
+entry=""; file=""; previous=""
+for arg in "$@"; do
+    case "$previous" in
+        -entry) entry="$arg" ;;
+        -value) file="$arg" ;;
+    esac
+    previous="$arg"
+done
+if [[ -n "$file" && -f "$file" ]]; then
+    awk -v key="${entry##*.}" '
+        $1 == key {
+            line = $0
+            sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
+            gsub(/;/, "", line)
+            print line
+            exit
+        }' "$file"
+fi
+exit 0
+STUB
+
+    chmod +x "${bin_dir}/surfaceTransformPoints" "${bin_dir}/surfaceCheck" \
+        "${bin_dir}/foamDictionary"
+    setup_path="${bin_dir}:${PATH}"
+}
+
+workspace="$(new_workspace setup_mixed_real)"
+make_setup_bases "$workspace"
+make_setup_command_stubs "$workspace"
+write_setup_csv "${workspace}/output_batch_1.csv" \
+    "good_1,3.5,270.0" \
+    "bad_1,not_a_number,90.0"
+
+out="$(cd "$workspace" && PATH="$setup_path" bash "$SETUP_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+
+summary="${workspace}/setup_cases_summary.csv"
+
+assert_failure "$status" \
+    "a failed row must make a mixed non-dry-run setup invocation non-zero"
+assert_eq 1 "$(summary_status_count "$summary" failed 9)" \
+    "the mixed non-dry-run invocation records the failed row"
+assert_eq 2 "$(summary_status_count "$summary" created 9)" \
+    "the successful row keeps its flow and transport summary records"
+
+# The successful row keeps its Case output artifacts.
+assert_dir_exists "${workspace}/case_good_1/flow" \
+    "the successful row keeps its flow Case directory"
+assert_file_exists "${workspace}/case_good_1/flow/doe_row.csv" \
+    "the successful row keeps its flow doe_row.csv"
+assert_file_exists "${workspace}/case_good_1/flow/setup_metadata.env" \
+    "the successful row keeps its flow setup metadata"
+assert_file_exists "${workspace}/case_good_1/flow/0/U" \
+    "the successful row keeps its prepared flow field"
+assert_dir_exists "${workspace}/case_good_1/trd" \
+    "the successful row keeps its transport Case directory"
+assert_file_exists "${workspace}/case_good_1/trd/doe_row.csv" \
+    "the successful row keeps its transport doe_row.csv"
+assert_file_exists "${workspace}/case_good_1/trd/setup_metadata.env" \
+    "the successful row keeps its transport setup metadata"
+assert_file_exists "${workspace}/_setup_logs/case_good_1.log" \
+    "the successful row keeps its case log"
+
+# The failed row leaves the failure signals.
+assert_contains "$(cat "${workspace}/.setup_cases_failed")" "output_batch_1.csv,3" \
+    "the failed row of the mixed invocation reaches the failure artifact"
+assert_dir_missing "${workspace}/case_bad_1" \
+    "the failed row creates no Case directory"
+
 # ---- top level: a failed setup row marks the batch failed (Issue #24) ------------
 
 # build_setup_batches <name> - two batches that use the real setup stage runner

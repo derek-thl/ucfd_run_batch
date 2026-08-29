@@ -705,6 +705,7 @@ Final status:
 - The setup stage runner MUST print the existing failure warning and the summary path before the final non-zero return.
 - If no setup row fails, the setup stage runner MUST return `0` after successful completion.
 - Fatal validation errors and fatal command errors MUST remain non-zero.
+- The setup stage runner MUST NOT decide the final status from the size of `.setup_cases_failed` alone. A failed creation, a failed truncation, or a failed append of the Failure Artifact MUST NOT produce stage success.
 
 ## 15. Mesh stage specification
 
@@ -1579,7 +1580,9 @@ The setup case MUST also prove:
 - the setup summary records each failed row;
 - `.setup_cases_failed` identifies each failed row;
 - the setup stage runner exits non-zero;
+- a failed record append also gives a non-zero setup stage result;
 - successful rows of the same invocation stay in the summary;
+- a successful row of a mixed invocation keeps its Case output artifacts;
 - `run_batch.sh` marks the batch failed;
 - without `--keep-going`, a failed setup batch stops later batches;
 - with `--keep-going`, other batches are attempted and the final status stays non-zero.
