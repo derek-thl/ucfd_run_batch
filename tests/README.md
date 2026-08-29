@@ -62,9 +62,18 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.N | Transport continuation behavior | `cases/n_transport_continuation.sh` |
 | 23.O | Post-processing idempotency | `cases/o_post_idempotency.sh` |
 | 23.P | Failure propagation | `cases/p_failure_propagation.sh` |
+| 23.Q | Consolidated end-of-run report | `cases/q_consolidated_run_report.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.Q uses its own stage scripts instead of `tests/fakes/stage_stub.sh`,
+because the report scenarios must control the stage summary content, the stage
+result, and the batch completion order. One control directory holds the summary,
+the forced failure, and the delay of each stage and batch. The scenario reads
+only the console output and the Batch Workspace. No scenario reads an internal
+`run_batch.sh` bookkeeping file, because that record is a private implementation
+detail with no contract.
 
 ## Scope exclusions
 

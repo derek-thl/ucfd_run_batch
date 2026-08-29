@@ -655,6 +655,7 @@ run_batch_inner() {
     local local_batch_csv
     local post_script=""
     local -a job_args=()
+    local stage_status=0
 
     csv_basename="$(basename -- "$input_csv_abs")"
     batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
@@ -725,7 +726,12 @@ run_batch_inner() {
         post_script="$(stage_script_path setup_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
-            "${STAGE_JOB_ARGS[@]}" || return $?
+            "${STAGE_JOB_ARGS[@]}" || {
+            stage_status=$?
+            report_record_stage "$ordinal" setup failed
+            return "$stage_status"
+        }
+        report_record_stage "$ordinal" setup succeeded
     fi
 
     if (( RUN_MESH == 1 )); then
@@ -733,7 +739,12 @@ run_batch_inner() {
         post_script="$(stage_script_path run_mesh_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
-            "${STAGE_JOB_ARGS[@]}" || return $?
+            "${STAGE_JOB_ARGS[@]}" || {
+            stage_status=$?
+            report_record_stage "$ordinal" mesh failed
+            return "$stage_status"
+        }
+        report_record_stage "$ordinal" mesh succeeded
     fi
 
     if (( RUN_FLOW == 1 )); then
@@ -741,7 +752,12 @@ run_batch_inner() {
         post_script="$(stage_script_path run_flow_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
-            "${STAGE_JOB_ARGS[@]}" || return $?
+            "${STAGE_JOB_ARGS[@]}" || {
+            stage_status=$?
+            report_record_stage "$ordinal" flow failed
+            return "$stage_status"
+        }
+        report_record_stage "$ordinal" flow succeeded
     fi
 
     if (( RUN_TRANSPORT == 1 )); then
@@ -750,7 +766,12 @@ run_batch_inner() {
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
             "${STAGE_JOB_ARGS[@]}" \
-            --save-times "$SAVE_TIMES" || return $?
+            --save-times "$SAVE_TIMES" || {
+            stage_status=$?
+            report_record_stage "$ordinal" transport failed
+            return "$stage_status"
+        }
+        report_record_stage "$ordinal" transport succeeded
     fi
 
     if (( RUN_POST == 1 )); then
@@ -758,9 +779,15 @@ run_batch_inner() {
             build_job_args post
             run_stage "$post_script" \
                 -i "$BATCH_CSV_PATH" \
-                "${STAGE_JOB_ARGS[@]}" || return $?
+                "${STAGE_JOB_ARGS[@]}" || {
+                stage_status=$?
+                report_record_stage "$ordinal" post failed
+                return "$stage_status"
+            }
+            report_record_stage "$ordinal" post succeeded
         elif (( POST_REQUIRED == 1 )); then
             error "Requested post-processing stage script not found in master or batch directory: $PWD"
+            report_record_stage "$ordinal" post failed
             return 127
         else
             warn "No post-processing script found in batch directory. Skip."
@@ -771,6 +798,7 @@ run_batch_inner() {
 
 run_batch() (
     local batch_number="$2"
+    local ordinal="$3"
     local started=$SECONDS
     local rc=0
 
@@ -779,9 +807,11 @@ run_batch() (
     # v4 Section 19: successful and failed batches report elapsed time. The
     # original child failure status is preserved.
     if (( rc != 0 )); then
+        report_record_batch "$ordinal" "$batch_number" failed
         error "Batch failed    : batch_${batch_number} (exit=${rc}, elapsed=$(format_seconds "$(( SECONDS - started ))"))"
         return "$rc"
     fi
+    report_record_batch "$ordinal" "$batch_number" succeeded
     info "Batch finished  : batch_${batch_number} ($(format_seconds "$(( SECONDS - started ))"))"
 )
 
@@ -861,6 +891,241 @@ run_all_batches_parallel() {
         error "Parallel batch execution did not complete successfully: failures=$failures, launched=$launched/$total"
         return 1
     }
+}
+
+# =============================================================================
+# Consolidated end-of-run report (v4 Section 19)
+# =============================================================================
+#
+# The report states the actual execution result of each batch and of each
+# selected stage. A batch runs in a subshell, and parallel batches run as
+# background jobs, so a result cannot return through a shell variable. One
+# temporary directory holds the execution record. The directory belongs to one
+# Orchestrator process, stays outside every Batch Workspace, and is removed when
+# the Orchestrator exits. The presence of a stage summary is never execution
+# evidence, because a reused Batch Workspace can hold a stale summary.
+
+REPORT_DIR=""
+
+report_init() {
+    REPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run_batch_report.XXXXXXXX")" ||
+        die "Cannot create the temporary run-report directory."
+}
+
+# report_cleanup keeps the original process status. A failed removal gives a
+# warning only.
+report_cleanup() {
+    local status=$?
+
+    [[ -n "$REPORT_DIR" && -d "$REPORT_DIR" ]] || return "$status"
+
+    rm -rf -- "$REPORT_DIR" ||
+        warn "Could not remove the temporary run-report directory: $REPORT_DIR"
+
+    return "$status"
+}
+
+# report_record_batch <ordinal> <batch_number> <succeeded|failed>
+report_record_batch() {
+    [[ -n "$REPORT_DIR" ]] || return 0
+
+    printf '%s\n' "$3" > "${REPORT_DIR}/batch.${1}.result" 2>/dev/null ||
+        warn "Could not record the run-report result of batch_${2}."
+}
+
+# report_record_stage <ordinal> <stage_key> <succeeded|failed>
+report_record_stage() {
+    [[ -n "$REPORT_DIR" ]] || return 0
+
+    printf '%s\n' "$3" > "${REPORT_DIR}/stage.${1}.${2}.result" 2>/dev/null ||
+        warn "Could not record the run-report result of stage ${2}."
+}
+
+# report_selected_stage_keys prints the selected stage keys in canonical order.
+report_selected_stage_keys() {
+    (( RUN_SETUP == 0 )) || printf 'setup\n'
+    (( RUN_MESH == 0 )) || printf 'mesh\n'
+    (( RUN_FLOW == 0 )) || printf 'flow\n'
+    (( RUN_TRANSPORT == 0 )) || printf 'transport\n'
+    (( RUN_POST == 0 )) || printf 'post\n'
+}
+
+report_stage_name() {
+    case "$1" in
+        post) printf 'post-processing\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+report_stage_summary_file() {
+    case "$1" in
+        setup) printf 'setup_cases_summary.csv\n' ;;
+        mesh) printf 'run_mesh_cases_summary.csv\n' ;;
+        flow) printf 'run_flow_cases_summary.csv\n' ;;
+        transport) printf 'run_transport_cases_summary.csv\n' ;;
+        post) printf 'run_post_processing_cases_summary.csv\n' ;;
+    esac
+}
+
+# report_stage_columns <stage_key> prints "case row status message".
+# A row value of 0 means that the summary has no row-number column.
+report_stage_columns() {
+    case "$1" in
+        setup) printf '3 2 9 10\n' ;;
+        post) printf '1 0 3 4\n' ;;
+        *) printf '3 2 6 7\n' ;;
+    esac
+}
+
+# report_stage_success_status <stage_key> prints the success status values.
+report_stage_success_status() {
+    case "$1" in
+        setup) printf 'created dry_run\n' ;;
+        mesh) printf 'meshed continued\n' ;;
+        post) printf 'completed\n' ;;
+        *) printf 'solved continued\n' ;;
+    esac
+}
+
+# report_summary_counts <summary> <status_column> <success_values>
+# prints "total succeeded skipped failed other".
+report_summary_counts() {
+    awk -F, -v column="$2" -v success_values="$3" '
+        function clean(value) {
+            gsub(/"/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        BEGIN {
+            count = split(success_values, values, " ")
+            for (i = 1; i <= count; i++) success[values[i]] = 1
+        }
+        NR == 1 { next }
+        /^[[:space:]]*$/ { next }
+        {
+            status = clean($column)
+            total++
+            if (status in success) succeeded++
+            else if (status == "skipped") skipped++
+            else if (status == "failed") failed++
+            else other++
+        }
+        END {
+            printf "%d %d %d %d %d\n", total + 0, succeeded + 0, skipped + 0,
+                failed + 0, other + 0
+        }' "$1"
+}
+
+# report_failed_rows <summary> <case_col> <row_col> <status_col> <message_col>
+# prints "row_number<TAB>case_id<TAB>message" for each failed row. The order is
+# numeric row number, then Case ID.
+report_failed_rows() {
+    awk -F, -v case_column="$2" -v row_column="$3" -v status_column="$4" \
+            -v message_column="$5" '
+        function clean(value) {
+            gsub(/"/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        NR == 1 { next }
+        /^[[:space:]]*$/ { next }
+        clean($status_column) == "failed" {
+            message = ""
+            for (i = message_column; i <= NF; i++) {
+                message = (message == "" ? $i : message "," $i)
+            }
+            row = (row_column > 0 ? clean($row_column) : "0")
+            if (row !~ /^[0-9]+$/) row = "0"
+            printf "%s\t%s\t%s\n", row, clean($case_column), clean(message)
+        }' "$1" |
+        LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k2,2
+}
+
+# report_log_path <message> prints the first absolute path of the summary
+# message. The report never builds a path.
+report_log_path() {
+    local path
+
+    path="$(printf '%s\n' "$1" |
+        awk '{ for (i = 1; i <= NF; i++) if (substr($i, 1, 1) == "/") { print $i; exit } }')"
+
+    printf '%s\n' "${path:-unavailable}"
+}
+
+print_run_report() {
+    local requested_count="${#INPUT_CSVS_ABS[@]}"
+    local attempted=0 succeeded=0 failed=0 not_started=0
+    local i ordinal batch_id batch_result
+    local stage_key stage_name stage_result summary_path summary_state
+    local total_count succeeded_count skipped_count failed_count other_count
+    local case_column row_column status_column message_column
+    local row_number case_id message log_path
+
+    info "Run report begin"
+
+    for (( i = 0; i < requested_count; i++ )); do
+        ordinal=$(( i + 1 ))
+        batch_id="${BATCH_NUMBERS[$i]}"
+
+        # A batch without an execution record never started.
+        if [[ ! -f "${REPORT_DIR}/batch.${ordinal}.result" ]]; then
+            not_started=$(( not_started + 1 ))
+            continue
+        fi
+
+        batch_result="$(cat "${REPORT_DIR}/batch.${ordinal}.result")"
+        attempted=$(( attempted + 1 ))
+        if [[ "$batch_result" == "succeeded" ]]; then
+            succeeded=$(( succeeded + 1 ))
+        else
+            failed=$(( failed + 1 ))
+        fi
+
+        info "Run report batch: batch_${batch_id} result=${batch_result}"
+
+        while IFS= read -r stage_key; do
+            stage_name="$(report_stage_name "$stage_key")"
+
+            stage_result="not_attempted"
+            if [[ -f "${REPORT_DIR}/stage.${ordinal}.${stage_key}.result" ]]; then
+                stage_result="$(cat "${REPORT_DIR}/stage.${ordinal}.${stage_key}.result")"
+            fi
+
+            summary_state="unavailable"
+            total_count="unknown"
+            succeeded_count="unknown"
+            skipped_count="unknown"
+            failed_count="unknown"
+            other_count="unknown"
+
+            summary_path="${OUTPUT_ROOT}/batch_${batch_id}/$(report_stage_summary_file "$stage_key")"
+            read -r case_column row_column status_column message_column \
+                <<< "$(report_stage_columns "$stage_key")"
+
+            # A stage that did not run never contributes summary counts, even
+            # when a stale summary exists in a reused Batch Workspace.
+            if [[ "$stage_result" != "not_attempted" && -r "$summary_path" ]]; then
+                summary_state="available"
+                read -r total_count succeeded_count skipped_count failed_count other_count \
+                    <<< "$(report_summary_counts "$summary_path" "$status_column" \
+                        "$(report_stage_success_status "$stage_key")")"
+            fi
+
+            info "Run report stage: batch=batch_${batch_id} stage=${stage_name} result=${stage_result} summary=${summary_state} total=${total_count} succeeded=${succeeded_count} skipped=${skipped_count} failed=${failed_count} other=${other_count}"
+
+            [[ "$summary_state" == "available" ]] || continue
+
+            while IFS=$'\t' read -r row_number case_id message; do
+                [[ -n "${row_number}${case_id}${message}" ]] || continue
+                log_path="$(report_log_path "$message")"
+                info "Run report failure: batch=batch_${batch_id} stage=${stage_name} case=${case_id:-unavailable} log=${log_path}"
+            done < <(report_failed_rows "$summary_path" "$case_column" "$row_column" \
+                "$status_column" "$message_column")
+        done < <(report_selected_stage_keys)
+    done
+
+    info "Run report total: requested=${requested_count} attempted=${attempted} succeeded=${succeeded} failed=${failed} not_started=${not_started}"
+    info "Run report end"
 }
 
 main() {
@@ -999,11 +1264,21 @@ main() {
         exit 0
     fi
 
+    local scheduler_status=0
+
+    report_init
+    trap report_cleanup EXIT
+
+    # The scheduler status is captured so that a failed run still reports.
     if (( BATCH_JOBS == 1 )); then
-        run_all_batches_sequential
+        run_all_batches_sequential || scheduler_status=$?
     else
-        run_all_batches_parallel
+        run_all_batches_parallel || scheduler_status=$?
     fi
+
+    print_run_report
+
+    (( scheduler_status == 0 )) || exit "$scheduler_status"
 
     info "All requested batches and stages finished successfully."
 }
