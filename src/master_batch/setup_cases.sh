@@ -276,7 +276,7 @@ wait_for_free_slot() {
         (( running < max_jobs )) && break
         show_progress
         if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
-            wait -n || true
+            wait -n || FAILED_ROW_JOBS=$(( FAILED_ROW_JOBS + 1 ))
         else
             sleep 0.5
         fi
@@ -1145,14 +1145,40 @@ run_row_in_background() {
 
     log_file="$LOG_DIR/${case_id}.log"
 
+    # The job status reports the row result to the parent. A failed record
+    # append cannot hide a failed row, because the artifact can stay empty.
     (
-        if ! setup_one_row "$csv_abs" "$row_no" "$row_line" >"$log_file" 2>&1; then
-            echo "$csv_abs,$row_no" >> "$FAIL_FILE"
+        if setup_one_row "$csv_abs" "$row_no" "$row_line" >"$log_file" 2>&1; then
+            exit 0
         fi
+        echo "$csv_abs,$row_no" >> "$FAIL_FILE" || exit 2
+        exit 1
     ) &
 }
 
+# wait_for_all_rows - wait for every launched row job and count the failures.
+wait_for_all_rows() {
+    local rc pid
+
+    if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
+        while [[ -n "$(jobs -p)" ]]; do
+            rc=0
+            wait -n || rc=$?
+            (( rc == 0 )) || FAILED_ROW_JOBS=$(( FAILED_ROW_JOBS + 1 ))
+        done
+        return 0
+    fi
+
+    for pid in $(jobs -p); do
+        rc=0
+        wait "$pid" || rc=$?
+        (( rc == 0 )) || FAILED_ROW_JOBS=$(( FAILED_ROW_JOBS + 1 ))
+    done
+}
+
 main() {
+    FAILED_ROW_JOBS=0
+
     validate_global_config
 
     local csv csv_abs row_no line
@@ -1181,16 +1207,21 @@ main() {
         done < <(tail -n +2 "$csv_abs")
     done < <(find_csv_files)
 
-    wait
+    wait_for_all_rows
     show_progress
 
-    if [[ -s "$FAIL_FILE" ]]; then
+    local rows_failed=0
+
+    if (( FAILED_ROW_JOBS > 0 )) || [[ -s "$FAIL_FILE" ]]; then
+        rows_failed=1
         warn "Some rows failed. Check: $FAIL_FILE"
     else
         info "Done."
     fi
 
     info "Summary: $SUMMARY_CSV"
+
+    (( rows_failed == 0 )) || return 1
 }
 
 main "$@"

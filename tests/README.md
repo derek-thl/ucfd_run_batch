@@ -99,6 +99,35 @@ five confirmed gaps in Specification #3.
   `cases/p_failure_propagation.sh` now asserts a failed summary row, the
   failure artifact, a non-zero stage, and no success marker for every required
   fresh-mesh and fresh-flow command.
+- **Section 23.P, setup stage. Closed by Issue #24.** A failed setup row
+  previously did not make the setup stage non-zero: `setup_cases.sh` recorded
+  the failed row in `.setup_cases_failed` and printed a warning, but the final
+  status stayed `0`. Specification Section 14.8 held this behavior as an
+  accepted exception. The Issue #24 correction makes the setup stage runner
+  return non-zero at stage completion when the failure artifact is not empty,
+  and Section 14.8 now states the non-zero rule. The row job status, and not
+  the size of the failure artifact alone, gives the final result. A failed
+  record append therefore also gives a non-zero stage result.
+  `cases/p_failure_propagation.sh` asserts the failed summary row, the failure
+  artifact, the existing warning, the summary diagnostic, and a non-zero
+  status for one failed row and for concurrent failed rows. The same scenario
+  asserts that `run_batch.sh` marks the batch failed, that mesh does not start
+  in the same batch, and that `--keep-going` still ends non-zero.
+
+  Two scenarios need no OpenFOAM installation and no change to
+  `tests/lib/harness.sh`:
+
+  - The append-failure scenario points `.setup_cases_failed` at `/dev/full`.
+    The stage runner can create and truncate that artifact, but every append
+    fails and the artifact stays empty. The scenario first proves that these
+    three conditions are true, and then proves the non-zero stage result.
+  - The mixed non-dry-run scenario builds a small flow base folder and a small
+    transport base folder, and it puts local `surfaceTransformPoints`,
+    `surfaceCheck`, and `foamDictionary` stubs on `PATH`. The stubs give the
+    exact log text that the setup stage runner parses. The scenario proves
+    that the successful row keeps its Case directories, its `doe_row.csv`
+    files, its setup metadata, its prepared field, and its case log, while the
+    failed row makes the stage non-zero.
 - **Section 23.B, top-level help completeness. Closed by Issue #10.** The
   `run_batch.sh` help previously did not display the documented `--stages`
   alias or the `--` end-of-options marker from specification Section 6.4. Both

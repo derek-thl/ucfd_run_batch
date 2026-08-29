@@ -698,7 +698,14 @@ _setup_logs/
 .setup_cases_failed
 ```
 
-Current v4 behavioral note: background row failures are recorded in `.setup_cases_failed` and produce a warning at the end, but the setup runner does not explicitly return non-zero only because the fail file is non-empty. Fatal validation/command errors still terminate under shell error handling. This is a known behavior of the baseline and MUST be treated as technical debt, not silently changed during a replication task.
+Final status:
+
+- The setup stage runner MUST wait for all launched setup rows.
+- If one or more setup rows fail, `.setup_cases_failed` MUST identify the failed rows, and the setup stage runner MUST return non-zero at stage completion.
+- The setup stage runner MUST print the existing failure warning and the summary path before the final non-zero return.
+- If no setup row fails, the setup stage runner MUST return `0` after successful completion.
+- Fatal validation errors and fatal command errors MUST remain non-zero.
+- The setup stage runner MUST NOT decide the final status from the size of `.setup_cases_failed` alone. A failed creation, a failed truncation, or a failed append of the Failure Artifact MUST NOT produce stage success.
 
 ## 15. Mesh stage specification
 
@@ -1558,7 +1565,7 @@ Expected: rebuild even when signature is unchanged.
 
 ### P. Failure propagation
 
-For mesh, flow, transport, and post, force one case runner to fail.
+For setup, mesh, flow, transport, and post, force one case runner to fail.
 
 Expected:
 
@@ -1568,7 +1575,17 @@ Expected:
 - without `--keep-going`, new batches stop launching;
 - with `--keep-going`, other batches are attempted and final status remains failure.
 
-Setup's baseline fail-file behavior is the known exception documented in Section 14.8.
+The setup case MUST also prove:
+
+- the setup summary records each failed row;
+- `.setup_cases_failed` identifies each failed row;
+- the setup stage runner exits non-zero;
+- a failed record append also gives a non-zero setup stage result;
+- successful rows of the same invocation stay in the summary;
+- a successful row of a mixed invocation keeps its Case output artifacts;
+- `run_batch.sh` marks the batch failed;
+- without `--keep-going`, a failed setup batch stops later batches;
+- with `--keep-going`, other batches are attempted and the final status stays non-zero.
 
 ## 24. Multi-agent GitHub handoff rules
 
@@ -1643,11 +1660,10 @@ These may be future improvements but MUST be separate reviewed changes.
 ## 27. Known technical debt / cautions
 
 1. **Simple CSV parser**: stage scripts use Bash `IFS=','`; quoted commas are unsupported.
-2. **Setup failure aggregation**: setup records failed rows but does not currently make fail-file presence alone a non-zero final exit.
-3. **MPI estimate is a hint**: the top-level runner detects one `numberOfSubdomains` value and does not prove all cases use the same value.
-4. **`--save-times` interface asymmetry**: top-level v4 accepts integer comma lists, while transport runner accepts a broader numeric list format.
-5. **Post signature is structural**: it tracks time-directory/field-selection state, not hashes of every OpenFOAM result file. If file contents change without time-set changes, `FORCE_POST=1` may be required.
-6. **Central stage source is intentional**: updating `master_batch` affects subsequent runs of old batches because central scripts are preferred.
+2. **MPI estimate is a hint**: the top-level runner detects one `numberOfSubdomains` value and does not prove all cases use the same value.
+3. **`--save-times` interface asymmetry**: top-level v4 accepts integer comma lists, while transport runner accepts a broader numeric list format.
+4. **Post signature is structural**: it tracks time-directory/field-selection state, not hashes of every OpenFOAM result file. If file contents change without time-set changes, `FORCE_POST=1` may be required.
+5. **Central stage source is intentional**: updating `master_batch` affects subsequent runs of old batches because central scripts are preferred.
 
 Do not “fix” these items inside an unrelated implementation task. Open a dedicated Issue if behavior must change.
 
