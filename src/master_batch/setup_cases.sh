@@ -1184,13 +1184,18 @@ main() {
     wait
     show_progress
 
+    local rows_failed=0
+
     if [[ -s "$FAIL_FILE" ]]; then
+        rows_failed=1
         warn "Some rows failed. Check: $FAIL_FILE"
     else
         info "Done."
     fi
 
     info "Summary: $SUMMARY_CSV"
+
+    (( rows_failed == 0 )) || return 1
 }
 
 main "$@"
