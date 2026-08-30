@@ -152,6 +152,93 @@ LC_ALL=C
 
 for predictable parsing and sorting.
 
+### 5.1 Advisory selected-Stage command preflight
+
+After structural preflight succeeds, and before dry-run plan output or stage 1 starts, the Orchestrator MUST inspect the required OpenFOAM-family commands and MPI commands of the selected stages.
+
+The inspection MUST use `command -v`. Dynamic flow solver discovery MAY use the current non-mutating `foamDictionary -entry application -value` interface.
+
+A missing command MUST give this timestamped `WARN` message payload:
+
+```text
+Selected-Stage tool advisory: stage=<setup|mesh|flow|transport|post-processing> command=<command> status=missing
+```
+
+A missing dynamic flow solver command MUST name the batch and the Case:
+
+```text
+Selected-Stage tool advisory: stage=flow batch=batch_<id> case=<case_id> command=<command> status=missing
+```
+
+When the Orchestrator cannot detect `application` for an eligible flow Case, the Orchestrator MUST give:
+
+```text
+Selected-Stage tool advisory: stage=flow batch=batch_<id> case=<case_id> application=undetected controlDict=<absolute-path>
+```
+
+When at least one warning exists, the Orchestrator MUST end the advisory block with:
+
+```text
+Selected-Stage tool advisory summary: missing=<N> undetected=<N>. Execution continues.
+```
+
+`missing` MUST equal the number of `status=missing` lines. `undetected` MUST equal the number of `application=undetected` lines.
+
+The advisory block MUST use canonical stage order. Static command warnings inside one stage MUST use the command order of the required-command matrix. Dynamic flow warnings MUST use DOE Batch CSV argument order and then DOE Batch CSV row order.
+
+If no missing command and no undetected command exists, the Orchestrator MUST add no advisory output.
+
+The advisory MUST NOT change the dry-run status, a stage status, a batch status, or the final Orchestrator status. A command that is missing during a real run MAY still make the existing stage runner fail later. That later status is existing stage runner behavior, not an advisory status.
+
+The advisory MUST run for `--dry-run`. A dry-run stays non-executing and keeps status `0` after a successful structural preflight.
+
+A structural preflight failure MUST occur before this advisory. The Orchestrator MUST NOT print advisory output after a structural preflight failure.
+
+The advisory MUST end before the first existing `Stage start` diagnostic and before any batch process starts.
+
+The advisory MUST NOT execute a solver, a meshing command, an MPI command, a reconstruction command, or a post-processing command. The advisory MUST NOT create or change a Batch Workspace, a Case, a stage summary, a stage log, a Failure Artifact, or a restart marker.
+
+#### Required-command matrix
+
+| Stage | Required commands |
+|---|---|
+| setup | `surfaceCheck`, `surfaceTransformPoints`, `foamDictionary` |
+| mesh, all eligible Cases continue | `foamDictionary` |
+| mesh, at least one eligible Case is fresh | `surfaceFeatureExtract`, `blockMesh`, `decomposePar`, `mpirun`, `snappyHexMesh`, `reconstructParMesh`, `checkMesh`, `foamDictionary` |
+| flow | `decomposePar`, `mpirun`, `renumberMesh`, `checkMesh`, `foamDictionary`, each eligible Case solver, then conditional `reconstructPar` |
+| transport | `decomposePar`, `mpirun`, `renumberMesh`, `scalarTransportDeffFoam`, `reconstructPar`, `foamDictionary` |
+| post-processing | `foamToVTK` |
+
+The Orchestrator always forwards a non-empty `--save-times` value to transport. The transport stage runner therefore selects custom reconstruction and needs `reconstructPar`. The transport solver is fixed and MUST NOT be treated as dynamic.
+
+For flow, `reconstructPar` is required when `RECONSTRUCT_MODE` is `latest` or `all`. `reconstructPar` MUST NOT be reported missing when `RECONSTRUCT_MODE=none`.
+
+The advisory MUST NOT report the optional commands `foamListTimes`, `foamLog`, and `gnuplot`.
+
+The advisory covers OpenFOAM-family commands and `mpirun` only. The advisory MUST NOT report the mandatory platform utilities `awk`, `sed`, `tee`, `find`, and `sort`, or any other GNU/Linux, Bash, or coreutils command of this section.
+
+#### Eligible Case and mode rules
+
+The advisory uses the existing simple DOE Batch CSV assumptions.
+
+An empty Case value is ignored. Each non-empty Case value uses the existing stage runner Case ID rule. A `NA` Case ID is ignored. Each normalized Case is inspected once per batch, and a later duplicate row for the same Case is ignored.
+
+For a reused Batch Workspace, a flow Case is eligible for mesh or flow dynamic checks only when `<Batch Workspace>/<case_id>/flow` exists. A missing Case directory that the current stage runner skips is not an eligible dynamic flow Case, and it MUST NOT give an `application=undetected` warning.
+
+When setup is selected, each valid unique DOE Batch CSV Case is an eligible future Case, and flow solver discovery MUST use `<MASTER_BATCH_DIR>/simpleFoam_files/system/controlDict`. For a reused Batch Workspace, flow solver discovery MUST use `<Batch Workspace>/<case_id>/flow/system/controlDict`.
+
+If an eligible flow Case has no readable `system/controlDict`, or `application` cannot be read, the Orchestrator MUST give the `application=undetected` warning for that Case. The Orchestrator MUST NOT use a default solver name.
+
+Mesh mode MUST use the current Section 15.3 fresh/continue rule. `FORCE_MESH=1` means fresh. Otherwise a Case is continue only when it has a constant mesh and has `restart.marker` or a nonzero numeric time directory. Every other eligible Case is fresh.
+
+When setup and mesh are both selected, mesh MUST use the fresh required-command set. When all eligible reused mesh Cases are continue, fresh-only mesh commands MUST NOT be reported missing. When at least one eligible mesh Case is fresh, the fresh mesh command set is used once.
+
+#### Optional post-processing rule
+
+When post-processing belongs to the default pipeline and no post-processing stage runner exists, existing behavior skips that stage with a warning. The advisory MUST NOT report `foamToVTK` for that skipped stage.
+
+When post-processing is selected explicitly and no stage runner exists, structural preflight stays fatal, and the advisory does not run.
+
 ## 6. Top-level `run_batch.sh` contract
 
 ### 6.1 Invocation
@@ -1247,6 +1334,17 @@ stage failure exit code
 batch elapsed time
 ```
 
+The top-level runner MUST also log the Section 5.1 advisory payloads:
+
+```text
+Selected-Stage tool advisory: stage=<stage> command=<command> status=missing
+Selected-Stage tool advisory: stage=flow batch=batch_<id> case=<case_id> command=<command> status=missing
+Selected-Stage tool advisory: stage=flow batch=batch_<id> case=<case_id> application=undetected controlDict=<absolute-path>
+Selected-Stage tool advisory summary: missing=<N> undetected=<N>. Execution continues.
+```
+
+The advisory warning order is deterministic. The summary line appears only when one or more advisory warnings exist. All advisory warnings appear before stage 1. The existing `Preflight PASS` line, plan lines, stage lines, batch lines, and consolidated report lines stay unchanged.
+
 Printed shell commands MAY use shell escaping such as `%q`.
 
 Example display:
@@ -1726,6 +1824,40 @@ Expected:
 - the temporary report record does not survive the Orchestrator;
 - every exit status is unchanged.
 
+### R. Advisory selected-Stage tool preflight
+
+Run the Orchestrator with a controlled command directory that holds every platform utility and every advisory command except the commands that the scenario removes.
+
+Normalize the timestamp and the level prefix, and then compare the advisory payload.
+
+Expected:
+
+- one missing static command for one selected stage gives the exact warning and the exact summary;
+- an unselected stage command gives no warning;
+- several missing commands follow canonical stage order and matrix command order;
+- a default full pipeline checks every stage that has a resolvable stage runner;
+- a reused mesh Case with a constant mesh and `restart.marker` gives no fresh-only mesh warning;
+- a reused mesh Case with a constant mesh and a nonzero numeric time directory gives no fresh-only mesh warning;
+- `FORCE_MESH=1` uses the fresh mesh command set;
+- one fresh Case and one continue Case use the fresh mesh command set once;
+- a reused eligible flow Case reads `application` from its own control dictionary;
+- a missing detected solver names the stage, the batch, the Case, and the command;
+- two Cases with different applications are checked in DOE Batch CSV row order;
+- an unreadable control dictionary gives `application=undetected` with the absolute path;
+- a Case without a Case directory gives no dynamic flow warning;
+- setup and flow together read `application` from the master flow template;
+- `RECONSTRUCT_MODE=none` gives no `reconstructPar` warning, and `latest` and `all` give one;
+- transport checks the fixed solver and `reconstructPar`, and transport does not use a Case control dictionary;
+- `foamListTimes`, `foamLog`, and `gnuplot` give no warning;
+- a skipped optional post-processing stage gives no `foamToVTK` warning;
+- every advisory warning appears before the first `Stage start` line;
+- a successful run, a failed run, and a dry-run keep their existing status;
+- a structural preflight failure gives no advisory block;
+- advisory inspection changes no Batch Workspace file;
+- the stage runner keeps its own missing-command diagnostic and its own failure status;
+- the consolidated report stays unchanged;
+- mandatory platform utilities give no warning.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -1844,6 +1976,7 @@ A replacement is compatible when all of the following are true:
 - post-processing reuses current outputs and rebuilds stale outputs;
 - failures are logged and propagated according to the baseline contract;
 - the consolidated end-of-run report shows each attempted batch, each selected stage, and each failed Case, and it changes no exit status;
+- the advisory selected-Stage command preflight names each missing selected-Stage command before stage 1, and it changes no exit status;
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 

@@ -63,9 +63,20 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.O | Post-processing idempotency | `cases/o_post_idempotency.sh` |
 | 23.P | Failure propagation | `cases/p_failure_propagation.sh` |
 | 23.Q | Consolidated end-of-run report | `cases/q_consolidated_run_report.sh` |
+| 23.R | Advisory selected-Stage tool preflight | `cases/r_selected_stage_tool_preflight.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.R builds a complete command directory inside its own workspace and
+sets `PATH` to that directory only. The directory holds a symbolic link to each
+platform utility that the Orchestrator needs, plus a stub for each advisory
+command that the scenario keeps. A scenario therefore decides exactly which
+command is absent, and a host with a real OpenFOAM or MPI installation cannot
+change a result. Each scenario also proves that the named command really is
+absent from its `PATH` before it asserts a warning. The `foamDictionary` stub
+reads the requested entry from the given file, because the advisory detects the
+flow solver through that interface.
 
 Section 23.Q uses its own stage scripts instead of `tests/fakes/stage_stub.sh`,
 because the report scenarios must control the stage summary content, the stage
