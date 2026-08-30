@@ -1257,6 +1257,123 @@ Example display:
 
 is only an escaped log representation. It MUST NOT imply that backslashes are included in the actual argument passed to the child script.
 
+### 19.1 Consolidated end-of-run report
+
+After all launched batches finish, `run_batch.sh` MUST print one consolidated report.
+
+The report MUST be console output only. The report MUST NOT add a persistent file, marker, summary, or Failure Artifact.
+
+The report MUST use the existing timestamped `INFO`, `WARN`, and `ERROR` logging interface. The stable contract is the message payload after the timestamp and the level prefix. The report lines use the `INFO` level, because one stream keeps the report block contiguous and keeps the line order stable.
+
+The report MUST start with:
+
+```text
+Run report begin
+```
+
+The report MUST end with:
+
+```text
+Run report end
+```
+
+The report MUST contain one batch line for each attempted batch:
+
+```text
+Run report batch: batch_<id> result=<succeeded|failed>
+```
+
+Each attempted batch MUST contain one stage line for each selected stage, in canonical order:
+
+```text
+Run report stage: batch=batch_<id> stage=<setup|mesh|flow|transport|post-processing> result=<succeeded|failed|not_attempted> summary=<available|unavailable> total=<N|unknown> succeeded=<N|unknown> skipped=<N|unknown> failed=<N|unknown> other=<N|unknown>
+```
+
+`result` MUST come from actual Orchestrator execution state. The implementation MUST NOT infer stage execution from the presence of a summary file.
+
+`not_attempted` MUST identify a selected stage that did not start. This state includes a selected stage that did not start because an earlier stage in the same batch failed, and an optional post-processing stage that has no stage script.
+
+`summary=available` means that the report read the expected existing stage summary. The five existing summary names and schemas stay unchanged.
+
+`summary=unavailable` MUST use `unknown` for all five count fields. A missing or unreadable summary MUST NOT change the stage result, the batch result, or the final process status.
+
+For an available summary:
+
+- `total` is the number of data rows;
+- `succeeded` counts the stage success status values;
+- `skipped` counts `skipped`;
+- `failed` counts `failed`;
+- `other` counts every other status value.
+
+The stage success status values are:
+
+| Stage | Success status values |
+|---|---|
+| setup | `created`, `dry_run` |
+| mesh | `meshed`, `continued` |
+| flow | `solved`, `continued` |
+| transport | `solved`, `continued` |
+| post-processing | `completed` |
+
+Each failed summary row MUST produce one failure line. The failure lines of one stage MUST follow the stage line of that stage:
+
+```text
+Run report failure: batch=batch_<id> stage=<stage> case=<case_id> log=<absolute-path|unavailable>
+```
+
+The report MUST use the Case ID from the stage summary. The report MUST use `case=unavailable` only when a failed summary row has an empty Case ID.
+
+The report MUST print the exact absolute log path that the failed summary row supplies. The report MUST take the first absolute path in the summary message column. If the message column has no absolute path, the report MUST print `log=unavailable`. The report MUST NOT build a log path.
+
+A stage failure without a failed summary row MUST still show `result=failed` on the stage line. The report MUST NOT invent a Case row for that failure.
+
+The report MUST contain one run-total line:
+
+```text
+Run report total: requested=<N> attempted=<N> succeeded=<N> failed=<N> not_started=<N>
+```
+
+The run-total invariant MUST be:
+
+```text
+requested = attempted + not_started
+attempted = succeeded + failed
+```
+
+Batch sections MUST follow DOE Batch CSV argument order, including parallel-batch execution.
+
+Stage lines MUST follow canonical stage order: setup, mesh, flow, transport, post-processing.
+
+Failed rows for setup, mesh, flow, and transport MUST follow numeric summary `row_number`, then Case ID. Failed post-processing rows MUST follow Case ID.
+
+With `--keep-going`, the report MUST include every attempted batch, and the final status MUST stay non-zero when any batch failed.
+
+Without `--keep-going`, the report MUST include each attempted batch. The report MUST omit a batch section for each batch that did not start.
+
+In parallel stop-first mode, already-running batches stay attempted and MUST appear in input order. Batches that were not launched MUST NOT appear as batch sections.
+
+The report MUST print after all launched batches finish and before the existing overall success diagnostic on a successful run.
+
+A report warning or an unavailable summary MUST NOT replace or mask the original batch-runner process status.
+
+A dry-run MUST keep its current plan output and MUST NOT print the consolidated report.
+
+A validation failure or a preflight failure before batch execution MUST keep its current output and MUST NOT print the consolidated report.
+
+The report needs the execution result of each batch and of each selected stage. A batch runs in a subshell, and parallel batches run as background jobs. The implementation MUST keep this record outside every Batch Workspace, MUST keep the record private to one Orchestrator process, and MUST remove the record when the Orchestrator exits. A failed removal MUST give a warning and MUST NOT change the process status.
+
+The report reads these existing summaries and MUST NOT change them:
+
+| Stage | Summary | Case ID column | Row-order column | Status column | Message column |
+|---|---|---:|---:|---:|---:|
+| setup | `setup_cases_summary.csv` | 3 | 2 | 9 | 10 |
+| mesh | `run_mesh_cases_summary.csv` | 3 | 2 | 6 | 7 |
+| flow | `run_flow_cases_summary.csv` | 3 | 2 | 6 | 7 |
+| transport | `run_transport_cases_summary.csv` | 3 | 2 | 6 | 7 |
+| post-processing | `run_post_processing_cases_summary.csv` | 1 | None | 3 | 4 |
+
+The report uses the existing simple CSV assumptions. The report does not add quoted-comma parsing.
+
 ## 20. Copy-on-write policy
 
 Large directory copies SHOULD use:
@@ -1587,6 +1704,28 @@ The setup case MUST also prove:
 - without `--keep-going`, a failed setup batch stops later batches;
 - with `--keep-going`, other batches are attempted and the final status stays non-zero.
 
+### Q. Consolidated end-of-run report
+
+Run the Orchestrator with stage scripts that give a controlled stage result and a controlled stage summary.
+
+Normalize the timestamp and the level prefix, and then compare the report payload.
+
+Expected:
+
+- a successful single batch gives one begin line, one batch line, one stage line, one total line, and one end line, with the exact summary counts and no failure line;
+- a failed stage gives `result=failed`, one failure line for each failed summary row, the exact summary log path, and `log=unavailable` for a row without a log path;
+- a failed stage without a usable summary gives `summary=unavailable`, `unknown` counts, and no invented Case line;
+- a selected stage that did not start after an earlier failure gives `result=not_attempted`;
+- a stale summary in a reused Batch Workspace does not make a stage look attempted, and its rows are not counted;
+- a non-canonical stage selection gives stage lines in canonical order;
+- sequential success, sequential stop-first, and `--keep-going` give the correct attempted, succeeded, failed, and not_started totals;
+- a parallel run with a reversed completion order keeps input-batch order;
+- a parallel stop-first run keeps already-running batches and omits batches that were never launched;
+- a dry-run and a preflight failure print no report block;
+- the report changes no stage summary and leaves no artifact in a Batch Workspace;
+- the temporary report record does not survive the Orchestrator;
+- every exit status is unchanged.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -1704,6 +1843,7 @@ A replacement is compatible when all of the following are true:
 - continuation does not replace the mesh/state used by existing transport fields;
 - post-processing reuses current outputs and rebuilds stale outputs;
 - failures are logged and propagated according to the baseline contract;
+- the consolidated end-of-run report shows each attempted batch, each selected stage, and each failed Case, and it changes no exit status;
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 
