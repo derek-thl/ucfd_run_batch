@@ -1128,6 +1128,255 @@ print_run_report() {
     info "Run report end"
 }
 
+# =============================================================================
+# Advisory selected-Stage tool preflight (v4 Section 5.1)
+# =============================================================================
+#
+# The advisory names missing commands for the selected stages before stage 1.
+# The advisory is read-only: it never runs a stage command, never writes into a
+# Batch Workspace, and never changes a status. Every stage runner keeps its own
+# final command validation.
+
+TOOL_ADVISORY_MISSING=0
+TOOL_ADVISORY_UNDETECTED=0
+
+tool_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# advise_missing_command <stage> <command>
+advise_missing_command() {
+    if tool_available "$2"; then
+        return 0
+    fi
+
+    warn "Selected-Stage tool advisory: stage=${1} command=${2} status=missing"
+    TOOL_ADVISORY_MISSING=$(( TOOL_ADVISORY_MISSING + 1 ))
+}
+
+# tool_advisory_case_id <raw> applies the stage runner Case ID rule.
+tool_advisory_case_id() {
+    local value
+
+    value="$(printf '%s' "${1//$'\r'/}" |
+        sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+            -e 's/[[:space:]]\+/_/g' -e 's/[^0-9A-Za-z._-]/_/g' \
+            -e 's/_\+/_/g' -e 's/^_//; s/_$//')"
+
+    [[ -n "$value" ]] || value="NA"
+
+    if [[ "$value" == "NA" || "$value" == case_* ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    printf 'case_%s\n' "$value"
+}
+
+# tool_advisory_case_ids <csv> prints each unique normalized Case ID in DOE
+# Batch CSV row order. The advisory uses the existing simple CSV assumptions.
+tool_advisory_case_ids() {
+    local csv="$1" column line raw case_id
+    local -A seen=()
+
+    column="$(awk -F, 'NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                value = $i
+                gsub(/\r/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                if (tolower(value) == "case") { print i; exit }
+            }
+        }' "$csv")"
+
+    [[ -n "$column" ]] || return 0
+
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ -n "${line//[[:space:]]/}" ]] || continue
+
+        raw="$(printf '%s\n' "$line" | awk -F, -v c="$column" '{ print $c }')"
+        [[ -n "${raw//[[:space:]]/}" ]] || continue
+
+        case_id="$(tool_advisory_case_id "$raw")"
+        [[ "$case_id" != "NA" ]] || continue
+        [[ -z "${seen[$case_id]:-}" ]] || continue
+
+        seen["$case_id"]=1
+        printf '%s\n' "$case_id"
+    done < <(tail -n +2 "$csv")
+}
+
+tool_advisory_has_nonzero_time_dir() {
+    local name
+
+    while IFS= read -r name; do
+        [[ "$name" != "0" ]] || continue
+        [[ "$name" =~ ^[0-9]+([.][0-9]+)?$ || "$name" =~ ^[.][0-9]+$ ]] && return 0
+    done < <(find "$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null)
+
+    return 1
+}
+
+# tool_advisory_case_is_continue <flow_case_dir> applies the Section 15.3 rule.
+tool_advisory_case_is_continue() {
+    local dir="$1"
+
+    [[ -d "${dir}/constant/polyMesh" &&
+        -f "${dir}/constant/polyMesh/points" &&
+        -f "${dir}/constant/polyMesh/boundary" ]] || return 1
+
+    [[ -f "${dir}/restart.marker" ]] && return 0
+
+    tool_advisory_has_nonzero_time_dir "$dir"
+}
+
+# tool_advisory_mesh_is_fresh is true when at least one eligible mesh Case needs
+# a fresh mesh.
+tool_advisory_mesh_is_fresh() {
+    local i batch_dir case_id
+
+    # Setup initializes each Batch Workspace, so every Case meshes fresh.
+    (( RUN_SETUP == 0 )) || return 0
+    [[ "${FORCE_MESH:-0}" != "1" ]] || return 0
+
+    for (( i = 0; i < ${#INPUT_CSVS_ABS[@]}; i++ )); do
+        batch_dir="${OUTPUT_ROOT}/batch_${BATCH_NUMBERS[$i]}"
+        while IFS= read -r case_id; do
+            [[ -d "${batch_dir}/${case_id}/flow" ]] || continue
+            tool_advisory_case_is_continue "${batch_dir}/${case_id}/flow" || return 0
+        done < <(tool_advisory_case_ids "${INPUT_CSVS_ABS[$i]}")
+    done
+
+    return 1
+}
+
+# tool_advisory_application <control_dict> prints the detected solver, or
+# nothing when the Orchestrator cannot read it. The advisory never falls back to
+# a default solver name.
+tool_advisory_application() {
+    local file="$1" value
+
+    [[ -r "$file" ]] || return 0
+    tool_available foamDictionary || return 0
+
+    value="$(foamDictionary -entry application -value "$file" 2>/dev/null || true)"
+    printf '%s' "$value" | tr -d '\r' | tr -d '";' | awk '{ $1 = $1; print }'
+}
+
+# tool_advisory_flow_solvers inspects the solver of each eligible flow Case, in
+# DOE Batch CSV argument order and then DOE Batch CSV row order.
+tool_advisory_flow_solvers() {
+    local i batch_id batch_dir case_id control_dict solver
+
+    for (( i = 0; i < ${#INPUT_CSVS_ABS[@]}; i++ )); do
+        batch_id="${BATCH_NUMBERS[$i]}"
+        batch_dir="${OUTPUT_ROOT}/batch_${batch_id}"
+
+        while IFS= read -r case_id; do
+            if (( RUN_SETUP == 1 )); then
+                # Setup creates each future Case from the master flow template.
+                control_dict="${MASTER_BATCH_DIR}/simpleFoam_files/system/controlDict"
+            else
+                # A Case without a flow directory is skipped by the stage runner.
+                [[ -d "${batch_dir}/${case_id}/flow" ]] || continue
+                control_dict="${batch_dir}/${case_id}/flow/system/controlDict"
+            fi
+
+            solver="$(tool_advisory_application "$control_dict")"
+
+            if [[ -z "$solver" ]]; then
+                warn "Selected-Stage tool advisory: stage=flow batch=batch_${batch_id} case=${case_id} application=undetected controlDict=${control_dict}"
+                TOOL_ADVISORY_UNDETECTED=$(( TOOL_ADVISORY_UNDETECTED + 1 ))
+                continue
+            fi
+
+            tool_available "$solver" && continue
+
+            warn "Selected-Stage tool advisory: stage=flow batch=batch_${batch_id} case=${case_id} command=${solver} status=missing"
+            TOOL_ADVISORY_MISSING=$(( TOOL_ADVISORY_MISSING + 1 ))
+        done < <(tool_advisory_case_ids "${INPUT_CSVS_ABS[$i]}")
+    done
+}
+
+# tool_advisory_post_available is true when a post-processing stage runner is
+# resolvable. Existing behavior skips an optional post-processing stage that has
+# no stage runner, so that stage needs no command.
+tool_advisory_post_available() {
+    local i batch_dir
+
+    if [[ -d "$MASTER_BATCH_DIR" ]] &&
+        find_post_script_in_dir "$MASTER_BATCH_DIR" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    for (( i = 0; i < ${#BATCH_NUMBERS[@]}; i++ )); do
+        batch_dir="${OUTPUT_ROOT}/batch_${BATCH_NUMBERS[$i]}"
+        if find_post_script_in_dir "$batch_dir" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+run_tool_advisory() {
+    TOOL_ADVISORY_MISSING=0
+    TOOL_ADVISORY_UNDETECTED=0
+
+    if (( RUN_SETUP == 1 )); then
+        advise_missing_command setup surfaceCheck
+        advise_missing_command setup surfaceTransformPoints
+        advise_missing_command setup foamDictionary
+    fi
+
+    if (( RUN_MESH == 1 )); then
+        if tool_advisory_mesh_is_fresh; then
+            advise_missing_command mesh surfaceFeatureExtract
+            advise_missing_command mesh blockMesh
+            advise_missing_command mesh decomposePar
+            advise_missing_command mesh mpirun
+            advise_missing_command mesh snappyHexMesh
+            advise_missing_command mesh reconstructParMesh
+            advise_missing_command mesh checkMesh
+        fi
+        advise_missing_command mesh foamDictionary
+    fi
+
+    if (( RUN_FLOW == 1 )); then
+        advise_missing_command flow decomposePar
+        advise_missing_command flow mpirun
+        advise_missing_command flow renumberMesh
+        advise_missing_command flow checkMesh
+        advise_missing_command flow foamDictionary
+        tool_advisory_flow_solvers
+
+        # RECONSTRUCT_MODE=none never calls reconstructPar.
+        if [[ "${RECONSTRUCT_MODE:-latest}" != "none" ]]; then
+            advise_missing_command flow reconstructPar
+        fi
+    fi
+
+    if (( RUN_TRANSPORT == 1 )); then
+        advise_missing_command transport decomposePar
+        advise_missing_command transport mpirun
+        advise_missing_command transport renumberMesh
+        # The transport solver is fixed. The Orchestrator always forwards a
+        # non-empty --save-times value, so transport reconstructs custom times.
+        advise_missing_command transport scalarTransportDeffFoam
+        advise_missing_command transport reconstructPar
+        advise_missing_command transport foamDictionary
+    fi
+
+    # A skipped optional post-processing stage has no required command.
+    if (( RUN_POST == 1 )) && tool_advisory_post_available; then
+        advise_missing_command post-processing foamToVTK
+    fi
+
+    (( TOOL_ADVISORY_MISSING > 0 || TOOL_ADVISORY_UNDETECTED > 0 )) || return 0
+
+    warn "Selected-Stage tool advisory summary: missing=${TOOL_ADVISORY_MISSING} undetected=${TOOL_ADVISORY_UNDETECTED}. Execution continues."
+}
+
 main() {
     local end_of_options=0
 
@@ -1253,6 +1502,7 @@ main() {
 
     normalize_stage_selection
     preflight
+    run_tool_advisory
 
     if (( DRY_RUN == 1 )); then
         local i
