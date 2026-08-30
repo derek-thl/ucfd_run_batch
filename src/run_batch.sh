@@ -1173,20 +1173,27 @@ tool_advisory_case_id() {
     printf 'case_%s\n' "$value"
 }
 
-# tool_advisory_case_ids <csv> prints each unique normalized Case ID in DOE
-# Batch CSV row order. The advisory uses the existing simple CSV assumptions.
-tool_advisory_case_ids() {
-    local csv="$1" column line raw case_id
-    local -A seen=()
-
-    column="$(awk -F, 'NR == 1 {
+# orchestrator_case_column <csv> prints the 1-based index of the
+# case-insensitive Case column, or nothing when the column does not exist. The
+# selected-Stage advisory and the read-only status mode share this lookup.
+orchestrator_case_column() {
+    awk -F, 'NR == 1 {
             for (i = 1; i <= NF; i++) {
                 value = $i
                 gsub(/\r/, "", value)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
                 if (tolower(value) == "case") { print i; exit }
             }
-        }' "$csv")"
+        }' "$1"
+}
+
+# tool_advisory_case_ids <csv> prints each unique normalized Case ID in DOE
+# Batch CSV row order. The advisory uses the existing simple CSV assumptions.
+tool_advisory_case_ids() {
+    local csv="$1" column line raw case_id
+    local -A seen=()
+
+    column="$(orchestrator_case_column "$csv")"
 
     [[ -n "$column" ]] || return 0
 
@@ -1377,11 +1384,146 @@ run_tool_advisory() {
     warn "Selected-Stage tool advisory summary: missing=${TOOL_ADVISORY_MISSING} undetected=${TOOL_ADVISORY_UNDETECTED}. Execution continues."
 }
 
+# =============================================================================
+# Read-only status mode (v4 Section 6.7)
+# =============================================================================
+#
+# Status mode observes the existing Stage marker state of each valid unique
+# Case. Status mode writes nothing, resolves no stage runner, runs no OpenFOAM
+# command, and prints no execution diagnostic. Status mode reports marker
+# presence only. Marker presence is not proof of stage success.
+
+STATUS_MODE=0
+STATUS_CONFLICT_OPTION=""
+
+# The `--status` help text lives in its own function, so that the existing
+# usage() text and every existing help entry stay unchanged.
+usage_status() {
+    cat <<'EOF_STATUS'
+
+Read-only status mode:
+  --status                Report the existing stage marker state of each Case
+                           and exit. Status mode writes nothing, runs no stage
+                           script, and runs no OpenFOAM command.
+
+                           Usage:
+                             bash run_batch.sh --status [-o <DIR>] <batch_csv> [<batch_csv> ...]
+
+                           Compatible options: -o, --output-dir, -h, --help, --
+                           Compatible environment: RUN_BATCH_OUTPUT_DIR
+
+                           --status cannot be combined with an execution option:
+                             -s, --stage, --stages, -j, --jobs, --setup-jobs,
+                             --mesh-jobs, --flow-jobs, --transport-jobs,
+                             --post-jobs, -B, --batch-jobs, -m, --master-dir,
+                             -f, --overwrite, --keep-going, --skip-post,
+                             --save-times, --scalar-field, -n, --dry-run
+
+                           Each batch_<id> directory must already exist.
+                           Reported state is marker presence only. It does not
+                           prove that stage output is valid or current.
+EOF_STATUS
+}
+
+usage_full() {
+    usage
+    usage_status
+}
+
+status_dir_state() {
+    if [[ -d "$1" ]]; then
+        printf 'present\n'
+        return 0
+    fi
+    printf 'absent\n'
+}
+
+status_file_state() {
+    if [[ -f "$1" ]]; then
+        printf 'present\n'
+        return 0
+    fi
+    printf 'absent\n'
+}
+
+# status_validate collects every accepted DOE Batch CSV and Batch ID. Validation
+# finishes for every requested batch before the report starts.
+status_validate() {
+    local input input_abs filename batch_number batch_dir local_batch_csv
+    local -A seen_batch_dirs=()
+
+    OUTPUT_ROOT="$(canonicalize_path "$OUTPUT_ROOT")"
+
+    STATUS_CSVS=()
+    STATUS_BATCHES=()
+
+    for input in "${INPUT_CSVS[@]}"; do
+        input_abs="$(canonicalize_existing_file "$input" || true)"
+        [[ -n "$input_abs" ]] || die "Batch CSV not found: $input"
+
+        filename="$(basename -- "$input_abs")"
+        [[ "${filename,,}" == *.csv ]] ||
+            die "Input must have a .csv extension: $input_abs"
+
+        batch_number="$(extract_batch_number "$filename" || true)"
+        [[ -n "$batch_number" ]] ||
+            die "Cannot determine batch ID from filename: $filename. Recommended form: output_batch_<id>.csv"
+
+        batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
+        local_batch_csv="${batch_dir}/${filename}"
+
+        if [[ -n "${seen_batch_dirs[$batch_dir]:-}" ]]; then
+            die "Duplicate batch destination detected: $batch_dir. Inputs '${seen_batch_dirs[$batch_dir]}' and '$input_abs' resolve to the same batch ID."
+        fi
+        seen_batch_dirs["$batch_dir"]="$input_abs"
+
+        [[ -d "$batch_dir" ]] ||
+            die "Existing batch directory required for --status: $batch_dir"
+
+        [[ -n "$(find "$batch_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] ||
+            die "Existing batch directory is empty: $batch_dir"
+
+        if [[ -f "$local_batch_csv" && "$input_abs" != "$local_batch_csv" ]]; then
+            cmp -s -- "$input_abs" "$local_batch_csv" ||
+                die "CSV mismatch for existing batch_${batch_number}: '$input_abs' differs from '$local_batch_csv'. Use the CSV that created this batch or run setup again with --overwrite."
+        fi
+
+        # Status mode cannot build its per-Case report without a Case column.
+        [[ -n "$(orchestrator_case_column "$input_abs")" ]] ||
+            die "Required column not found in $input_abs: Case"
+
+        STATUS_CSVS+=("$input_abs")
+        STATUS_BATCHES+=("$batch_number")
+    done
+}
+
+run_status_mode() {
+    local i batch_number batch_dir case_id case_root case_count=0
+
+    status_validate
+
+    info "Status report begin"
+
+    for (( i = 0; i < ${#STATUS_CSVS[@]}; i++ )); do
+        batch_number="${STATUS_BATCHES[$i]}"
+        batch_dir="${OUTPUT_ROOT}/batch_${batch_number}"
+
+        while IFS= read -r case_id; do
+            case_root="${batch_dir}/${case_id}"
+            info "Status report case: batch=batch_${batch_number} case=${case_id} case_dir=$(status_dir_state "$case_root") mesh_restart_marker=$(status_file_state "${case_root}/flow/restart.marker") flow_marker=$(status_file_state "${case_root}/flow/flow.marker") transport_marker=$(status_file_state "${case_root}/trd/transport.marker") post_signature=$(status_file_state "${case_root}/vtk/post_processing.complete")"
+            case_count=$(( case_count + 1 ))
+        done < <(tool_advisory_case_ids "${STATUS_CSVS[$i]}")
+    done
+
+    info "Status report total: batches=${#STATUS_CSVS[@]} cases=${case_count}"
+    info "Status report end"
+}
+
 main() {
     local end_of_options=0
 
     (( $# >= 1 )) || {
-        usage
+        usage_full
         exit 1
     }
 
@@ -1393,6 +1535,18 @@ main() {
         fi
 
         case "$1" in
+            # Record the first execution option that the user supplies, so that
+            # a --status conflict never comes from an environment value.
+            -s|--stage|--stages|-j|--jobs|--setup-jobs|--mesh-jobs|--flow-jobs| \
+            --transport-jobs|--post-jobs|-B|--batch-jobs|-m|--master-dir| \
+            -f|--overwrite|--keep-going|--skip-post|--save-times| \
+            --scalar-field|-n|--dry-run)
+                [[ -n "$STATUS_CONFLICT_OPTION" ]] || STATUS_CONFLICT_OPTION="$1"
+                ;;&
+            --status)
+                STATUS_MODE=1
+                shift
+                ;;
             -s|--stage|--stages)
                 (( $# >= 2 )) || die "$1 requires a stage name or comma-separated stage list."
                 STAGE_TOKENS+=("$2")
@@ -1460,7 +1614,7 @@ main() {
                 shift
                 ;;
             -h|--help)
-                usage
+                usage_full
                 exit 0
                 ;;
             --)
@@ -1477,8 +1631,21 @@ main() {
         esac
     done
 
+    if (( STATUS_MODE == 1 )); then
+        [[ -z "$STATUS_CONFLICT_OPTION" ]] ||
+            die "--status cannot be combined with ${STATUS_CONFLICT_OPTION}."
+
+        (( ${#INPUT_CSVS[@]} >= 1 )) || {
+            usage_full
+            exit 1
+        }
+
+        run_status_mode
+        exit 0
+    fi
+
     (( ${#INPUT_CSVS[@]} >= 1 )) || {
-        usage
+        usage_full
         exit 1
     }
 
