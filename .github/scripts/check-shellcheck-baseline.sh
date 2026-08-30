@@ -7,8 +7,11 @@
 # fails when the two differ. A new, removed, moved, or changed diagnostic
 # fails the comparison.
 #
-# The gate checks the six batch-runner scripts only. A scope change or a
+# The gate checks the seven batch-runner files only. A scope change or a
 # ShellCheck version change requires a separate bounded Issue.
+#
+# The gate follows an external source, so that a Stage Runner and its
+# co-located shared Stage library are analyzed as one deployment unit.
 
 set -Eeuo pipefail
 export LC_ALL=C
@@ -20,6 +23,7 @@ BASELINE_FILE="${REPO_ROOT}/.github/shellcheck-baseline.gcc"
 
 CHECKED_FILES=(
     "src/run_batch.sh"
+    "src/master_batch/lib_batch_stage.sh"
     "src/master_batch/setup_cases.sh"
     "src/master_batch/run_mesh_cases.sh"
     "src/master_batch/run_flow_cases.sh"
@@ -100,7 +104,7 @@ cd -- "$REPO_ROOT" ||
 # ShellCheck exit 0 means no diagnostic. Exit 1 means it reported diagnostics.
 # Both are valid analysis results. Any other status is an execution error.
 shellcheck_status=0
-shellcheck --format=gcc "${CHECKED_FILES[@]}" > "$CURRENT_FILE" ||
+shellcheck --external-sources --format=gcc "${CHECKED_FILES[@]}" > "$CURRENT_FILE" ||
     shellcheck_status=$?
 
 if (( shellcheck_status != 0 && shellcheck_status != 1 )); then

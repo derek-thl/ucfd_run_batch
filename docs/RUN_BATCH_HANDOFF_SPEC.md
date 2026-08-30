@@ -79,11 +79,35 @@ Each stage runner MUST own:
 - stage failure files;
 - stage-specific environment controls.
 
-### 3.3 No hidden shared library
+### 3.3 Shared Stage library
 
-The v4 baseline uses self-contained shell scripts. No external Bash helper library is required.
+The Stage Runners MAY use the internal Bash library:
 
-An agent SHOULD preserve this deployment property unless a separate change explicitly introduces a shared library and updates all deployment/install rules.
+```text
+<physical-directory-of-selected-Stage-Runner-target>/lib_batch_stage.sh
+```
+
+When a Stage Runner uses this library, the Stage Runner and the co-located library are one deployment unit.
+
+The selected Stage Runner MUST resolve the library from the physical directory that contains the selected Stage Runner target. Resolution MUST use the selected Stage Runner path. Resolution MUST NOT use the Batch Workspace current working directory, `PATH`, `MASTER_BATCH_DIR`, `BATCH_DIR`, or a library environment variable.
+
+The central-first Stage Runner resolution rule applies to the complete deployment unit. A central Stage Runner MUST use the central co-located library. A batch-local Stage Runner MUST use the batch-local co-located library. A Stage Runner MUST NOT fall back to a library from the other location.
+
+The library MUST publish `BATCH_STAGE_LIBRARY_API_VERSION`. Each new Stage Runner that uses the library MUST contain the literal declaration `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1`. Before the Stage Runner sources the library, the Stage Runner MUST remove inherited values of both API-version variables and set the required value from its literal declaration. The Stage Runner MUST verify that the library value equals the required value.
+
+The library MUST have no source-time file, process, network, or console side effect. Source time MAY assign library variables and define functions only.
+
+The library MUST use the `batch_stage_` namespace for shared helper functions. The library MAY own common mutual-exclusion mechanics, atomic append mechanics, job-pool primitives, CSV field tokenization and index lookup, and progress primitives.
+
+Each Stage Runner MUST continue to own its CLI, environment controls, Stage-specific commands, required CSV columns, header text, row composition, artifact paths, summary schema, Failure Artifact schema, operator-visible messages, final status interpretation, markers, and restart behavior.
+
+The shared implementation MUST preserve each Stage Runner's current status propagation. The shared implementation MUST NOT normalize different lock-release, failure-record, child-status, or progress-output behavior.
+
+A missing or incompatible required library MUST fail closed before Case work or an OpenFOAM command starts. The failure MUST NOT create or change a Stage summary, Failure Artifact, marker, Case log, or Case state.
+
+The Orchestrator structural preflight MUST validate the co-located library for each selected Stage Runner that contains the literal library-requirement declaration. The check MUST run during a real run and during `--dry-run`. A selected Stage Runner without the declaration MUST keep the existing selection and execution behavior. Status mode MUST NOT resolve or validate a Stage Runner or library.
+
+An old self-contained batch-local Stage Runner remains independently executable. A new Stage Runner that uses the library is independently executable only as part of its complete deployment unit.
 
 ## 4. Required repository/workspace layout
 
@@ -101,6 +125,7 @@ Recommended project layout:
 │   ├── run_flow_cases.sh
 │   ├── run_transport_cases.sh
 │   ├── run_post_processing_cases.sh
+│   ├── lib_batch_stage.sh
 │   ├── simpleFoam_files/
 │   └── scalarTransportDeffFoam_files/
 ├── batch_1/                   # generated/reused workspace
@@ -121,6 +146,8 @@ batch_<id>/
 `flow/` is the CFD flow case.  
 `trd/` is the scalar-transport case.  
 `vtk/` contains post-processed VTU outputs.
+
+`lib_batch_stage.sh` and each new Stage Runner that sources it form one deployment unit. The complete `master_batch` copy puts the library into each new Batch Workspace.
 
 ## 5. Runtime assumptions
 
@@ -517,7 +544,7 @@ Two input CSVs that resolve to the same destination batch ID MUST be rejected du
 When `setup` is selected:
 
 1. `master_batch` MUST exist.
-2. Required selected stage scripts MUST exist in `master_batch`.
+2. Required selected Stage Runner paths MUST exist in `master_batch`. A selected Stage Runner that declares a shared Stage library requirement MUST have its complete deployment unit.
 3. The destination `batch_<id>` MUST NOT equal `master_batch`.
 4. The source CSV MUST NOT be inside its destination `batch_<id>`.
 5. A non-empty existing destination MUST fail unless `--overwrite` is set.
@@ -533,13 +560,15 @@ cp -a --reflink=auto
 
 This preserves ordinary copy semantics and uses copy-on-write when the filesystem supports it.
 
+The complete template copy MUST include `lib_batch_stage.sh`. A partial copy of a new Stage Runner without its co-located library is invalid.
+
 ### 7.2 Setup not selected: reuse mode
 
 When setup is not selected:
 
 1. `batch_<id>` MUST already exist.
 2. It MUST be non-empty.
-3. Selected stage scripts MUST be resolvable from the master or the batch-local copy.
+3. Selected Stage Runners MUST be resolvable from the master or the batch-local copy. A selected Stage Runner that declares a shared Stage library requirement MUST have its complete deployment unit.
 4. The workspace MUST NOT be removed or recreated.
 5. `--overwrite` MUST be rejected.
 
@@ -563,6 +592,18 @@ For an existing batch, `run_batch.sh` MUST resolve a selected stage script in th
 
 The central `master_batch` copy is authoritative when available.
 
+The selected Stage Runner path and its co-located `lib_batch_stage.sh` are one resolution result. The Orchestrator MUST resolve the physical Stage Runner target and MUST use the library from that physical target directory. The Orchestrator MUST NOT select a Stage Runner from one location and a library from another location.
+
+A selected Stage Runner declares its library requirement with the literal line `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1`. The Orchestrator MUST require and validate a compatible co-located library only when the selected Stage Runner contains this declaration. A selected Stage Runner without this declaration MUST run unchanged.
+
+A central Stage Runner with the declaration MUST use its central co-located library. A batch-local Stage Runner with the declaration MUST use its batch-local co-located library. A missing or incompatible co-located library MUST fail structural preflight. The Orchestrator MUST NOT fall back to the other location after it selects a Stage Runner.
+
+For a symbolic-link Stage Runner, the library beside the physical symbolic-link target is authoritative.
+
+The Orchestrator MUST validate one deployment unit for each batch and selected Stage resolution result before `Preflight PASS`. In initialize mode, resolution MUST use the master directory because the Batch Workspace does not exist.
+
+The Orchestrator MUST validate the API version in a new Bash subprocess. The subprocess MUST remove inherited `BATCH_STAGE_LIBRARY_API_VERSION`, MUST read standard input from `/dev/null`, and MUST NOT change the Orchestrator environment.
+
 Reason: old batch workspaces contain copied scripts. They can become incompatible with a newer `run_batch.sh`. Central-first resolution prevents version drift such as a new wrapper passing `--save-times` to an old transport runner that does not know that option.
 
 Post-processing script names MUST support:
@@ -585,6 +626,8 @@ Every Orchestrator Stage Runner invocation MUST also supply the Batch Workspace 
 Explicit forwarding supplements the current-working-directory rule. Explicit forwarding MUST NOT replace that rule. The Orchestrator MUST continue to enter the Batch Workspace before it invokes a Stage Runner, and the Orchestrator MUST NOT depend on `-O` as a replacement for the current working directory.
 
 Master-first resolution and batch-local resolution MUST use the same argument contract.
+
+An optional post-processing Stage with no resolvable Stage Runner stays skipped. No library is required for that skipped Stage.
 
 ## 9. Cross-stage environment contract
 
@@ -1666,7 +1709,8 @@ Current v4 use cases include:
 - flow template -> flow case;
 - transport template -> transport case;
 - flow `polyMesh` -> fresh transport case;
-- flow `U`, `nut`, `phi` -> fresh transport initial fields.
+- flow `U`, `nut`, `phi` -> fresh transport initial fields;
+- `lib_batch_stage.sh` as part of the complete `master_batch` -> `batch_<id>` deployment-unit copy.
 
 Hard links MUST NOT be used as a transparent replacement because OpenFOAM case files are modified after copying.
 
@@ -1773,6 +1817,7 @@ An AI agent claiming compatibility MUST run or provide evidence for the followin
 
 ```bash
 bash -n run_batch.sh
+bash -n master_batch/lib_batch_stage.sh
 bash -n master_batch/setup_cases.sh
 bash -n master_batch/run_mesh_cases.sh
 bash -n master_batch/run_flow_cases.sh
@@ -1780,7 +1825,7 @@ bash -n master_batch/run_transport_cases.sh
 bash -n master_batch/run_post_processing_cases.sh
 ```
 
-Expected: all exit `0`.
+Expected: all seven scripts exit `0`.
 
 ### B. CLI help
 
@@ -2086,6 +2131,30 @@ Expected:
 - a direct Stage Runner invocation without an output-directory option keeps its current default;
 - the selected-Stage advisory, the read-only status mode, the consolidated report, and the optional post-processing skip stay unchanged.
 
+### U. Shared Stage library deployment foundation
+
+Use the Orchestrator CLI and direct Stage Runner CLIs.
+
+Expected:
+
+- every new Stage Runner uses only `lib_batch_stage.sh` beside its physical target;
+- the required library API version is `1`;
+- a declared central Stage Runner does not use a batch-local library;
+- a declared batch-local Stage Runner does not use a central library;
+- a symbolic-link Stage Runner uses the library beside the physical target;
+- a custom master directory uses its co-located library;
+- a missing, unreadable, unsourceable, or incompatible library fails with status `1` and the required diagnostic;
+- an inherited API-version environment value cannot satisfy the check;
+- direct Stage Runner failure occurs before argument parsing, artifact creation, Case work, and OpenFOAM work;
+- Orchestrator failure occurs before `Preflight PASS`, advisory inspection, dry-run commands, Batch Workspace writes, Stage work, and OpenFOAM work;
+- `--dry-run` validates the selected deployment unit and writes nothing;
+- status mode does not resolve, source, or validate a Stage Runner or library;
+- an optional missing post-processing Stage stays skipped;
+- a new Batch Workspace contains the copied library;
+- an old self-contained Stage Runner with no library-requirement declaration keeps its current direct and Orchestrator behavior;
+- an unreadable-library assertion is skipped and reported when `EUID` is `0`;
+- complete compatible deployment units keep all existing behavior and status results.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -2119,6 +2188,8 @@ specification/behavior change
 
 An agent MUST NOT change CLI semantics, path conventions, markers, save-time behavior, or restart behavior as an incidental cleanup.
 
+For I-G0, report `Behavioral contract changed: yes` and `Workspace layout changed: yes`. Report `CLI changed: no`, `Restart semantics changed: no`, `Concurrency semantics changed: no`, and `OpenFOAM commands changed: no`.
+
 ## 25. Recommended AI-agent implementation sequence
 
 For a clean-room recreation, implement in this order:
@@ -2138,7 +2209,7 @@ For a clean-room recreation, implement in this order:
 13. `run_post_processing_cases.sh` deterministic outputs and signature-based reuse.
 14. Add all acceptance tests from Section 23.
 
-At every step, keep the scripts independently executable.
+At every step, keep each old self-contained Stage Runner independently executable. Keep each new Stage Runner independently executable as part of its complete deployment unit.
 
 ## 26. Non-goals of v4
 
@@ -2150,11 +2221,12 @@ The baseline does not require:
 - automatic CPU affinity or MPI rank reduction;
 - automatic GPU scheduling;
 - true RFC-compliant CSV parsing with quoted commas;
-- a common shell library;
 - multi-time `foamToVTK` batching in one invocation;
 - automatic creation of missing transport cases during transport execution.
 
 These may be future improvements but MUST be separate reviewed changes.
+
+The internal shared Stage library in Section 3.3 is part of the reviewed v4 deployment. A different runtime, an external library dependency, or another common library remains a separate reviewed change.
 
 ## 27. Known technical debt / cautions
 
@@ -2163,12 +2235,13 @@ These may be future improvements but MUST be separate reviewed changes.
 3. **`--save-times` interface asymmetry**: top-level v4 accepts integer comma lists, while transport runner accepts a broader numeric list format.
 4. **Post signature is structural**: it tracks time-directory/field-selection state, not hashes of every OpenFOAM result file. If file contents change without time-set changes, `FORCE_POST=1` may be required.
 5. **Central stage source is intentional**: updating `master_batch` affects subsequent runs of old batches because central scripts are preferred.
+6. **Stage library co-location is required**: a new Stage Runner and `lib_batch_stage.sh` from the same physical target directory are one deployment unit. Do not copy or select one without the other.
 
 Do not “fix” these items inside an unrelated implementation task. Open a dedicated Issue if behavior must change.
 
 ## 28. Baseline file fingerprints
 
-The v4 implementation used to create this handoff has these SHA-256 fingerprints:
+The following fingerprints identify historical baselines and later-added deployment files. A legitimate implementation change will naturally change a file hash.
 
 ```text
 24f623eb8f38764ce7ca9ea940429813ee4f2a3660c86521d520400081230819  run_batch.sh
@@ -2177,6 +2250,7 @@ The v4 implementation used to create this handoff has these SHA-256 fingerprints
 8a5ee48b0dcec6e69892475f6e17b62194741d906d2623257ab33ac3178efe3a  run_flow_cases.sh
 1b864b3c5ff142b64168691a618a4fb85a26ee22c59d61f1ff0c28617781dc61  run_transport_cases.sh
 8ef7e3ef929b2064f226b0179e55f14ef986f51db7f63b5d4ef26f4b51fd688a  run_post_processing_cases.sh
+9908ee074757031d2eb472b27be6ee0a70c706940fbc203d94cb17df315d8fdd  lib_batch_stage.sh
 ```
 
 Agents can use these only to identify the exact baseline. A legitimate implementation change will naturally change the hashes.
@@ -2207,6 +2281,12 @@ A replacement is compatible when all of the following are true:
 - the advisory selected-Stage command preflight names each missing selected-Stage command before stage 1, and it changes no exit status;
 - the read-only status mode reports the existing stage marker state of each valid unique Case, writes nothing, and runs no stage runner and no OpenFOAM command;
 - every Orchestrator Stage Runner command carries the exact `-O <absolute-batch-workspace-path>` pair while the Section 8 current-working-directory rule stays valid;
+- every new Stage Runner resolves and verifies only its co-located shared Stage library;
+- the Orchestrator validates each selected Stage Runner deployment unit during structural preflight and dry-run;
+- status mode does not resolve, source, or validate a Stage Runner or shared Stage library;
+- missing or incompatible shared Stage libraries fail closed before Batch Workspace, Case, Stage, or OpenFOAM work;
+- new Batch Workspaces contain the shared Stage library;
+- old self-contained Stage Runners with no library-requirement declaration keep their current direct and Orchestrator behavior;
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 

@@ -218,24 +218,30 @@ validate_selected_scripts_for_batch() {
     if (( RUN_SETUP == 1 )); then
         path="$(stage_script_path setup_cases.sh "$batch_dir" || true)"
         [[ -n "$path" ]] || die "Selected setup stage script not found in master or batch: $batch_dir"
+        validate_stage_deployment_unit "$path"
     fi
     if (( RUN_MESH == 1 )); then
         path="$(stage_script_path run_mesh_cases.sh "$batch_dir" || true)"
         [[ -n "$path" ]] || die "Selected mesh stage script not found in master or batch: $batch_dir"
+        validate_stage_deployment_unit "$path"
     fi
     if (( RUN_FLOW == 1 )); then
         path="$(stage_script_path run_flow_cases.sh "$batch_dir" || true)"
         [[ -n "$path" ]] || die "Selected flow stage script not found in master or batch: $batch_dir"
+        validate_stage_deployment_unit "$path"
     fi
     if (( RUN_TRANSPORT == 1 )); then
         path="$(stage_script_path run_transport_cases.sh "$batch_dir" || true)"
         [[ -n "$path" ]] || die "Selected transport stage script not found in master or batch: $batch_dir"
+        validate_stage_deployment_unit "$path"
     fi
     if (( RUN_POST == 1 )); then
         path="$(post_script_path "$batch_dir" || true)"
         if [[ -z "$path" && "$POST_REQUIRED" == "1" ]]; then
             die "Selected post-processing stage script not found in master or batch: $batch_dir"
         fi
+        # A skipped optional post-processing stage needs no library.
+        [[ -z "$path" ]] || validate_stage_deployment_unit "$path"
     fi
 }
 
@@ -429,6 +435,61 @@ selected_stage_summary() {
     printf '%s' "$summary"
 }
 
+# =============================================================================
+# Shared Stage library deployment unit (v4 Section 3.3 and Section 8)
+# =============================================================================
+#
+# A selected Stage Runner and its co-located lib_batch_stage.sh are one
+# resolution result. The Orchestrator validates the deployment unit of each
+# selected Stage Runner before `Preflight PASS`. A Stage Runner without the
+# literal library-requirement declaration keeps its existing behavior.
+
+# stage_library_path <stage_runner_path> prints the co-located library path of
+# the physical Stage Runner target.
+stage_library_path() {
+    local physical
+
+    physical="$(readlink -f -- "$1" 2>/dev/null || true)"
+    [[ -n "$physical" ]] || physical="$1"
+
+    printf '%s/lib_batch_stage.sh\n' "$(dirname -- "$physical")"
+}
+
+# stage_declares_library <stage_runner_path> is true when the selected Stage
+# Runner contains the literal library-requirement declaration.
+stage_declares_library() {
+    local physical
+
+    physical="$(readlink -f -- "$1" 2>/dev/null || true)"
+    [[ -n "$physical" ]] || physical="$1"
+
+    grep -qF 'readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1' "$physical" 2>/dev/null
+}
+
+# validate_stage_deployment_unit <stage_runner_path>
+validate_stage_deployment_unit() {
+    local script="$1" library probe
+
+    stage_declares_library "$script" || return 0
+
+    library="$(stage_library_path "$script")"
+
+    [[ -f "$library" ]] ||
+        die "Required Stage library is missing or incompatible for ${script}: ${library}"
+
+    # A new subprocess verifies the API version. The subprocess never changes
+    # the Orchestrator environment and never reads standard input.
+    probe="$(cat <<'PROBE'
+source "$1" || exit 1
+[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "1" ]] || exit 1
+PROBE
+)"
+
+    env -u BATCH_STAGE_LIBRARY_API_VERSION bash -c "$probe" bash "$library" \
+        </dev/null >/dev/null 2>&1 ||
+        die "Required Stage library is missing or incompatible for ${script}: ${library}"
+}
+
 validate_selected_scripts_in_dir() {
     local dir="$1"
     local context="$2"
@@ -455,6 +516,14 @@ validate_selected_scripts_in_dir() {
             warn "No post-processing script found in ${context}; post-processing will be skipped."
         fi
     fi
+
+    (( RUN_SETUP == 0 )) || validate_stage_deployment_unit "${dir}/setup_cases.sh"
+    (( RUN_MESH == 0 )) || validate_stage_deployment_unit "${dir}/run_mesh_cases.sh"
+    (( RUN_FLOW == 0 )) || validate_stage_deployment_unit "${dir}/run_flow_cases.sh"
+    (( RUN_TRANSPORT == 0 )) || validate_stage_deployment_unit "${dir}/run_transport_cases.sh"
+
+    # A skipped optional post-processing stage needs no library.
+    [[ -z "$post_script" ]] || validate_stage_deployment_unit "${dir}/${post_script}"
 }
 
 preflight() {
