@@ -63,7 +63,8 @@ The words `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`, and `MAY` define implement
 - transport `--save-times` propagation;
 - dry-run planning;
 - batch failure policy;
-- top-level logging.
+- top-level logging;
+- read-only status reporting of existing stage markers.
 
 ### 3.2 Stage runners own
 
@@ -334,6 +335,7 @@ mesh -> transport
 | `--save-times <LIST>` | Transport reconstruction times. Top-level v4 format is comma-separated non-negative integers. Default `60,120,300`. |
 | `--scalar-field <NAME>` | OpenFOAM scalar field token shared by setup, transport, and post-processing. Default `T`. |
 | `-n`, `--dry-run` | Run preflight and print the plan. Do not run stages. |
+| `--status` | Report the existing stage marker state of each Case and exit. Read-only. See Section 6.7. |
 | `-h`, `--help` | Print usage and exit. |
 | `--` | End option parsing. Remaining arguments are CSV paths. |
 
@@ -358,6 +360,117 @@ Example:
 ```
 
 Note: `run_transport_cases.sh` itself accepts a broader time syntax, including decimal values and comma/semicolon/space separators. The top-level wrapper intentionally has the narrower v4 interface. An agent MUST NOT silently broaden the top-level contract when reproducing v4.
+
+### 6.7 Read-only status mode
+
+`--status` selects a separate observation mode. `--status` does not select a stage and does not execute a stage.
+
+Invocation:
+
+```bash
+bash run_batch.sh --status [--output-dir <DIR>] <batch_csv> [<batch_csv> ...]
+```
+
+These existing forms stay available in status mode: `-o`, `--output-dir`, `-h`, `--help`, `--`, and one or more DOE Batch CSV arguments. `RUN_BATCH_OUTPUT_DIR` stays the compatible environment override for the output root.
+
+`MASTER_BATCH_DIR` and `RUN_BATCH_OVERWRITE` stay accepted environment variables. Status mode ignores both values. An environment value MUST NOT cause a conflict. Only the matching `--master-dir` or `--overwrite` CLI option causes a conflict.
+
+`--status` conflicts with each of these execution options:
+
+```text
+-s --stage --stages
+-j --jobs --setup-jobs --mesh-jobs --flow-jobs --transport-jobs --post-jobs
+-B --batch-jobs
+-m --master-dir
+-f --overwrite
+--keep-going --skip-post --save-times --scalar-field
+-n --dry-run
+```
+
+A conflict MUST fail before status output. The error MUST name `--status` and the conflicting option. The option order MUST NOT change the result.
+
+The help output MUST document `--status`, its read-only behavior, its compatible options, and its conflicts.
+
+#### Status validation
+
+Status mode MUST validate, for every requested batch, before it prints `Status report begin`:
+
+1. at least one DOE Batch CSV argument exists;
+2. each DOE Batch CSV exists and is a regular file;
+3. each DOE Batch CSV has a `.csv` extension;
+4. each Batch ID can be extracted with the existing Section 6.6 rule;
+5. no two DOE Batch CSV arguments resolve to the same Batch Workspace;
+6. each Batch Workspace exists and is non-empty;
+7. when the Batch Workspace holds a copy of the same DOE Batch CSV and the user supplies an external copy, both copies are identical;
+8. each DOE Batch CSV has a case-insensitive `Case` column.
+
+A validation failure MUST print no status report block and MUST return non-zero. An existing reuse-preflight diagnostic MUST stay unchanged where it applies. A missing `Case` column MUST give an explicit diagnostic.
+
+The missing-column failure is intentional. The Section 5.1 advisory is non-fatal and can omit dynamic Case inspection when no Case column exists. Status mode cannot produce its required per-Case report without that column.
+
+A missing Case directory or a missing marker is observed state. It MUST NOT make status mode non-zero. After successful validation and report output, status mode MUST return `0`.
+
+#### Status output
+
+Status mode MUST use the existing timestamped `INFO` logging interface. The stable contract is the message payload after the timestamp and the level prefix.
+
+The output MUST start with:
+
+```text
+Status report begin
+```
+
+The output MUST give one line for each valid unique Case:
+
+```text
+Status report case: batch=batch_<id> case=<case_id> case_dir=<present|absent> mesh_restart_marker=<present|absent> flow_marker=<present|absent> transport_marker=<present|absent> post_signature=<present|absent>
+```
+
+The output MUST give one total line:
+
+```text
+Status report total: batches=<N> cases=<N>
+```
+
+The output MUST end with:
+
+```text
+Status report end
+```
+
+`batches` is the number of accepted DOE Batch CSV arguments. `cases` is the number of emitted Case lines.
+
+Batch sections MUST follow DOE Batch CSV argument order. Case lines inside one batch MUST follow DOE Batch CSV row order. Each normalized Case is emitted once per batch, and a later duplicate row for the same normalized Case is ignored. An empty Case value and a normalized `NA` Case ID give no Case line.
+
+Status mode uses the existing simple DOE Batch CSV assumptions and the existing Case ID rule. Status mode does not add quoted-comma parsing.
+
+#### Marker mapping
+
+For `<Batch Workspace>/<case_id>`, status mode reports only these exact paths:
+
+| Output field | Existing path | `present` rule |
+|---|---|---|
+| `case_dir` | `<Batch Workspace>/<case_id>/` | The path is a directory. |
+| `mesh_restart_marker` | `<Batch Workspace>/<case_id>/flow/restart.marker` | The path is a regular file. |
+| `flow_marker` | `<Batch Workspace>/<case_id>/flow/flow.marker` | The path is a regular file. |
+| `transport_marker` | `<Batch Workspace>/<case_id>/trd/transport.marker` | The path is a regular file. |
+| `post_signature` | `<Batch Workspace>/<case_id>/vtk/post_processing.complete` | The path is a regular file. |
+
+Every other value is `absent`.
+
+The report states marker presence only. The report MUST NOT claim stage success, stage readiness, or current post-processing output. The report MUST NOT use a nonzero numeric time directory, `constant/polyMesh`, `case.foam`, a stage summary, a Failure Artifact, a stage log, or the content of `post_processing.complete` as evidence.
+
+`post_signature=present` does not mean that the stored signature matches current source results, and it does not mean that every expected VTU output exists.
+
+#### Read-only and non-execution rules
+
+Status mode MUST NOT create, remove, rename, truncate, or change any file or directory. Status mode MUST NOT initialize, overwrite, or repair a Batch Workspace, copy a DOE Batch CSV, create a temporary run-report directory, or create a summary, log, Failure Artifact, state file, or marker.
+
+Status mode MUST NOT run structural stage-script validation, resolve or run a stage runner, run the Section 5.1 advisory, or run a solver, meshing command, MPI command, reconstruction command, post-processing command, or `foamDictionary`.
+
+Status mode MUST NOT print `Preflight PASS`, a dry-run plan, `Stage start`, a consolidated run report, or the normal overall-success diagnostic.
+
+Status mode MAY use existing GNU/Linux, Bash, and coreutils commands to read paths and to parse the DOE Batch CSV.
 
 ### 6.5 Environment compatibility
 
@@ -1345,6 +1458,17 @@ Selected-Stage tool advisory summary: missing=<N> undetected=<N>. Execution cont
 
 The advisory warning order is deterministic. The summary line appears only when one or more advisory warnings exist. All advisory warnings appear before stage 1. The existing `Preflight PASS` line, plan lines, stage lines, batch lines, and consolidated report lines stay unchanged.
 
+The top-level runner MUST also log the Section 6.7 status payloads:
+
+```text
+Status report begin
+Status report case: batch=batch_<id> case=<case_id> case_dir=<present|absent> mesh_restart_marker=<present|absent> flow_marker=<present|absent> transport_marker=<present|absent> post_signature=<present|absent>
+Status report total: batches=<N> cases=<N>
+Status report end
+```
+
+Status mode uses `INFO` output. Status mode prints no execution-mode diagnostic.
+
 Printed shell commands MAY use shell escaping such as `%q`.
 
 Example display:
@@ -1493,6 +1617,8 @@ Hard links MUST NOT be used as a transparent replacement because OpenFOAM case f
 ## 21. Resume/idempotency policy
 
 The scripts intentionally use stage-local markers and existing time directories.
+
+The Section 6.7 status mode reports marker presence only. Status mode does not replace and does not reinterpret the stage resume and skip rules of this section.
 
 | Stage | Resume/skip evidence |
 |---|---|
@@ -1858,6 +1984,33 @@ Expected:
 - the consolidated report stays unchanged;
 - mandatory platform utilities give no warning.
 
+### S. Read-only status mode
+
+Run the Orchestrator with `--status` against an existing Batch Workspace.
+
+Normalize the timestamp and the level prefix, and then compare the status payload.
+
+Expected:
+
+- `--help` lists `--status` and keeps every existing help entry;
+- one Case with no Case directory gives one all-`absent` Case line and status `0`;
+- a present Case directory changes only `case_dir`;
+- each of the four marker files changes only its exact field;
+- a nonzero time directory, a valid mesh, `case.foam`, a stage summary, a Failure Artifact, and a stage log change no marker field;
+- Case ID normalization matches the existing stage runner rule;
+- an empty Case value and a normalized `NA` Case value give no Case line;
+- a duplicate normalized Case value gives one Case line;
+- a DOE Batch CSV with a valid `Case` column and no data row gives `batches=1 cases=0`;
+- Case lines follow DOE Batch CSV row order, and batches follow DOE Batch CSV argument order;
+- no DOE Batch CSV, a missing DOE Batch CSV, a missing or empty Batch Workspace, a duplicate Batch ID, a mismatched Batch Workspace CSV, and a missing `Case` column each give non-zero and no status report block;
+- each execution-option conflict gives non-zero, names `--status` and the conflicting option, and gives no status report block;
+- `MASTER_BATCH_DIR` and `RUN_BATCH_OVERWRITE` environment values give no conflict and no write;
+- a recursive Batch Workspace snapshot is identical before and after status mode;
+- status mode creates no output root;
+- status mode runs no stage script and no OpenFOAM command;
+- status mode prints no preflight, advisory, plan, stage, consolidated report, or overall-success line;
+- an existing dry-run and an existing execution keep their output and their status.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -1977,6 +2130,7 @@ A replacement is compatible when all of the following are true:
 - failures are logged and propagated according to the baseline contract;
 - the consolidated end-of-run report shows each attempted batch, each selected stage, and each failed Case, and it changes no exit status;
 - the advisory selected-Stage command preflight names each missing selected-Stage command before stage 1, and it changes no exit status;
+- the read-only status mode reports the existing stage marker state of each valid unique Case, writes nothing, and runs no stage runner and no OpenFOAM command;
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 

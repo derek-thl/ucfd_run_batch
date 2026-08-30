@@ -64,9 +64,18 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.P | Failure propagation | `cases/p_failure_propagation.sh` |
 | 23.Q | Consolidated end-of-run report | `cases/q_consolidated_run_report.sh` |
 | 23.R | Advisory selected-Stage tool preflight | `cases/r_selected_stage_tool_preflight.sh` |
+| 23.S | Read-only status mode | `cases/s_read_only_status_mode.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.S proves the read-only rule with two independent checks. The scenario
+compares a recursive `find` listing and a `cksum` listing of the whole output
+root before and after status mode. The scenario also puts poison commands on
+`PATH` and poison stage scripts in the master directory and in the Batch
+Workspace. Each poison command appends its own name to one log file. Status mode
+passes only when that log file does not exist, so no OpenFOAM command and no
+stage script ran.
 
 Section 23.R builds a complete command directory inside its own workspace and
 sets `PATH` to that directory only. The directory holds a symbolic link to each
