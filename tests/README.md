@@ -65,9 +65,18 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.Q | Consolidated end-of-run report | `cases/q_consolidated_run_report.sh` |
 | 23.R | Advisory selected-Stage tool preflight | `cases/r_selected_stage_tool_preflight.sh` |
 | 23.S | Read-only status mode | `cases/s_read_only_status_mode.sh` |
+| 23.T | Explicit Stage Runner output-directory forwarding | `cases/t_explicit_output_dir_forwarding.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.T reads the recorded Stage Runner argument vector, working directory,
+and exported environment from `tests/fakes/stage_stub.sh`. The scenario compares
+each vector against the exact Section 9.1 order, and it proves that the `-O`
+value, the exported `BATCH_DIR`, and the recorded working directory are the same
+path. One scenario uses a Batch Workspace path that holds a space, an ampersand,
+a semicolon, and a dollar sign, so a split argument or an added escape fails the
+comparison.
 
 Section 23.S proves the read-only rule with two independent checks. The scenario
 compares a recursive `find` listing and a `cksum` listing of the whole output

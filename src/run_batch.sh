@@ -631,14 +631,14 @@ print_batch_plan() {
         fi
     fi
 
-    if (( RUN_SETUP == 1 )); then build_job_args setup; post_script="$(stage_script_path setup_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
-    if (( RUN_MESH == 1 )); then build_job_args mesh; post_script="$(stage_script_path run_mesh_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
-    if (( RUN_FLOW == 1 )); then build_job_args flow; post_script="$(stage_script_path run_flow_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; fi
-    if (( RUN_TRANSPORT == 1 )); then build_job_args transport; post_script="$(stage_script_path run_transport_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}" --save-times "$SAVE_TIMES"; fi
+    if (( RUN_SETUP == 1 )); then build_job_args setup; post_script="$(stage_script_path setup_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" -O "$batch_dir" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_MESH == 1 )); then build_job_args mesh; post_script="$(stage_script_path run_mesh_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" -O "$batch_dir" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_FLOW == 1 )); then build_job_args flow; post_script="$(stage_script_path run_flow_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" -O "$batch_dir" "${STAGE_JOB_ARGS[@]}"; fi
+    if (( RUN_TRANSPORT == 1 )); then build_job_args transport; post_script="$(stage_script_path run_transport_cases.sh "$batch_dir")"; print_command bash "$post_script" -i "$batch_csv_path" -O "$batch_dir" "${STAGE_JOB_ARGS[@]}" --save-times "$SAVE_TIMES"; fi
 
     if (( RUN_POST == 1 )); then
         post_script="$(post_script_path "$batch_dir" || true)"
-        [[ -z "$post_script" ]] || { build_job_args post; print_command bash "$post_script" -i "$batch_csv_path" "${STAGE_JOB_ARGS[@]}"; }
+        [[ -z "$post_script" ]] || { build_job_args post; print_command bash "$post_script" -i "$batch_csv_path" -O "$batch_dir" "${STAGE_JOB_ARGS[@]}"; }
     fi
 }
 
@@ -726,6 +726,7 @@ run_batch_inner() {
         post_script="$(stage_script_path setup_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
+            -O "$BATCH_DIR" \
             "${STAGE_JOB_ARGS[@]}" || {
             stage_status=$?
             report_record_stage "$ordinal" setup failed
@@ -739,6 +740,7 @@ run_batch_inner() {
         post_script="$(stage_script_path run_mesh_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
+            -O "$BATCH_DIR" \
             "${STAGE_JOB_ARGS[@]}" || {
             stage_status=$?
             report_record_stage "$ordinal" mesh failed
@@ -752,6 +754,7 @@ run_batch_inner() {
         post_script="$(stage_script_path run_flow_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
+            -O "$BATCH_DIR" \
             "${STAGE_JOB_ARGS[@]}" || {
             stage_status=$?
             report_record_stage "$ordinal" flow failed
@@ -765,6 +768,7 @@ run_batch_inner() {
         post_script="$(stage_script_path run_transport_cases.sh "$PWD")"
         run_stage "$post_script" \
             -i "$BATCH_CSV_PATH" \
+            -O "$BATCH_DIR" \
             "${STAGE_JOB_ARGS[@]}" \
             --save-times "$SAVE_TIMES" || {
             stage_status=$?
@@ -779,6 +783,7 @@ run_batch_inner() {
             build_job_args post
             run_stage "$post_script" \
                 -i "$BATCH_CSV_PATH" \
+                -O "$BATCH_DIR" \
                 "${STAGE_JOB_ARGS[@]}" || {
                 stage_status=$?
                 report_record_stage "$ordinal" post failed

@@ -574,7 +574,17 @@ run_postprocess_cases.sh
 
 in that preference order within a directory.
 
-The selected stage script MUST run with the batch workspace as current working directory, even when the executable script file is physically located in `master_batch`.
+The selected Stage Runner MUST run with the Batch Workspace as its current working directory, even when the executable script file is physically located in `master_batch`.
+
+Every Orchestrator Stage Runner invocation MUST also supply the Batch Workspace as an explicit argument:
+
+```text
+-O <absolute-batch-workspace-path>
+```
+
+Explicit forwarding supplements the current-working-directory rule. Explicit forwarding MUST NOT replace that rule. The Orchestrator MUST continue to enter the Batch Workspace before it invokes a Stage Runner, and the Orchestrator MUST NOT depend on `-O` as a replacement for the current working directory.
+
+Master-first resolution and batch-local resolution MUST use the same argument contract.
 
 ## 9. Cross-stage environment contract
 
@@ -599,6 +609,50 @@ Meaning:
 | `SCALAR_FIELD` | Shared transport scalar field name. |
 
 Stage runners SHOULD accept `-i <csv>` as the explicit primary input and MAY use the exported batch variables as fallback discovery inputs.
+
+### 9.1 Stage Runner argument contract
+
+For every Stage Runner that the Orchestrator invokes, the common argument prefix MUST be:
+
+```text
+-i
+<selected-doe-batch-csv-path>
+-O
+<absolute-batch-workspace-path>
+```
+
+`-O` MUST occur exactly once in each Stage Runner argument vector.
+
+The value after `-O` MUST equal the exported `BATCH_DIR`, MUST equal the Stage Runner current working directory, and MUST identify the Batch Workspace of the current batch. The value MUST stay one argument, including when the path contains spaces or shell metacharacters, and it MUST carry no display-escaping backslash that is not part of the path.
+
+The remaining argument order MUST be:
+
+```text
+setup:
+  -i <csv> -O <batch-workspace> [-j <jobs>]
+
+mesh:
+  -i <csv> -O <batch-workspace> [-j <jobs>]
+
+flow:
+  -i <csv> -O <batch-workspace> [-j <jobs>]
+
+transport:
+  -i <csv> -O <batch-workspace> [-j <jobs>] --save-times <list>
+
+post-processing:
+  -i <csv> -O <batch-workspace> [-j <jobs>]
+```
+
+When the Orchestrator forwards no `-j`, `-O <batch-workspace>` still stays present.
+
+Each invoked Stage Runner MUST receive the Batch Workspace path of its own batch, including in parallel-batch execution.
+
+An optional post-processing Stage without a resolvable Stage Runner stays skipped. The Orchestrator MUST NOT invent an invocation for a skipped Stage.
+
+The exported environment contract of this section stays unchanged. The Orchestrator keeps three Batch Workspace channels by design: the current working directory, the explicit `-O` argument, and the exported `BATCH_DIR`.
+
+Direct Stage Runner invocation stays unchanged. `-O` and `--output-dir` support, the existing default output directory, the validation, and the path resolution of each Stage Runner stay unchanged.
 
 ## 10. Stage job-count precedence
 
@@ -1469,6 +1523,8 @@ Status report end
 
 Status mode uses `INFO` output. Status mode prints no execution-mode diagnostic.
 
+Each `Stage command` line includes the explicit `-O` argument and the Batch Workspace path of Section 9.1. The printed command represents the same Stage Runner argument order that a real run uses. Display escaping MUST NOT change the real argument vector.
+
 Printed shell commands MAY use shell escaping such as `%q`.
 
 Example display:
@@ -2011,6 +2067,25 @@ Expected:
 - status mode prints no preflight, advisory, plan, stage, consolidated report, or overall-success line;
 - an existing dry-run and an existing execution keep their output and their status.
 
+### T. Explicit Stage Runner output-directory forwarding
+
+Run the Orchestrator with stage stubs that record the argument vector, the working directory, and the exported environment.
+
+Expected:
+
+- setup, mesh, flow, and post-processing each receive `-i <csv> -O <batch-workspace> [-j <jobs>]`;
+- transport receives `-i <csv> -O <batch-workspace> [-j <jobs>] --save-times <list>`;
+- each Stage Runner receives `-O` exactly once;
+- each `-O` value equals the exported `BATCH_DIR` and the recorded Stage Runner working directory;
+- the contract holds when the Orchestrator forwards no `-j`;
+- a Batch Workspace path with spaces and shell metacharacters stays one exact argument and carries no added backslash;
+- a master-resolved and a batch-local Stage Runner receive the same argument contract;
+- sequential batches and parallel batches each receive their own Batch Workspace path;
+- each dry-run Stage Runner command shows the same argument order, and no Stage Runner runs;
+- a forced Stage Runner exit status stays the final Orchestrator status;
+- a direct Stage Runner invocation without an output-directory option keeps its current default;
+- the selected-Stage advisory, the read-only status mode, the consolidated report, and the optional post-processing skip stay unchanged.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -2131,6 +2206,7 @@ A replacement is compatible when all of the following are true:
 - the consolidated end-of-run report shows each attempted batch, each selected stage, and each failed Case, and it changes no exit status;
 - the advisory selected-Stage command preflight names each missing selected-Stage command before stage 1, and it changes no exit status;
 - the read-only status mode reports the existing stage marker state of each valid unique Case, writes nothing, and runs no stage runner and no OpenFOAM command;
+- every Orchestrator Stage Runner command carries the exact `-O <absolute-batch-workspace-path>` pair while the Section 8 current-working-directory rule stays valid;
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 
