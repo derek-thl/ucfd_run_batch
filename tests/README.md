@@ -46,7 +46,7 @@ The public script CLI is the only test seam. No test calls a private function.
 
 | Specification | Scenario | Test file |
 |---|---|---|
-| 23.A | Bash syntax for all six scripts | `cases/a_syntax.sh` |
+| 23.A | Bash syntax for all seven files | `cases/a_syntax.sh` |
 | 23.B | CLI help for all six scripts | `cases/b_cli_help.sh` |
 | 23.C | Top-level multi-CSV dry-run | `cases/c_multi_csv_dry_run.sh` |
 | 23.D | Canonical stage ordering | `cases/d_stage_ordering.sh` |
@@ -66,9 +66,18 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.R | Advisory selected-Stage tool preflight | `cases/r_selected_stage_tool_preflight.sh` |
 | 23.S | Read-only status mode | `cases/s_read_only_status_mode.sh` |
 | 23.T | Explicit Stage Runner output-directory forwarding | `cases/t_explicit_output_dir_forwarding.sh` |
+| 23.U | Shared Stage library deployment foundation | `cases/u_shared_stage_library_deployment.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.U builds real deployment units. Each scenario copies the production
+Stage Runners and `lib_batch_stage.sh` into a temporary directory, so a scenario
+controls the exact library shape beside each Stage Runner target. The scenario
+does not use `make_stub_master` for a deployment-unit assertion, because a stage
+stub carries no library-requirement declaration and keeps its current behavior.
+The unreadable-library assertion is skipped and reported when `EUID` is `0`,
+because the root identity can read a file with mode `000`.
 
 Section 23.T reads the recorded Stage Runner argument vector, working directory,
 and exported environment from `tests/fakes/stage_stub.sh`. The scenario compares

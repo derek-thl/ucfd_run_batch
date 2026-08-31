@@ -8,6 +8,7 @@ on:
   push:
     paths:
       - 'src/run_batch.sh'
+      - 'src/master_batch/lib_batch_stage.sh'
       - 'src/master_batch/setup_cases.sh'
       - 'src/master_batch/run_mesh_cases.sh'
       - 'src/master_batch/run_flow_cases.sh'
@@ -20,6 +21,7 @@ on:
   pull_request:
     paths:
       - 'src/run_batch.sh'
+      - 'src/master_batch/lib_batch_stage.sh'
       - 'src/master_batch/setup_cases.sh'
       - 'src/master_batch/run_mesh_cases.sh'
       - 'src/master_batch/run_flow_cases.sh'

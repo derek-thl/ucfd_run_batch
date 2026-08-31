@@ -7,6 +7,31 @@ trap 'echo ">>> [ERROR] ${0##*/} failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 export LC_ALL=C
 
 # =============================================================================
+# SHARED STAGE LIBRARY DEPLOYMENT UNIT
+# =============================================================================
+# This Stage Runner and its co-located lib_batch_stage.sh are one deployment
+# unit. The library comes only from the physical directory of this script
+# target. The check runs before argument parsing, artifact initialization, Case
+# work, and any OpenFOAM command.
+unset BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION BATCH_STAGE_LIBRARY_API_VERSION
+readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1
+BATCH_STAGE_LIBRARY="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib_batch_stage.sh"
+
+batch_stage_library_reject() {
+    echo "Error: Required Stage library is missing or incompatible: ${BATCH_STAGE_LIBRARY}" >&2
+    exit 1
+}
+
+[[ -f "$BATCH_STAGE_LIBRARY" && -r "$BATCH_STAGE_LIBRARY" ]] || batch_stage_library_reject
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib_batch_stage.sh
+source "$BATCH_STAGE_LIBRARY" 2>/dev/null || batch_stage_library_reject
+
+[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "$BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION" ]] ||
+    batch_stage_library_reject
+
+# =============================================================================
 # 0. USER CONFIG
 # =============================================================================
 PARALLEL_JOBS=2

@@ -521,6 +521,7 @@ output="${workspace}/out"
 mkdir -p "$master" "$output" "${master}/simpleFoam_files/system" \
     "${master}/scalarTransportDeffFoam_files"
 cp -f -- "$SETUP_SCRIPT" "${master}/setup_cases.sh"
+cp -f -- "${MASTER_SRC_DIR}/lib_batch_stage.sh" "${master}/lib_batch_stage.sh"
 printf 'FoamFile { object controlDict; }\napplication     simpleFoam;\n' \
     > "${master}/simpleFoam_files/system/controlDict"
 make_csv "${workspace}/output_batch_1.csv" case_0
