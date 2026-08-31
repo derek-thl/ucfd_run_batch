@@ -116,9 +116,9 @@ csv_quote() {
 with_lock() {
     local lock="$1"
     shift
-    while ! mkdir "$lock" 2>/dev/null; do sleep 0.05; done
+    batch_stage_lock_acquire "$lock" 0.05
     "$@"
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
 }
 
 append_summary_unlocked() {

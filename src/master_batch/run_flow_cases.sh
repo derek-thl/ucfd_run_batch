@@ -201,9 +201,7 @@ append_summary() {
     local csv_file="$1" row_no="$2" case_id="$3" case_name="$4" case_dir="$5" status="$6" msg="${7}"
     local lock="${SUMMARY_CSV}.lockdir"
 
-    while ! mkdir "$lock" 2>/dev/null; do
-        sleep 0.05
-    done
+    batch_stage_lock_acquire "$lock" 0.05
 
     {
         csv_quote "$csv_file"; printf ','
@@ -215,7 +213,7 @@ append_summary() {
         csv_quote "$msg"; printf '\n'
     } >> "$SUMMARY_CSV"
 
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
 }
 
 # =============================================================================
@@ -543,9 +541,9 @@ solve_one_case() {
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file"
 
         local lock="${SUMMARY_CSV}.lockdir"
-        while ! mkdir "$lock" 2>/dev/null; do sleep 0.05; done
+        batch_stage_lock_acquire "$lock" 0.05
         echo "$case_name" >> "$FAIL_FILE"
-        rmdir "$lock"
+        batch_stage_lock_release "$lock"
 
         info "Case failed: $case_name"
         return 1
