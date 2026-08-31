@@ -323,31 +323,81 @@ assert_eq 1 "$(summary_status_count "${workspace}/run_post_processing_cases_summ
     "post-processing keeps its failed summary row"
 assert_no_lock_dir "$workspace" "post-processing failure"
 
-# ---- a transport Failure Artifact on /dev/full cannot give Stage success ----
+# ---- a transport Failure Artifact on /dev/full keeps Stage completion --------
+#
+# A Failure Artifact on /dev/full is a character device. The transport progress
+# line counted Failure Artifact lines without a regular-file test, so the
+# progress read took an endless stream and the Stage Runner never completed
+# (Issue #42). Both observations below must complete without an external kill.
+# The 120-second STAGE_TIMEOUT is only a test safety limit, so status 124 is a
+# test failure and never an accepted Stage result.
 
-make_flow_batch transport_devfull 1
+# assert_no_case_state <workspace> <label>
+assert_no_case_state() {
+    local found
+    found="$(find "$1" -name '*.state' 2>/dev/null | sort | tr '\n' ' ')"
+    assert_eq "" "$found" "${2}: no Case state file survives"
+}
+
+# A successful transport Stage must still finish while the Failure Artifact is a
+# character device. endTime 300 covers the requested save time 300.
+make_flow_batch transport_devfull_solved 1
+make_flow_mesh "${workspace}/case_0/flow"
+make_flow_result "${workspace}/case_0/flow" 3000
+make_transport_case "${workspace}/case_0/trd" 2 T 300
+ln -s /dev/full "${workspace}/.run_transport_cases_failed"
+
+out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times "300" 2>&1)" \
+    && status=0 || status=$?
+
+assert_ne 124 "$status" \
+    "a solved transport Stage on /dev/full completes without an external kill"
+assert_status 0 "$status" "a solved transport Stage on /dev/full keeps status 0"
+assert_eq 1 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" solved)" \
+    "the solved /dev/full run keeps one solved summary row"
+assert_contains "$out" "All transport jobs finished." \
+    "the solved /dev/full run reports Stage success"
+assert_file_exists "${workspace}/case_0/trd/transport.marker" \
+    "the solved /dev/full run writes the transport marker"
+assert_no_lock_dir "$workspace" "transport /dev/full solved"
+assert_no_case_state "$workspace" "transport /dev/full solved"
+
+# A failed transport Stage must complete and report failure. endTime 100 cannot
+# cover the requested save time 300, so the Case fails and the Stage Runner
+# appends the Case name to the Failure Artifact. That append fails on
+# /dev/full. The Stage Runner must not hide the write error and must not turn a
+# failed Failure Artifact append into Stage success.
+make_flow_batch transport_devfull_failed 1
 make_flow_mesh "${workspace}/case_0/flow"
 make_flow_result "${workspace}/case_0/flow" 3000
 make_transport_case "${workspace}/case_0/trd" 2 T 100
 ln -s /dev/full "${workspace}/.run_transport_cases_failed"
 
-# The lock behavior is provable here. The Stage status is not, because the
-# transport Stage Runner does not terminate after a Failure Artifact append
-# fails with `No space left on device`. That hang is pre-existing and is not a
-# lock defect: a trace shows `mark_failed` acquires the lock, records the failed
-# append status, releases the lock, and returns that status. The scenario
-# therefore uses a short timeout, asserts that the run does not report success,
-# and asserts the lock release. The Implementer published a blocker for the
-# Stage-status part of Issue #39 items 11 and 12.
-DEVFULL_TIMEOUT=10
-
-out="$(cd "$workspace" && timeout "$DEVFULL_TIMEOUT" bash "$TRANSPORT_SCRIPT" \
-        -i output_batch_1.csv -O . -j 1 --save-times "60,120,300" 2>&1)" \
+out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times "300" 2>&1)" \
     && status=0 || status=$?
 
+assert_ne 124 "$status" \
+    "a failed transport Stage on /dev/full completes without an external kill"
 assert_ne 0 "$status" \
     "a transport Failure Artifact on /dev/full does not report Stage success"
-assert_no_lock_dir "$workspace" "transport /dev/full"
+assert_eq 1 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" failed)" \
+    "the failed /dev/full run keeps one failed summary row"
+assert_contains "$out" "write error: No space left on device" \
+    "the failed /dev/full run keeps the Failure Artifact write error"
+# The failed append status ends the Case job before the per-Case line. This
+# scenario keeps that current behavior.
+assert_not_contains "$out" "TRANSPORT FAILED:" \
+    "the failed /dev/full run keeps the current absence of the per-Case line"
+assert_contains "$out" "One or more transport jobs failed." \
+    "the failed /dev/full run reports Stage failure"
+assert_not_contains "$out" "All transport jobs finished." \
+    "the failed /dev/full run does not report Stage success"
+assert_file_missing "${workspace}/case_0/trd/transport.marker" \
+    "the failed /dev/full run writes no transport marker"
+assert_no_lock_dir "$workspace" "transport /dev/full failed"
+assert_no_case_state "$workspace" "transport /dev/full failed"
 
 # ---- a lock path with spaces and shell metacharacters stays one argument ----
 
