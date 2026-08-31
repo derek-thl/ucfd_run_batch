@@ -476,9 +476,7 @@ append_summary() {
     local message="$4"
     local lock="${SUMMARY_CSV}.lockdir"
 
-    while ! mkdir "$lock" 2>/dev/null; do
-        sleep 0.05
-    done
+    batch_stage_lock_acquire "$lock" 0.05
 
     printf '"%s","%s","%s","%s"\n' \
         "$case_id" \
@@ -486,7 +484,7 @@ append_summary() {
         "$status" \
         "${message//\"/\"\"}" >>"$SUMMARY_CSV"
 
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
 }
 
 post_outputs_complete() {

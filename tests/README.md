@@ -67,9 +67,35 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.S | Read-only status mode | `cases/s_read_only_status_mode.sh` |
 | 23.T | Explicit Stage Runner output-directory forwarding | `cases/t_explicit_output_dir_forwarding.sh` |
 | 23.U | Shared Stage library deployment foundation | `cases/u_shared_stage_library_deployment.sh` |
+| 23.V | Shared Stage library locking characterization | `cases/v_shared_stage_library_locking.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.V characterizes the Stage Runner mutual-exclusion behavior. The
+assertions pass before and after the I-G1 extraction, because I-G1 moves only
+acquisition and release mechanics. Every Stage Runner invocation has a finite
+`timeout`, so a lock regression fails the scenario instead of waiting without a
+limit. The scenario proves concurrent summary integrity through the field count
+of every summary line, because a merged row or a partial row changes that count.
+The scenario holds the exact `${SUMMARY_CSV}.lockdir` path to prove that each
+Stage Runner waits on that path.
+
+Two Section 23.V characterizations are reduced, and each reduction names its
+cause in the scenario file:
+
+- The mesh characterization uses one Case at a time. `show_running_cases` in
+  `run_mesh_cases.sh` globs `_mesh_state/*.state` and then reads each file with
+  `awk`. A Case that finishes between the glob and the `awk` makes the following
+  `read` reach end of file, and `set -e` stops the Stage Runner. That race loses
+  a summary row and gives status 1 even when every Case succeeds.
+- The transport `/dev/full` characterization asserts the lock release and that
+  the run does not report success. The transport Stage Runner does not terminate
+  after a Failure Artifact append fails with `No space left on device`.
+
+Both causes are pre-existing and neither is a locking defect. Issue #39
+prohibits a pre-existing behavior fix, so the Implementer published a blocker
+for both acceptance items.
 
 Section 23.U builds real deployment units. Each scenario copies the production
 Stage Runners and `lib_batch_stage.sh` into a temporary directory, so a scenario

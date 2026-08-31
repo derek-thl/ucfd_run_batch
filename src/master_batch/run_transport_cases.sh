@@ -203,7 +203,7 @@ append_summary() {
     local csv_file="$1" row_no="$2" case_id="$3" case_name="$4" case_dir="$5" status="$6" msg="$7"
     local lock="${SUMMARY_CSV}.lockdir"
 
-    while ! mkdir "$lock" 2>/dev/null; do sleep 0.05; done
+    batch_stage_lock_acquire "$lock" 0.05
     {
         csv_quote "$csv_file"; printf ','
         csv_quote "$row_no"; printf ','
@@ -213,7 +213,7 @@ append_summary() {
         csv_quote "$status"; printf ','
         csv_quote "$msg"; printf '\n'
     } >> "$SUMMARY_CSV"
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
 }
 
 # mark_failed returns the failure-artifact append status. The lock release
@@ -221,9 +221,9 @@ append_summary() {
 # write error must not produce stage success.
 mark_failed() {
     local case_name="$1" lock="${SUMMARY_CSV}.lockdir" rc=0
-    while ! mkdir "$lock" 2>/dev/null; do sleep 0.05; done
+    batch_stage_lock_acquire "$lock" 0.05
     echo "$case_name" >> "$FAIL_FILE" || rc=$?
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
     return "$rc"
 }
 

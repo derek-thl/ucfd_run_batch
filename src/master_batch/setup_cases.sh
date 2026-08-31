@@ -223,9 +223,7 @@ append_summary() {
     local csv_file="$1" row_no="$2" case_id="$3" case_name="$4" wd="$5" ws="$6" ws_for_setup="$7" case_dir="$8" status="$9" msg="${10}"
     local lock="${SUMMARY_CSV}.lockdir"
 
-    while ! mkdir "$lock" 2>/dev/null; do
-        sleep 0.05
-    done
+    batch_stage_lock_acquire "$lock" 0.05
 
     {
         csv_quote "$csv_file"; printf ','
@@ -240,7 +238,7 @@ append_summary() {
         csv_quote "$msg"; printf '\n'
     } >> "$SUMMARY_CSV"
 
-    rmdir "$lock"
+    batch_stage_lock_release "$lock"
 }
 
 

@@ -26,3 +26,30 @@
 # output, creates no process, defines no helper, and changes no value.
 readonly BATCH_STAGE_LIBRARY_API_VERSION=1
 : "$BATCH_STAGE_LIBRARY_API_VERSION"
+
+# batch_stage_lock_acquire <lock-path> <retry-seconds>
+#
+# The helper runs the current mkdir acquisition attempt and retries without a
+# limit until the attempt succeeds. Only the acquisition attempt sends standard
+# error to /dev/null. The helper returns 0 only after acquisition succeeds.
+#
+# The helper adds no timeout, no retry limit, no stale-lock detection, no owner
+# file, no trap, no signal handling, no backoff, no logging, no argument
+# validation, and no flock. A failed sleep keeps the current shell failure
+# behavior.
+batch_stage_lock_acquire() {
+    while ! mkdir "$1" 2>/dev/null; do
+        sleep "$2"
+    done
+}
+
+# batch_stage_lock_release <lock-path>
+#
+# The helper runs the current rmdir release operation on the exact caller path
+# and returns the exact rmdir status. The helper never suppresses, retries,
+# replaces, or normalizes that status. The helper never removes a non-empty lock
+# directory and never uses recursive removal. Each caller keeps its own status
+# interpretation.
+batch_stage_lock_release() {
+    rmdir "$1"
+}
