@@ -369,3 +369,39 @@ assert_status 0 "$status" "status mode ignores a poison deployment unit"
 assert_contains "$out" "Status report end" "status mode keeps its report"
 assert_not_contains "$out" "Required Stage library" \
     "status mode resolves and validates no Stage Runner or library"
+
+# ---- a failed dry-run prints no batch plan and no Stage Runner command ------
+
+make_orchestrated dryrun_incompatible_library
+make_deployment_unit "$master" no_version
+make_reuse_batch "$output" 1 "${workspace}/output_batch_1.csv"
+
+before="$(find "$output" | sort)"
+before_content="$(find "$output" -type f -exec cksum {} \; | sort)"
+
+out="$(cd "$workspace" && bash "$RUN_BATCH" --dry-run --stage mesh,transport \
+        -m "$master" -o "$output" "${workspace}/output_batch_1.csv" 2>&1)" \
+    && status=0 || status=$?
+
+assert_status 1 "$status" "a failed dry-run library check gives status 1"
+assert_contains "$out" \
+    "$(expected_orchestrator_diagnostic "${master}/run_mesh_cases.sh" "${master}/lib_batch_stage.sh")" \
+    "the failed dry-run prints the exact library diagnostic"
+assert_not_contains "$out" "Preflight PASS" \
+    "the failed dry-run prints no Preflight PASS"
+assert_not_contains "$out" "DRY-RUN" \
+    "the failed dry-run prints no batch plan"
+assert_not_contains "$out" "Selected-Stage tool advisory" \
+    "the failed dry-run runs no advisory inspection"
+assert_not_contains "$out" "Stage start" \
+    "the failed dry-run starts no stage"
+
+# print_command indents each planned Stage Runner command with four spaces.
+if printf '%s\n' "$out" | grep -q '^    bash '; then
+    _fail "a failed dry-run must print no Stage Runner command"
+fi
+
+assert_eq "$before" "$(find "$output" | sort)" \
+    "the failed dry-run creates and removes no path"
+assert_eq "$before_content" "$(find "$output" -type f -exec cksum {} \; | sort)" \
+    "the failed dry-run changes no Batch Workspace file"
