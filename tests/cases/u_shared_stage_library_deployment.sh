@@ -300,7 +300,17 @@ printf 'FoamFile { object controlDict; }\napplication     simpleFoam;\n' \
     > "${master}/simpleFoam_files/system/controlDict"
 printf 'Case,WS,WD\n' > "${workspace}/output_batch_1.csv"
 
-out="$(cd "$workspace" && bash "$RUN_BATCH" --stage setup \
+# The real setup Stage Runner validates its required commands. The scenario
+# supplies its own stubs, so a host with or without an OpenFOAM installation
+# gives the same result.
+setup_bin="${workspace}/_setup_bin"
+mkdir -p "$setup_bin"
+for command_name in surfaceCheck surfaceTransformPoints foamDictionary; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${setup_bin}/${command_name}"
+    chmod +x "${setup_bin}/${command_name}"
+done
+
+out="$(cd "$workspace" && PATH="${setup_bin}:${PATH}" bash "$RUN_BATCH" --stage setup \
         -m "$master" -o "$output" "${workspace}/output_batch_1.csv" 2>&1)" \
     && status=0 || status=$?
 
