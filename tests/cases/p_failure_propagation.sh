@@ -529,6 +529,7 @@ build_setup_batches() {
     output="${workspace}/out"
     make_stub_master "$master" master
     cp -f -- "$SETUP_SCRIPT" "${master}/setup_cases.sh"
+    cp -f -- "${MASTER_SRC_DIR}/lib_batch_stage.sh" "${master}/lib_batch_stage.sh"
     mkdir -p "${master}/simpleFoam_files" "${master}/scalarTransportDeffFoam_files"
     mkdir -p "$output" "${workspace}/_setup_bin"
 

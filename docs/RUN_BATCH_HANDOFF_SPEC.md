@@ -2250,7 +2250,7 @@ The following fingerprints identify historical baselines and later-added deploym
 8a5ee48b0dcec6e69892475f6e17b62194741d906d2623257ab33ac3178efe3a  run_flow_cases.sh
 1b864b3c5ff142b64168691a618a4fb85a26ee22c59d61f1ff0c28617781dc61  run_transport_cases.sh
 8ef7e3ef929b2064f226b0179e55f14ef986f51db7f63b5d4ef26f4b51fd688a  run_post_processing_cases.sh
-9908ee074757031d2eb472b27be6ee0a70c706940fbc203d94cb17df315d8fdd  lib_batch_stage.sh
+8d57441746b83791378a40f31dc5fa4c2b2139caaeaf6ac1dc3c692e5f1f500d  lib_batch_stage.sh
 ```
 
 Agents can use these only to identify the exact baseline. A legitimate implementation change will naturally change the hashes.

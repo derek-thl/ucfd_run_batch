@@ -19,10 +19,10 @@
 # defines no helper function yet. Later authorized Items add shared helpers in
 # the batch_stage_ namespace.
 
-# The API version carries the export attribute so that ShellCheck 0.9.0 reports
-# no finding for a variable that only a sourcing Stage Runner reads. A
-# suppression directive is not used. An inherited value cannot satisfy a Stage
-# Runner check, because each Stage Runner removes both API-version variables
-# before it sources this library.
-export BATCH_STAGE_LIBRARY_API_VERSION=1
-readonly BATCH_STAGE_LIBRARY_API_VERSION
+# The API version stays non-exported, so that the variable never enters a Stage
+# Runner child-process environment. The side-effect-free reference below exists
+# only to prevent ShellCheck SC2034 for a variable that only a sourcing Stage
+# Runner reads. A suppression directive is not used. The reference writes no
+# output, creates no process, defines no helper, and changes no value.
+readonly BATCH_STAGE_LIBRARY_API_VERSION=1
+: "$BATCH_STAGE_LIBRARY_API_VERSION"
