@@ -85,28 +85,163 @@ assert_eq "dry_run " "$(summary_status_values "${workspace}/setup_cases_summary.
     "setup keeps its current status values"
 assert_no_lock_dir "$workspace" "setup success"
 
-# ---- mesh: summary writes keep the 7-column schema -------------------------
+# ---- mesh: a state file that disappears cannot stop a concurrent run --------
 #
-# This scenario runs the mesh Stage Runner with one Case at a time. A mesh run
-# with more than one concurrent Case cannot be characterized here, because
 # `show_running_cases` in run_mesh_cases.sh globs `_mesh_state/*.state` and then
-# reads each file with `awk`. A Case that finishes between the glob and the
-# `awk` makes the following `read` reach end of file, and `set -e` stops the
-# Stage Runner. That race loses a summary row and gives status 1 even when every
-# Case succeeds. The race is not a locking defect, and Issue #39 prohibits a
-# pre-existing behavior fix. The Implementer published a blocker for the mesh
-# concurrency requirement of Issue #39.
+# reads each selected file with `awk`. A concurrent Case can remove a selected
+# state file before that read completes. The read then reaches end of file and
+# returns non-zero, and `set -e` stopped the mesh Stage Runner after successful
+# Case work. The race lost a summary row and gave status 1 even when every Case
+# succeeded (Issue #41).
+#
+# This section controls the race instead of waiting for it. Two wrappers live
+# inside the isolated test workspace, outside the repository worktree:
+#
+# - The `blockMesh` wrapper keeps every mesh Case active until the race-control
+#   marker exists, so four Cases stay concurrent. The wait is finite.
+# - The `awk` wrapper delegates every call to the system `awk`. Only the
+#   `show_running_cases` program that reads the case, stage, message, updated,
+#   and log fields can trigger the race control, and only when its file operand
+#   is a selected state file. That program removes exactly one selected state
+#   file exactly once, delegates the same arguments, and records the match after
+#   the delegated read. The `mesh_one_case` program reads only the stage field,
+#   so it never matches and its state file stays.
+#
+# The scenario invokes only the public mesh Stage Runner CLI.
 
-make_flow_batch mesh_sequential 1
+make_flow_batch mesh_race "$CASE_COUNT"
+
+mesh_race_dir="${workspace}/_race"
+mesh_race_bin="${workspace}/_race_bin"
+mesh_race_marker="${mesh_race_dir}/marker"
+mkdir -p "$mesh_race_dir" "$mesh_race_bin"
+
+# Resolve both delegated targets before the wrapper directory enters PATH.
+mesh_race_real_blockmesh="$(command -v blockMesh)"
+mesh_race_real_awk="$(command -v awk)"
+assert_eq "${FAKE_BIN_DIR}/blockMesh" "$mesh_race_real_blockmesh" \
+    "the mesh race control delegates to the fake blockMesh"
+
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'race_marker=%q\n' "$mesh_race_marker"
+    printf 'real_blockmesh=%q\n' "$mesh_race_real_blockmesh"
+    cat <<'WRAPPER'
+# Keep this mesh Case active until the race control removes one selected state
+# file. The wait is finite, so a missing marker fails the Case.
+waited=0
+while [[ ! -e "$race_marker" ]]; do
+    sleep 0.05
+    waited=$(( waited + 1 ))
+    if (( waited > 600 )); then
+        echo "mesh race control: the marker did not appear" >&2
+        exit 97
+    fi
+done
+exec "$real_blockmesh" "$@"
+WRAPPER
+} > "${mesh_race_bin}/blockMesh"
+
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'race_marker=%q\n' "$mesh_race_marker"
+    printf 'race_once=%q\n' "${mesh_race_dir}/once"
+    printf 'real_awk=%q\n' "$mesh_race_real_awk"
+    cat <<'WRAPPER'
+matched=0
+for arg in "$@"; do
+    if [[ "$arg" == *'$1 == "case"'* && "$arg" == *'$1 == "message"'* &&
+          "$arg" == *'$1 == "updated"'* && "$arg" == *'$1 == "log"'* ]]; then
+        matched=1
+    fi
+done
+
+operand=""
+if (( $# > 0 )); then
+    operand="${!#}"
+fi
+
+if (( matched == 1 )) && [[ "$operand" == */_mesh_state/*.state ]] &&
+        mkdir "$race_once" 2>/dev/null; then
+    rm -f -- "$operand"
+    "$real_awk" "$@"
+    awk_status=$?
+    printf 'program=show_running_cases\npath=%s\n' "$operand" > "$race_marker"
+    exit "$awk_status"
+fi
+
+exec "$real_awk" "$@"
+WRAPPER
+} > "${mesh_race_bin}/awk"
+
+chmod +x "${mesh_race_bin}/blockMesh" "${mesh_race_bin}/awk"
+
+mesh_race_saved_path="$PATH"
+PATH="${mesh_race_bin}:${PATH}"
 
 out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$MESH_SCRIPT" \
-        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+        -i output_batch_1.csv -O . -j 4 2>&1)" && status=0 || status=$?
 
-assert_status 0 "$status" "the mesh run keeps exit status 0"
-assert_summary_shape "${workspace}/run_mesh_cases_summary.csv" 7 1 "mesh"
-assert_eq "meshed " "$(summary_status_values "${workspace}/run_mesh_cases_summary.csv" 6)" \
-    "mesh keeps its current status values"
-assert_no_lock_dir "$workspace" "mesh success"
+# No race-control wrapper stays resolvable after the mesh section.
+PATH="$mesh_race_saved_path"
+
+# The race control must have triggered. A run that removed no selected state
+# file is not valid evidence.
+assert_file_exists "$mesh_race_marker" \
+    "the mesh race control removed one selected state file"
+assert_contains "$(cat "$mesh_race_marker")" "program=show_running_cases" \
+    "the mesh race control matched the show_running_cases program"
+assert_contains "$(cat "$mesh_race_marker")" "path=${workspace}/_mesh_state/" \
+    "the mesh race control removed a selected _mesh_state path"
+assert_not_contains "$out" "mesh race control: the marker did not appear" \
+    "no mesh race-control wrapper reached its finite wait"
+
+assert_ne 124 "$status" "the concurrent mesh run completes without an external kill"
+assert_status 0 "$status" \
+    "a selected state file that disappears keeps mesh exit status 0"
+
+# Every required mesh command runs for every Case.
+for command_name in surfaceFeatureExtract blockMesh decomposePar mpirun \
+        snappyHexMesh reconstructParMesh checkMesh; do
+    assert_eq "$CASE_COUNT" "$(fake_call_count "$command_name")" \
+        "every Case runs ${command_name}"
+done
+
+assert_summary_shape "${workspace}/run_mesh_cases_summary.csv" 7 "$CASE_COUNT" "mesh"
+assert_eq 'csv_file,row_number,case_id,case_name,case_dir,status,message' \
+    "$(sed -n '1p' "${workspace}/run_mesh_cases_summary.csv")" \
+    "the mesh summary keeps the exact seven-column header"
+
+# The summary row order stays the concurrent completion order, so the comparison
+# sorts both sides and proves Case identity instead of position.
+mesh_expected_rows=""
+for index in 0 1 2 3; do
+    mesh_expected_rows+="$(printf \
+        '"%s/output_batch_1.csv","%s","case_%s","case_%s/flow","%s/case_%s/flow","meshed","OK"' \
+        "$workspace" "$(( index + 2 ))" "$index" "$index" "$workspace" "$index")"$'\n'
+done
+assert_eq "$(printf '%s' "$mesh_expected_rows" | sort)" \
+    "$(awk 'NR > 1 && NF > 0' "${workspace}/run_mesh_cases_summary.csv" | sort)" \
+    "the mesh summary holds one exact row for each Case"
+
+# The MESH FINISHED status comes from the mesh_one_case program that reads only
+# the stage field. Four normal lines prove that the wrapper delegated that
+# program unchanged and left its state file in place.
+for index in 0 1 2 3; do
+    assert_contains "$out" "MESH FINISHED: case_${index}/flow | status=meshed" \
+        "case_${index}/flow reports its normal MESH FINISHED status"
+    assert_file_exists "${workspace}/case_${index}/flow/restart.marker" \
+        "case_${index}/flow keeps its restart marker"
+done
+
+assert_contains "$out" "All mesh jobs finished." "the concurrent mesh run reports success"
+assert_not_contains "$out" "stage=running | mesh job active | updated=N/A" \
+    "show_running_cases prints no fabricated active-Case record"
+assert_file_missing "${workspace}/.run_mesh_cases_failed" \
+    "the concurrent mesh run writes no Failure Artifact"
+assert_eq "" "$(find "$workspace" -name '*.state' 2>/dev/null | sort | tr '\n' ' ')" \
+    "no mesh Case state file survives"
+assert_no_lock_dir "$workspace" "mesh race"
 
 # ---- flow: concurrent summary writes keep the 7-column schema -------------
 

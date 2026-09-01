@@ -187,9 +187,10 @@ show_running_cases() {
 
     info "Mesh cases currently running:"
 
-    local shown=0 f case_name stage msg updated log_file remain
+    local shown=0 f case_name stage msg updated log_file remain read_status
     for f in "${files[@]}"; do
         (( shown >= PROGRESS_MAX_ACTIVE )) && break
+        read_status=0
         IFS=$'\t' read -r case_name stage msg updated log_file < <(
             awk -F= '
                 $1 == "case"    { c = substr($0, index($0,"=") + 1) }
@@ -199,7 +200,16 @@ show_running_cases() {
                 $1 == "log"     { l = substr($0, index($0,"=") + 1) }
                 END { printf "%s\t%s\t%s\t%s\t%s\n", c, s, m, u, l }
             ' "$f" 2>/dev/null || true
-        )
+        ) || read_status=$?
+
+        # A concurrent case can remove a selected state file before this read
+        # completes. The read then reports no field and returns non-zero. That
+        # selection is stale, so this function ignores it instead of printing a
+        # record built from default values. A selected path that still exists
+        # keeps the existing default-fill behavior.
+        if (( read_status != 0 )) && [[ ! -e "$f" ]]; then
+            continue
+        fi
 
         case_name="${case_name:-$(basename "$f" .state)}"
         stage="${stage:-running}"
