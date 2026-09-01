@@ -81,21 +81,42 @@ of every summary line, because a merged row or a partial row changes that count.
 The scenario holds the exact `${SUMMARY_CSV}.lockdir` path to prove that each
 Stage Runner waits on that path.
 
-Two Section 23.V characterizations are reduced, and each reduction names its
-cause in the scenario file:
+One Section 23.V characterization stays reduced, and the scenario file names its
+cause:
 
 - The mesh characterization uses one Case at a time. `show_running_cases` in
   `run_mesh_cases.sh` globs `_mesh_state/*.state` and then reads each file with
   `awk`. A Case that finishes between the glob and the `awk` makes the following
   `read` reach end of file, and `set -e` stops the Stage Runner. That race loses
   a summary row and gives status 1 even when every Case succeeds.
-- The transport `/dev/full` characterization asserts the lock release and that
-  the run does not report success. The transport Stage Runner does not terminate
-  after a Failure Artifact append fails with `No space left on device`.
 
-Both causes are pre-existing and neither is a locking defect. Issue #39
-prohibits a pre-existing behavior fix, so the Implementer published a blocker
-for both acceptance items.
+That cause is pre-existing and is not a locking defect. Issue #39 prohibits a
+pre-existing behavior fix, so the Implementer published a blocker for that
+acceptance item. Issue #41 records the mesh race.
+
+The Section 23.V transport Failure Artifact section holds three observations,
+because Issue #42 corrected the transport progress read. A Failure Artifact on
+`/dev/full` is a character device, and the transport progress line counted
+Failure Artifact lines without a regular-file test, so the progress read took an
+endless stream and the Stage Runner never completed.
+
+- The solved `/dev/full` observation proves status 0, the exact solved summary
+  row, `All transport jobs finished.`, and the transport marker.
+- The failed `/dev/full` observation proves a non-zero status, the exact failed
+  summary row, the `write error: No space left on device` diagnostic, the lock
+  release, and no transport marker. The observation also keeps the current
+  absence of the per-Case `TRANSPORT FAILED:` line, because the failed append
+  status ends the Case job before that line.
+- The readable regular Failure Artifact observation keeps the current progress
+  behavior. Two Cases fail, so the progress line must report `failed=2`. The
+  observation holds the exact progress line, so the field set, the field order,
+  and the exact count are all proved. A constant failed count fails this
+  observation, so the guard must still read a regular Failure Artifact.
+
+Each observation rejects status `124`, because the 120-second `STAGE_TIMEOUT` is
+only a test safety limit and never an accepted Stage result. Each `/dev/full`
+observation verifies the exact seven-column header, exactly one data row, and
+every field value of that row.
 
 Section 23.U builds real deployment units. Each scenario copies the production
 Stage Runners and `lib_batch_stage.sh` into a temporary directory, so a scenario

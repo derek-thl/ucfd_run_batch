@@ -483,7 +483,14 @@ show_progress() {
             else if ($6=="skipped") skipped++;
         } END { print solved+0, continued+0, skipped+0 }' "$SUMMARY_CSV"
     )
-    failed="$(wc -l < "$FAIL_FILE" | tr -d ' ')"
+    # The progress line counts Failure Artifact lines only when the Failure
+    # Artifact is a regular file. A character device supplies an endless stream,
+    # so an unconditional read prevents Stage completion. The sibling Stage
+    # Runners already use this rule.
+    failed=0
+    if [[ -f "$FAIL_FILE" ]]; then
+        failed="$(wc -l < "$FAIL_FILE" | tr -d ' ')"
+    fi
     pending=$(( TOTAL_CASES - STARTED_CASES ))
     (( pending >= 0 )) || pending=0
 
