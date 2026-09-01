@@ -81,18 +81,50 @@ of every summary line, because a merged row or a partial row changes that count.
 The scenario holds the exact `${SUMMARY_CSV}.lockdir` path to prove that each
 Stage Runner waits on that path.
 
-One Section 23.V characterization stays reduced, and the scenario file names its
-cause:
+No Section 23.V characterization stays reduced. The mesh section runs four
+concurrent Cases with `-j 4`, and it controls the state-file disappearance
+instead of waiting for a rare race (Issue #41).
 
-- The mesh characterization uses one Case at a time. `show_running_cases` in
-  `run_mesh_cases.sh` globs `_mesh_state/*.state` and then reads each file with
-  `awk`. A Case that finishes between the glob and the `awk` makes the following
-  `read` reach end of file, and `set -e` stops the Stage Runner. That race loses
-  a summary row and gives status 1 even when every Case succeeds.
+`show_running_cases` in `run_mesh_cases.sh` globs `_mesh_state/*.state` and then
+reads each selected file with `awk`. A concurrent Case that removes a selected
+state file before that read makes the `read` reach end of file, and `set -e`
+stopped the Stage Runner. The race lost a summary row and gave status 1 even
+when every Case succeeded.
 
-That cause is pre-existing and is not a locking defect. Issue #39 prohibits a
-pre-existing behavior fix, so the Implementer published a blocker for that
-acceptance item. Issue #41 records the mesh race.
+The mesh section installs two wrappers in the isolated test workspace, outside
+the repository worktree, and restores the earlier `PATH` before the next
+section:
+
+- The `blockMesh` wrapper records this Case at the hold and then waits for every
+  other Case, so all four Cases are held together before the removal. The
+  wrapper then waits for the race-control marker, and it keeps the hold for a
+  bounded period after the marker appears. That post-marker hold matters,
+  because the parent shell must reach its missing-path check while every Case is
+  still held. A released Case would otherwise recreate the removed state file
+  first, and the check would then see a present path. Each wait is finite, and a
+  missing record or marker fails the Case.
+- The `awk` wrapper delegates every call to the system `awk`, which it resolves
+  before the wrapper directory enters `PATH`. Only the `show_running_cases`
+  program that reads all five case, stage, message, updated, and log selectors
+  can trigger the race control, and only when its file operand is a selected
+  state file. The removal waits until every Case reached the hold. The parent
+  shell waits inside `show_running_cases` for that call, so the wait keeps the
+  Cases concurrent instead of blocking the job pool. The wrapper removes exactly
+  one selected state file exactly once, confirms that the path is absent,
+  delegates the same arguments, returns the delegated status, and records the
+  program, the path, the single removal, and the delegated status only after that
+  read. The `mesh_one_case` program reads only the stage selector, so it never
+  matches.
+
+The scenario fails when a Case did not reach the hold, when the marker is
+absent, when the marker does not name the `show_running_cases` program and the
+selected path, when the marker does not record one removal and a non-zero
+delegated `awk` status, or when a wrapper reaches a finite wait. A run that
+removed no selected state file is not valid evidence. The scenario also rejects
+an active-Case line that carries the default-fill signature
+`stage=running | mesh job active | updated=N/A`, because a stale selection must
+not produce a fabricated record. The summary comparison sorts both sides, so it
+proves Case identity and keeps the concurrent completion order free.
 
 The Section 23.V transport Failure Artifact section holds three observations,
 because Issue #42 corrected the transport progress read. A Failure Artifact on
