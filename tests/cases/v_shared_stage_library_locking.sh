@@ -265,13 +265,16 @@ assert_contains "$mesh_race_marker_body" "path=${workspace}/_mesh_state/" \
     "the mesh race control removed a selected _mesh_state path"
 assert_contains "$mesh_race_marker_body" "removed=1" \
     "the mesh race control confirmed the selected path is absent"
-# The marker must hold exactly one delegated awk status, and that value must be
-# a number greater than zero. An absent, empty, or nonnumeric value fails both
-# assertions below, because each pattern matches a complete line.
+# The marker must hold exactly one delegated awk status line, and the complete
+# extracted value must be a number greater than zero. The line count rejects an
+# extra line, and the pattern test reads the complete value, so an absent, an
+# empty, a nonnumeric, and a zero value all fail.
 mesh_race_awk_status="$(sed -n 's/^awk_status=//p' "$mesh_race_marker")"
-assert_eq 1 "$(printf '%s\n' "$mesh_race_awk_status" | grep -c '^[0-9][0-9]*$')" \
-    "the mesh race control records exactly one numeric delegated awk status"
-assert_eq 1 "$(printf '%s\n' "$mesh_race_awk_status" | grep -c '^[1-9][0-9]*$')" \
+assert_eq 1 "$(printf '%s\n' "$mesh_race_awk_status" | wc -l | tr -d ' ')" \
+    "the mesh race control records exactly one delegated awk status line"
+mesh_race_status_valid=0
+[[ "$mesh_race_awk_status" =~ ^[1-9][0-9]*$ ]] && mesh_race_status_valid=1
+assert_eq 1 "$mesh_race_status_valid" \
     "the delegated awk read of the removed state file returned non-zero"
 assert_not_contains "$out" "mesh race control: the marker did not appear" \
     "no mesh race-control wrapper reached its finite wait"
