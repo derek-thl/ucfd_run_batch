@@ -53,3 +53,38 @@ batch_stage_lock_acquire() {
 batch_stage_lock_release() {
     rmdir "$1"
 }
+
+# batch_stage_csv_quote <output-variable> <value>
+#
+# The helper renders one CSV field into the named caller variable. It doubles
+# each double quote and adds one leading and one trailing double quote. The
+# assignment preserves every input byte, including a trailing newline byte,
+# because the helper never uses command substitution.
+#
+# The helper writes no standard output and no standard error. The helper returns
+# the exact status of its assignment. The helper performs no file, lock,
+# process, network, or console operation. An absent value argument gives an
+# empty value.
+batch_stage_csv_quote() {
+    local __batch_stage_csv_quote_value="${2-}"
+    __batch_stage_csv_quote_value="${__batch_stage_csv_quote_value//\"/\"\"}"
+    printf -v "$1" '"%s"' "$__batch_stage_csv_quote_value"
+}
+
+# batch_stage_csv_append_row <target-path> <rendered-field>...
+#
+# The helper joins the caller-rendered fields with one comma, adds one newline
+# after the last field, and appends the complete row to the target path with one
+# printf operation and one append redirection. Each rendered field keeps every
+# byte, because the helper adds no quote escaping and uses no command
+# substitution.
+#
+# The helper acquires and releases no lock, creates no temporary file, and
+# prints no diagnostic. The helper returns the exact append status, so a caller
+# keeps its own failure interpretation.
+batch_stage_csv_append_row() {
+    local __batch_stage_csv_append_row_target="$1"
+    shift
+    local IFS=,
+    printf '%s\n' "$*" >> "$__batch_stage_csv_append_row_target"
+}

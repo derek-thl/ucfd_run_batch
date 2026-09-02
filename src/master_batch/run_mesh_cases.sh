@@ -107,12 +107,6 @@ safe_path_token() {
     sanitize_token "$s"
 }
 
-csv_quote() {
-    local s="${1:-}"
-    s="${s//\"/\"\"}"
-    printf '"%s"' "$s"
-}
-
 with_lock() {
     local lock="$1"
     shift
@@ -123,15 +117,19 @@ with_lock() {
 
 append_summary_unlocked() {
     local csv_file="$1" row_no="$2" case_id="$3" case_name="$4" case_dir="$5" status="$6" msg="$7"
-    {
-        csv_quote "$csv_file"; printf ','
-        csv_quote "$row_no"; printf ','
-        csv_quote "$case_id"; printf ','
-        csv_quote "$case_name"; printf ','
-        csv_quote "$case_dir"; printf ','
-        csv_quote "$status"; printf ','
-        csv_quote "$msg"; printf '\n'
-    } >> "$SUMMARY_CSV"
+    local f_csv_file f_row_no f_case_id f_case_name f_case_dir f_status f_msg
+
+    batch_stage_csv_quote f_csv_file "$csv_file"
+    batch_stage_csv_quote f_row_no "$row_no"
+    batch_stage_csv_quote f_case_id "$case_id"
+    batch_stage_csv_quote f_case_name "$case_name"
+    batch_stage_csv_quote f_case_dir "$case_dir"
+    batch_stage_csv_quote f_status "$status"
+    batch_stage_csv_quote f_msg "$msg"
+
+    batch_stage_csv_append_row "$SUMMARY_CSV" \
+        "$f_csv_file" "$f_row_no" "$f_case_id" "$f_case_name" "$f_case_dir" \
+        "$f_status" "$f_msg"
 }
 
 append_summary() {

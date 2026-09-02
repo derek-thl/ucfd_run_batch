@@ -476,13 +476,21 @@ append_summary() {
     local message="$4"
     local lock="${SUMMARY_CSV}.lockdir"
 
+    local f_case_id f_case_dir f_status f_message
+
     batch_stage_lock_acquire "$lock" 0.05
 
-    printf '"%s","%s","%s","%s"\n' \
-        "$case_id" \
-        "$case_dir" \
-        "$status" \
-        "${message//\"/\"\"}" >>"$SUMMARY_CSV"
+    # Post-processing keeps its own field rendering. The Case ID, the Case
+    # directory, and the status keep their literal double-quote delimiters and
+    # add no inner-quote escaping. Only the message field doubles an inner
+    # double quote.
+    printf -v f_case_id '"%s"' "$case_id"
+    printf -v f_case_dir '"%s"' "$case_dir"
+    printf -v f_status '"%s"' "$status"
+    batch_stage_csv_quote f_message "$message"
+
+    batch_stage_csv_append_row "$SUMMARY_CSV" \
+        "$f_case_id" "$f_case_dir" "$f_status" "$f_message"
 
     batch_stage_lock_release "$lock"
 }
