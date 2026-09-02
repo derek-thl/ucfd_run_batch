@@ -9,6 +9,14 @@ CASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${CASE_DIR}/../lib/harness.sh"
 source "${CASE_DIR}/../lib/assert.sh"
 
+# assert_file_bytes_exact <path> <expected> <label>
+# The comparison appends one literal X to each side, so a trailing newline byte
+# stays significant inside command substitution.
+assert_file_bytes_exact() {
+    assert_file_exists "$1" "${3}: the file exists"
+    assert_eq "${2}X" "$(cat -- "$1"; printf X)" "${3}: the exact bytes"
+}
+
 # ---- top level: a failed stage fails the batch -------------------------------
 
 build_two_batches() {
@@ -600,3 +608,618 @@ assert_failure "$status" "a mesh command failure must fail the top-level run"
 assert_contains "$out" "Stage failed  : run_mesh_cases.sh" \
     "the top level names the failed mesh stage"
 assert_contains "$out" "Batch failed: batch_1" "the batch is marked failed"
+
+# ---- stage level: a non-zero summary lock release fails the Stage (Issue #47) ----
+#
+# A test-local rmdir wrapper delegates the exact summary lock removal to the
+# real rmdir and then returns control status 23. The append therefore succeeds
+# and the lock release reports a non-zero status. This regression holds the
+# current behavior: the summary append path must not replace a non-zero release
+# status with append status 0.
+
+# make_lock_release_control <workspace> <summary-lock-path>
+# The helper sets release_control_bin and release_control_record.
+make_lock_release_control() {
+    local ws="$1" lock="$2"
+    local bin="${ws}/_release_bin" dir="${ws}/_release_control" real_rmdir
+    mkdir -p "$bin" "$dir"
+
+    # Resolve the real rmdir before the wrapper directory enters PATH.
+    real_rmdir="$(command -v rmdir)"
+    assert_ne "${bin}/rmdir" "$real_rmdir" \
+        "the lock-release control resolves the real rmdir first"
+
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'control_lock=%q\n' "$lock"
+        printf 'control_dir=%q\n' "$dir"
+        printf 'real_rmdir=%q\n' "$real_rmdir"
+        cat <<'WRAPPER'
+# Only the exact summary lock path activates the control, and only once. Every
+# other call and argument vector reaches the real rmdir unchanged.
+if [[ "$1" == "$control_lock" ]] && mkdir "${control_dir}/once" 2>/dev/null; then
+    "$real_rmdir" "$@"
+    delegated=$?
+    removed=1
+    if [[ -e "$control_lock" ]]; then
+        removed=0
+    fi
+    printf 'activated=1\ndelegated=%s\nremoved=%s\nreturned=23\n' \
+        "$delegated" "$removed" > "${control_dir}/record"
+    exit 23
+fi
+exec "$real_rmdir" "$@"
+WRAPPER
+    } > "${bin}/rmdir"
+    chmod +x "${bin}/rmdir"
+
+    release_control_bin="$bin"
+    release_control_record="${dir}/record"
+}
+
+# assert_lock_release_control <label>
+assert_lock_release_control() {
+    assert_file_exists "$release_control_record" \
+        "${1}: the lock-release control ran for the exact summary lock"
+    assert_eq "activated=1
+delegated=0
+removed=1
+returned=23" "$(cat "$release_control_record")" \
+        "${1}: the real rmdir removed the exact summary lock before status 23"
+}
+
+# ---- mesh ----
+make_mesh_fixture release_mesh
+make_lock_release_control "$workspace" "${workspace}/run_mesh_cases_summary.csv.lockdir"
+release_saved_path="$PATH"
+PATH="${release_control_bin}:${PATH}"
+out="$(cd "$workspace" && timeout 120 bash "$MESH_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+PATH="$release_saved_path"
+
+assert_lock_release_control "mesh"
+assert_ne 124 "$status" "the mesh lock-release run completes without an external kill"
+assert_failure "$status" "a non-zero mesh summary lock release fails the Stage"
+assert_not_contains "$out" "All mesh jobs finished." \
+    "the mesh Stage does not report success after a non-zero lock release"
+assert_contains "$out" "One or more mesh jobs failed." \
+    "the mesh Stage keeps its existing failure message"
+assert_eq 1 "$(summary_status_count "${workspace}/run_mesh_cases_summary.csv" meshed)" \
+    "the successful mesh summary row stays present"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the mesh lock-release run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/flow/restart.marker" \
+    "completed mesh Case work stays present"
+
+# ---- flow ----
+make_flow_fixture release_flow yes
+make_lock_release_control "$workspace" "${workspace}/run_flow_cases_summary.csv.lockdir"
+release_saved_path="$PATH"
+PATH="${release_control_bin}:${PATH}"
+out="$(cd "$workspace" && timeout 120 bash "$FLOW_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+PATH="$release_saved_path"
+
+assert_lock_release_control "flow"
+assert_ne 124 "$status" "the flow lock-release run completes without an external kill"
+assert_failure "$status" "a non-zero flow summary lock release fails the Stage"
+assert_not_contains "$out" "All flow jobs finished." \
+    "the flow Stage does not report success after a non-zero lock release"
+assert_contains "$out" "One or more flow jobs failed." \
+    "the flow Stage keeps its existing failure message"
+assert_eq 1 "$(summary_status_count "${workspace}/run_flow_cases_summary.csv" solved)" \
+    "the successful flow summary row stays present"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the flow lock-release run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/flow/flow.marker" \
+    "completed flow Case work stays present"
+
+# ---- transport ----
+# make_transport_success_fixture <name> - one solvable transport Case.
+make_transport_success_fixture() {
+    workspace="$(new_workspace "$1")"
+    install_fakes "$workspace"
+    assert_fakes_active
+    make_csv "${workspace}/output_batch_1.csv" 0
+    make_flow_case "${workspace}/case_0/flow" 2
+    make_flow_mesh "${workspace}/case_0/flow"
+    make_flow_result "${workspace}/case_0/flow" 3000
+    make_transport_case "${workspace}/case_0/trd" 2 T 300
+}
+
+make_transport_success_fixture release_transport
+make_lock_release_control "$workspace" "${workspace}/run_transport_cases_summary.csv.lockdir"
+release_saved_path="$PATH"
+PATH="${release_control_bin}:${PATH}"
+out="$(cd "$workspace" && timeout 120 bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" && status=0 || status=$?
+PATH="$release_saved_path"
+
+assert_lock_release_control "transport"
+assert_ne 124 "$status" "the transport lock-release run completes without an external kill"
+assert_failure "$status" "a non-zero transport summary lock release fails the Stage"
+assert_not_contains "$out" "All transport jobs finished." \
+    "the transport Stage does not report success after a non-zero lock release"
+assert_contains "$out" "One or more transport jobs failed." \
+    "the transport Stage keeps its existing failure message"
+assert_eq 1 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" solved)" \
+    "the successful transport summary row stays present"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the transport lock-release run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/trd/transport.marker" \
+    "completed transport Case work stays present"
+
+# ---- stage level: a failed summary row append fails the Stage (Issue #47) ----
+#
+# The control replaces the initialized summary with a symbolic link to
+# /proc/version after the last required Case command and before the Case result
+# append. /proc/version is readable and finite, it reports size zero, and it
+# rejects an append, so the append fails promptly and a later summary reader
+# neither hangs nor fails.
+
+assert_file_exists /proc/version "the append control target exists"
+assert_eq 0 "$(stat -c '%s' /proc/version)" \
+    "the append control target reports file size zero"
+assert_ne 0 "$(wc -c < /proc/version)" \
+    "the append control target has a finite non-empty read"
+control_probe="$( ( LC_ALL=C printf 'x' >> /proc/version ) 2>&1 )" \
+    && control_probe_status=0 || control_probe_status=$?
+assert_ne 0 "$control_probe_status" "the append control target rejects an append"
+assert_contains "$control_probe" "Permission denied" \
+    "the append control target gives the selected LC_ALL=C append diagnostic"
+
+# make_append_failure_control <workspace> <command> <summary> [<failure-artifact>]
+# The helper sets append_control_bin, append_control_dir, and
+# append_control_marker.
+make_append_failure_control() {
+    local ws="$1" command_name="$2" summary="$3" fail_file="${4:-}"
+    local bin="${ws}/_append_bin" dir="${ws}/_append_control" real_command
+    mkdir -p "$bin" "$dir"
+
+    real_command="$(command -v "$command_name")"
+    assert_eq "${FAKE_BIN_DIR}/${command_name}" "$real_command" \
+        "the append control delegates to the fake ${command_name}"
+
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'control_dir=%q\n' "$dir"
+        printf 'control_summary=%q\n' "$summary"
+        printf 'control_fail_file=%q\n' "$fail_file"
+        printf 'real_command=%q\n' "$real_command"
+        cat <<'WRAPPER'
+# The control runs exactly once, after the last required Case command and
+# before the Case result append.
+if mkdir "${control_dir}/once" 2>/dev/null; then
+    if [[ -f "$control_summary" ]]; then
+        mv -- "$control_summary" "${control_dir}/summary_before_append.csv"
+        ln -s /proc/version "$control_summary"
+        printf 'summary=1\n' >> "${control_dir}/marker"
+    fi
+    if [[ -n "$control_fail_file" && -f "$control_fail_file" ]]; then
+        mv -- "$control_fail_file" "${control_dir}/fail_before_append"
+        ln -s /proc/version "$control_fail_file"
+        printf 'fail_file=1\n' >> "${control_dir}/marker"
+    fi
+fi
+exec "$real_command" "$@"
+WRAPPER
+    } > "${bin}/${command_name}"
+    chmod +x "${bin}/${command_name}"
+
+    append_control_bin="$bin"
+    append_control_dir="$dir"
+    append_control_marker="${dir}/marker"
+}
+
+# ---- mesh: the summary append fails ----
+make_mesh_fixture append_mesh
+make_append_failure_control "$workspace" checkMesh \
+    "${workspace}/run_mesh_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+assert_eq "${append_control_bin}/checkMesh" "$(command -v checkMesh)" \
+    "the mesh append control resolves before the fake checkMesh"
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$MESH_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n' \
+    "the mesh append control ran exactly once"
+assert_ne 124 "$status" "the mesh append-failure run completes without an external kill"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n' \
+    "the mesh summary evidence keeps its exact header bytes"
+assert_eq "/proc/version" "$(readlink "${workspace}/run_mesh_cases_summary.csv")" \
+    "the mesh summary path is the control symbolic link"
+mesh_case_log="$(case_log "$workspace" _mesh_logs case_0_flow)"
+assert_contains "$mesh_case_log" "run_mesh_cases_summary.csv" \
+    "the mesh Case log names the summary path"
+assert_contains "$mesh_case_log" "Permission denied" \
+    "the mesh Case log keeps the append failure diagnostic"
+assert_failure "$status" "a failed mesh summary row append fails the mesh Stage"
+assert_contains "$out" "One or more mesh jobs failed." \
+    "the mesh Stage keeps its existing failure message"
+assert_not_contains "$out" "All mesh jobs finished." \
+    "the mesh Stage does not report success after a failed append"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the mesh append-failure run leaves no lock directory"
+assert_contains "$(cat "${workspace}/.run_mesh_cases_failed")" "case_0/flow" \
+    "the mesh Failure Artifact identifies the affected Case"
+assert_file_exists "${workspace}/case_0/flow/restart.marker" \
+    "completed mesh Case work stays present after a failed append"
+assert_ne 0 "$(fake_call_count checkMesh)" \
+    "the command record proves that mesh Case work completed"
+
+# ---- flow: the summary append fails ----
+make_flow_fixture append_flow yes
+make_append_failure_control "$workspace" reconstructPar \
+    "${workspace}/run_flow_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+assert_eq "${append_control_bin}/reconstructPar" "$(command -v reconstructPar)" \
+    "the flow append control resolves before the fake reconstructPar"
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$FLOW_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n' \
+    "the flow append control ran exactly once"
+assert_ne 124 "$status" "the flow append-failure run completes without an external kill"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n' \
+    "the flow summary evidence keeps its exact header bytes"
+assert_eq "/proc/version" "$(readlink "${workspace}/run_flow_cases_summary.csv")" \
+    "the flow summary path is the control symbolic link"
+flow_case_log="$(case_log "$workspace" _flow_logs case_0_flow)"
+assert_contains "$flow_case_log" "run_flow_cases_summary.csv" \
+    "the flow Case log names the summary path"
+assert_contains "$flow_case_log" "Permission denied" \
+    "the flow Case log keeps the append failure diagnostic"
+assert_failure "$status" "a failed flow summary row append fails the flow Stage"
+assert_contains "$out" "One or more flow jobs failed." \
+    "the flow Stage keeps its existing failure message"
+assert_not_contains "$out" "All flow jobs finished." \
+    "the flow Stage does not report success after a failed append"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the flow append-failure run leaves no lock directory"
+assert_contains "$(cat "${workspace}/.run_flow_cases_failed")" "case_0/flow" \
+    "the flow Failure Artifact identifies the affected Case"
+assert_file_exists "${workspace}/case_0/flow/flow.marker" \
+    "completed flow Case work stays present after a failed append"
+assert_ne 0 "$(fake_call_count reconstructPar)" \
+    "the command record proves that flow Case work completed"
+
+# ---- transport: the summary append fails ----
+make_transport_success_fixture append_transport
+make_append_failure_control "$workspace" reconstructPar \
+    "${workspace}/run_transport_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+assert_eq "${append_control_bin}/reconstructPar" "$(command -v reconstructPar)" \
+    "the transport append control resolves before the fake reconstructPar"
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n' \
+    "the transport append control ran exactly once"
+assert_ne 124 "$status" \
+    "the transport append-failure run completes without an external kill"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n' \
+    "the transport summary evidence keeps its exact header bytes"
+assert_eq "/proc/version" \
+    "$(readlink "${workspace}/run_transport_cases_summary.csv")" \
+    "the transport summary path is the control symbolic link"
+transport_case_log="$(case_log "$workspace" _transport_logs case_0_trd)"
+assert_contains "$transport_case_log" "run_transport_cases_summary.csv" \
+    "the transport Case log names the summary path"
+assert_contains "$transport_case_log" "Permission denied" \
+    "the transport Case log keeps the append failure diagnostic"
+assert_failure "$status" \
+    "a failed transport summary row append fails the transport Stage"
+assert_contains "$out" "One or more transport jobs failed." \
+    "the transport Stage keeps its existing failure message"
+assert_not_contains "$out" "All transport jobs finished." \
+    "the transport Stage does not report success after a failed append"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the transport append-failure run leaves no lock directory"
+assert_contains "$(cat "${workspace}/.run_transport_cases_failed")" "case_0/trd" \
+    "the transport Failure Artifact identifies the affected Case"
+assert_file_exists "${workspace}/case_0/trd/transport.marker" \
+    "completed transport Case work stays present after a failed append"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the selected transport control command runs exactly once"
+
+# ---- Orchestrator: a failed summary append fails the batch (Issue #47) ------
+
+# build_orchestrated_stage <name> <stage-runner-path> <runner-file-name>
+# The helper sets workspace, master, output, and the Batch Workspace layout.
+build_orchestrated_stage() {
+    workspace="$(new_workspace "$1")"
+    install_fakes "$workspace"
+    use_stub_records "$workspace"
+    master="${workspace}/master_batch"
+    output="${workspace}/out"
+    make_stub_master "$master" master
+    cp -f -- "$2" "${master}/${3}"
+    cp -f -- "${MASTER_SRC_DIR}/lib_batch_stage.sh" "${master}/lib_batch_stage.sh"
+    mkdir -p "$output" "${output}/batch_1"
+    make_csv "${workspace}/output_batch_1.csv" 0
+    cp -f -- "${workspace}/output_batch_1.csv" "${output}/batch_1/output_batch_1.csv"
+}
+
+# ---- Orchestrator: mesh ----
+build_orchestrated_stage orch_mesh "$MESH_SCRIPT" run_mesh_cases.sh
+make_flow_case "${output}/batch_1/case_0/flow" 2
+make_append_failure_control "$workspace" checkMesh \
+    "${output}/batch_1/run_mesh_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C timeout 180 bash "$RUN_BATCH" --stage mesh \
+        -m "$master" -o "$output" "${workspace}/output_batch_1.csv" 2>&1)" \
+    && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_ne 124 "$status" "the orchestrated mesh run completes without an external kill"
+assert_failure "$status" "a failed mesh summary append fails the orchestrated run"
+assert_contains "$out" "Stage failed  : run_mesh_cases.sh" \
+    "the Orchestrator names the failed mesh Stage"
+assert_contains "$out" "Batch failed: batch_1" \
+    "the Orchestrator marks the batch failed after a failed mesh append"
+assert_not_contains "$out" "All requested batches and stages finished successfully." \
+    "the Orchestrator does not report overall success"
+
+# ---- Orchestrator: flow ----
+build_orchestrated_stage orch_flow "$FLOW_SCRIPT" run_flow_cases.sh
+make_flow_case "${output}/batch_1/case_0/flow" 2
+make_flow_mesh "${output}/batch_1/case_0/flow"
+printf 'FoamFile { object wallDistance; }\n' \
+    > "${output}/batch_1/case_0/flow/0/wallDistance"
+make_append_failure_control "$workspace" reconstructPar \
+    "${output}/batch_1/run_flow_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C timeout 180 bash "$RUN_BATCH" --stage flow \
+        -m "$master" -o "$output" "${workspace}/output_batch_1.csv" 2>&1)" \
+    && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_ne 124 "$status" "the orchestrated flow run completes without an external kill"
+assert_failure "$status" "a failed flow summary append fails the orchestrated run"
+assert_contains "$out" "Stage failed  : run_flow_cases.sh" \
+    "the Orchestrator names the failed flow Stage"
+assert_contains "$out" "Batch failed: batch_1" \
+    "the Orchestrator marks the batch failed after a failed flow append"
+assert_not_contains "$out" "All requested batches and stages finished successfully." \
+    "the Orchestrator does not report overall success after a flow append failure"
+
+# ---- Orchestrator: transport ----
+build_orchestrated_stage orch_transport "$TRANSPORT_SCRIPT" run_transport_cases.sh
+make_flow_case "${output}/batch_1/case_0/flow" 2
+make_flow_mesh "${output}/batch_1/case_0/flow"
+make_flow_result "${output}/batch_1/case_0/flow" 3000
+make_transport_case "${output}/batch_1/case_0/trd" 2 T 300
+make_append_failure_control "$workspace" reconstructPar \
+    "${output}/batch_1/run_transport_cases_summary.csv"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C timeout 180 bash "$RUN_BATCH" --stage transport \
+        --save-times 300 -m "$master" -o "$output" \
+        "${workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_ne 124 "$status" \
+    "the orchestrated transport run completes without an external kill"
+assert_failure "$status" "a failed transport summary append fails the orchestrated run"
+assert_contains "$out" "Stage failed  : run_transport_cases.sh" \
+    "the Orchestrator names the failed transport Stage"
+assert_contains "$out" "Batch failed: batch_1" \
+    "the Orchestrator marks the batch failed after a failed transport append"
+assert_not_contains "$out" "All requested batches and stages finished successfully." \
+    "the Orchestrator does not report overall success after a transport append failure"
+
+# ---- both the summary and the Failure Artifact append fail (Issue #47) ------
+#
+# Neither the summary nor the Failure Artifact can record the failure. Only the
+# private Case completion record keeps the Stage result non-zero. Each run uses
+# a test-local TMPDIR, so the scenario can prove that the private accounting
+# directory is removed.
+
+# assert_private_accounting_removed <tmpdir> <label>
+assert_private_accounting_removed() {
+    assert_dir_exists "$1" "${2}: the test-local TMPDIR exists"
+    assert_eq "" "$(find "$1" -mindepth 1 | sort | tr '\n' ' ')" \
+        "${2}: the private accounting directory is removed"
+}
+
+# ---- mesh dual failure ----
+make_mesh_fixture dual_mesh
+dual_tmpdir="${workspace}/_tmp"
+mkdir -p "$dual_tmpdir"
+make_append_failure_control "$workspace" checkMesh \
+    "${workspace}/run_mesh_cases_summary.csv" "${workspace}/.run_mesh_cases_failed"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$dual_tmpdir" timeout 120 \
+        bash "$MESH_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
+    "the mesh dual control replaced both artifacts exactly once"
+assert_ne 124 "$status" "the mesh dual-failure run completes without an external kill"
+assert_failure "$status" \
+    "the private mesh Case completion record alone keeps the Stage non-zero"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n' \
+    "the mesh summary evidence keeps its exact header bytes"
+assert_file_bytes_exact "${append_control_dir}/fail_before_append" "" \
+    "the mesh Failure Artifact evidence keeps its exact pre-append bytes"
+assert_eq "/proc/version" "$(readlink "${workspace}/run_mesh_cases_summary.csv")" \
+    "no failed mesh summary row is available to the final gate"
+assert_eq "/proc/version" "$(readlink "${workspace}/.run_mesh_cases_failed")" \
+    "no mesh Failure Artifact record is available to the final gate"
+assert_contains "$(case_log "$workspace" _mesh_logs case_0_flow)" "Permission denied" \
+    "the mesh Case log keeps the summary append diagnostic"
+assert_contains "$out" "Permission denied" \
+    "the mesh Stage output keeps the Failure Artifact append diagnostic"
+assert_contains "$out" "One or more mesh jobs failed." \
+    "the mesh dual-failure run keeps its existing failure message"
+assert_not_contains "$out" "All mesh jobs finished." \
+    "the mesh dual-failure run does not report success"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the mesh dual-failure run leaves no lock directory"
+assert_private_accounting_removed "$dual_tmpdir" "mesh"
+
+# ---- flow dual failure ----
+make_flow_fixture dual_flow yes
+dual_tmpdir="${workspace}/_tmp"
+mkdir -p "$dual_tmpdir"
+make_append_failure_control "$workspace" reconstructPar \
+    "${workspace}/run_flow_cases_summary.csv" "${workspace}/.run_flow_cases_failed"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$dual_tmpdir" timeout 120 \
+        bash "$FLOW_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
+    "the flow dual control replaced both artifacts exactly once"
+assert_ne 124 "$status" "the flow dual-failure run completes without an external kill"
+assert_failure "$status" \
+    "the private flow Case completion record alone keeps the Stage non-zero"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n' \
+    "the flow summary evidence keeps its exact header bytes"
+assert_file_bytes_exact "${append_control_dir}/fail_before_append" "" \
+    "the flow Failure Artifact evidence keeps its exact pre-append bytes"
+assert_eq "/proc/version" "$(readlink "${workspace}/run_flow_cases_summary.csv")" \
+    "no failed flow summary row is available to the final gate"
+assert_eq "/proc/version" "$(readlink "${workspace}/.run_flow_cases_failed")" \
+    "no flow Failure Artifact record is available to the final gate"
+assert_contains "$(case_log "$workspace" _flow_logs case_0_flow)" "Permission denied" \
+    "the flow Case log keeps the summary append diagnostic"
+assert_contains "$out" "Permission denied" \
+    "the flow Stage output keeps the Failure Artifact append diagnostic"
+assert_contains "$out" "One or more flow jobs failed." \
+    "the flow dual-failure run keeps its existing failure message"
+assert_not_contains "$out" "All flow jobs finished." \
+    "the flow dual-failure run does not report success"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the flow dual-failure run leaves no lock directory"
+assert_private_accounting_removed "$dual_tmpdir" "flow"
+
+# ---- transport dual failure ----
+make_transport_success_fixture dual_transport
+dual_tmpdir="${workspace}/_tmp"
+mkdir -p "$dual_tmpdir"
+make_append_failure_control "$workspace" reconstructPar \
+    "${workspace}/run_transport_cases_summary.csv" \
+    "${workspace}/.run_transport_cases_failed"
+append_saved_path="$PATH"
+PATH="${append_control_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$dual_tmpdir" timeout 120 \
+        bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" \
+    && status=0 || status=$?
+PATH="$append_saved_path"
+
+assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
+    "the transport dual control replaced both artifacts exactly once"
+assert_ne 124 "$status" \
+    "the transport dual-failure run completes without an external kill"
+assert_failure "$status" \
+    "the private transport Case completion record alone keeps the Stage non-zero"
+assert_file_bytes_exact "${append_control_dir}/summary_before_append.csv" \
+    "csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n' \
+    "the transport summary evidence keeps its exact header bytes"
+assert_file_bytes_exact "${append_control_dir}/fail_before_append" "" \
+    "the transport Failure Artifact evidence keeps its exact pre-append bytes"
+assert_eq "/proc/version" \
+    "$(readlink "${workspace}/run_transport_cases_summary.csv")" \
+    "no failed transport summary row is available to the final gate"
+assert_eq "/proc/version" \
+    "$(readlink "${workspace}/.run_transport_cases_failed")" \
+    "no transport Failure Artifact record is available to the final gate"
+assert_contains "$(case_log "$workspace" _transport_logs case_0_trd)" "Permission denied" \
+    "the transport Case log keeps the summary append diagnostic"
+assert_contains "$out" "Permission denied" \
+    "the transport Stage output keeps the Failure Artifact append diagnostic"
+assert_contains "$out" "One or more transport jobs failed." \
+    "the transport dual-failure run keeps its existing failure message"
+assert_not_contains "$out" "All transport jobs finished." \
+    "the transport dual-failure run does not report success"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the transport dual-failure run leaves no lock directory"
+assert_private_accounting_removed "$dual_tmpdir" "transport"
+
+# ---- the same fixtures without a failure control (Issue #47) ---------------
+#
+# The correction must keep the exact current successful behavior.
+
+# ---- mesh success ----
+make_mesh_fixture success_mesh
+success_tmpdir="${workspace}/_tmp"
+mkdir -p "$success_tmpdir"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
+        bash "$MESH_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+
+assert_status 0 "$status" "the uncontrolled mesh run keeps exit status 0"
+assert_file_bytes_exact "${workspace}/run_mesh_cases_summary.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"meshed\",\"OK\""$'\n' \
+    "the uncontrolled mesh summary"
+assert_contains "$out" "All mesh jobs finished." \
+    "the uncontrolled mesh run keeps its success message"
+assert_file_missing "${workspace}/.run_mesh_cases_failed" \
+    "the uncontrolled mesh run leaves no Failure Artifact"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the uncontrolled mesh run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/flow/restart.marker" \
+    "the uncontrolled mesh run keeps its Case artifacts"
+assert_private_accounting_removed "$success_tmpdir" "uncontrolled mesh"
+
+# ---- flow success ----
+make_flow_fixture success_flow yes
+success_tmpdir="${workspace}/_tmp"
+mkdir -p "$success_tmpdir"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
+        bash "$FLOW_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+
+assert_status 0 "$status" "the uncontrolled flow run keeps exit status 0"
+assert_file_bytes_exact "${workspace}/run_flow_cases_summary.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"solved\",\"OK\""$'\n' \
+    "the uncontrolled flow summary"
+assert_contains "$out" "All flow jobs finished." \
+    "the uncontrolled flow run keeps its success message"
+assert_file_missing "${workspace}/.run_flow_cases_failed" \
+    "the uncontrolled flow run leaves no Failure Artifact"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the uncontrolled flow run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/flow/flow.marker" \
+    "the uncontrolled flow run keeps its Case artifacts"
+assert_private_accounting_removed "$success_tmpdir" "uncontrolled flow"
+
+# ---- transport success ----
+make_transport_success_fixture success_transport
+success_tmpdir="${workspace}/_tmp"
+mkdir -p "$success_tmpdir"
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
+        bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" \
+    && status=0 || status=$?
+
+assert_status 0 "$status" "the uncontrolled transport run keeps exit status 0"
+assert_file_bytes_exact "${workspace}/run_transport_cases_summary.csv" \
+    "csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow|case_0/trd\",\"${workspace}/case_0/trd\",\"solved\",\"OK\""$'\n' \
+    "the uncontrolled transport summary"
+assert_contains "$out" "All transport jobs finished." \
+    "the uncontrolled transport run keeps its success message"
+assert_file_missing "${workspace}/.run_transport_cases_failed" \
+    "the uncontrolled transport run leaves no Failure Artifact"
+assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
+    "the uncontrolled transport run leaves no lock directory"
+assert_file_exists "${workspace}/case_0/trd/transport.marker" \
+    "the uncontrolled transport run keeps its Case artifacts"
+assert_private_accounting_removed "$success_tmpdir" "uncontrolled transport"

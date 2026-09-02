@@ -1094,7 +1094,20 @@ _mesh_state/
 
 State files SHOULD identify current case, stage, message, update time, and log path.
 
-If any case fails, mesh MUST return non-zero at stage completion.
+If any Case fails, mesh MUST return non-zero at Stage completion.
+
+A failed mesh summary-row append MUST make the mesh Case process and the
+mesh Stage return non-zero. The mesh Stage Runner MUST preserve the append
+failure diagnostic and MUST make one summary-lock release attempt. If the append
+status is non-zero, the append status MUST have precedence and the summary append
+path MUST return the exact append status after the release attempt. If the append
+status is `0`, the summary append path MUST return the exact lock-release status.
+The Stage Runner MUST NOT hide, replace, or normalize a non-zero lock-release
+status. The Stage Runner MUST NOT print `All mesh jobs finished.` after either failure. The Stage
+Runner MUST account for every launched mesh Case process, including a process
+that completes before the final drain starts. The existing Case failure path MUST
+attempt the existing failed summary row and Failure Artifact record. A failed
+append MUST NOT remove completed Case work or existing Case artifacts.
 
 ## 16. Flow stage specification
 
@@ -1212,7 +1225,20 @@ flow.marker          # inside each completed flow case
 case.foam            # inside each completed flow case
 ```
 
-If any case fails, flow MUST return non-zero at stage completion.
+If any Case fails, flow MUST return non-zero at Stage completion.
+
+A failed flow summary-row append MUST make the flow Case process and the
+flow Stage return non-zero. The flow Stage Runner MUST preserve the append
+failure diagnostic and MUST make one summary-lock release attempt. If the append
+status is non-zero, the append status MUST have precedence and the summary append
+path MUST return the exact append status after the release attempt. If the append
+status is `0`, the summary append path MUST return the exact lock-release status.
+The Stage Runner MUST NOT hide, replace, or normalize a non-zero lock-release
+status. The Stage Runner MUST NOT print `All flow jobs finished.` after either failure. The Stage
+Runner MUST account for every launched flow Case process, including a process
+that completes before the final drain starts. The existing Case failure path MUST
+attempt the existing failed summary row and Failure Artifact record. A failed
+append MUST NOT remove completed Case work or existing Case artifacts.
 
 ## 17. Transport stage specification
 
@@ -1383,7 +1409,20 @@ transport.marker       # inside each completed transport case
 case.foam              # inside each completed transport case
 ```
 
-If any case fails, transport MUST return non-zero at stage completion.
+If any Case fails, transport MUST return non-zero at Stage completion.
+
+A failed transport summary-row append MUST make the transport Case process and the
+transport Stage return non-zero. The transport Stage Runner MUST preserve the append
+failure diagnostic and MUST make one summary-lock release attempt. If the append
+status is non-zero, the append status MUST have precedence and the summary append
+path MUST return the exact append status after the release attempt. If the append
+status is `0`, the summary append path MUST return the exact lock-release status.
+The Stage Runner MUST NOT hide, replace, or normalize a non-zero lock-release
+status. The Stage Runner MUST NOT print `All transport jobs finished.` after either failure. The Stage
+Runner MUST account for every launched transport Case process, including a process
+that completes before the final drain starts. The existing Case failure path MUST
+attempt the existing failed summary row and Failure Artifact record. A failed
+append MUST NOT remove completed Case work or existing Case artifacts.
 
 ## 18. Post-processing stage specification
 
@@ -2028,6 +2067,39 @@ The setup case MUST also prove:
 - `run_batch.sh` marks the batch failed;
 - without `--keep-going`, a failed setup batch stops later batches;
 - with `--keep-going`, other batches are attempted and the final status stays non-zero.
+
+The mesh, flow, and transport acceptance cases MUST each force one summary-row
+append to fail after successful Case work.
+
+For these controlled append-failure cases, an unavailable failed summary row is
+the exception to the general requirement that the Stage summary records failure.
+Section 19 applies: the Stage result MUST remain failed, and the Orchestrator
+report MUST NOT invent a Case row.
+
+Each acceptance case MUST prove:
+
+- the deterministic append-failure control ran exactly once;
+- the append returned promptly without an external kill;
+- the existing Case log contains the append failure diagnostic;
+- the Stage Runner returns non-zero;
+- the successful final Stage message is absent;
+- the existing final Stage failure message is present;
+- the summary lock directory is absent;
+- when the Failure Artifact stays writable, the existing Failure Artifact
+  identifies the affected Case;
+- when both the summary append and Failure Artifact append fail, the Stage still
+  returns non-zero and preserves both diagnostics;
+- completed Case work and existing Case artifacts stay present;
+- an equivalent successful append keeps the exact current summary bytes, Stage
+  status, final success message, Failure Artifact behavior, and Case artifacts;
+- a successful append followed by a controlled non-zero lock-release status makes
+  the Stage return non-zero, keeps the successful row, does not print the
+  successful final Stage message, and leaves no lock directory; and
+- `run_batch.sh` marks the batch failed and returns non-zero through the current
+  Stage failure rules.
+
+The failed append MUST NOT change a summary header, schema, field composition,
+field order, status value, or successful row.
 
 ### Q. Consolidated end-of-run report
 
