@@ -68,6 +68,7 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.T | Explicit Stage Runner output-directory forwarding | `cases/t_explicit_output_dir_forwarding.sh` |
 | 23.U | Shared Stage library deployment foundation | `cases/u_shared_stage_library_deployment.sh` |
 | 23.V | Shared Stage library locking characterization | `cases/v_shared_stage_library_locking.sh` |
+| 23.W | Shared result-recording extraction | `cases/w_shared_stage_library_result_recording.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
@@ -149,6 +150,60 @@ Each observation rejects status `124`, because the 120-second `STAGE_TIMEOUT` is
 only a test safety limit and never an accepted Stage result. Each `/dev/full`
 observation verifies the exact seven-column header, exactly one data row, and
 every field value of that row.
+
+Section 23.W proves that the I-G2 result-recording extraction keeps every public
+result-recording behavior. The scenario runs all five Stage Runners through
+their direct CLIs and compares the complete summary bytes of each Stage against
+expected bytes that the scenario builds from independent literal values. The
+comparison appends one literal character to each side, so a trailing newline
+byte stays significant inside command substitution.
+
+Four Stage summaries use a Batch Workspace path component that holds a space, a
+comma, a double quote, and an embedded newline, so one comparison proves that
+each field stays enclosed in double quotes, that an inner double quote becomes
+two double quotes, and that a comma and a newline stay inside their quoted
+field. A setup row with an invalid wind speed and a Stage row with an empty
+Case column prove that an empty field stays `""`.
+
+Section 23.W also holds the current post-processing difference. The Case ID, the
+Case directory, and the status keep their literal double-quote delimiters and add
+no inner-quote escaping, so the Case directory field can hold one raw double
+quote. Only the message field doubles an inner double quote. I-G2 does not
+normalize post-processing to the other four Stage Runners.
+
+Section 23.W covers the statuses that current public fixtures can produce. A
+real setup run with flow and transport base folders gives `created`, and one
+invalid row in the same run gives `failed`. The real setup run also needs
+`surfaceCheck`, `surfaceTransformPoints`, and `foamDictionary`, so the section
+adds scenario-local stubs that give the exact log text the Stage Runner parses
+and restores the earlier `PATH` afterwards. A transport run with an existing
+marker, an existing transport mesh, and an existing initial state gives
+`continued`.
+
+Section 23.W also holds one failed observation for each Stage Runner. Each
+observation asserts the exact Failure Artifact path and bytes, the exact failed
+summary row, and the existing non-zero Stage status. The setup Failure Artifact
+records the DOE Batch CSV path and the row number. The mesh, flow, and transport
+Failure Artifacts record the Case name. The post-processing Failure Artifact
+records the Case ID.
+
+One section proves a deterministic summary-row append failure. An external
+`foamToVTK` wrapper runs after the post-processing Stage Runner writes its
+header and before it appends a Case row. The wrapper moves the initialized
+summary to an evidence path and creates a directory at the summary path, so the
+next append redirection fails. The section proves that the Stage Runner returns
+non-zero, keeps its failure diagnostic, and does not report success. The summary
+lock is held across the row append, so a failed append ends the Case job before
+the release and the lock directory survives. That is the current behavior.
+
+One section proves shared-helper use without sourcing the library. It copies a
+complete deployment unit into the isolated test workspace and appends compatible
+instrumented implementations of the two approved helpers to the copied library.
+Each instrumented helper keeps the production rendering and the production
+append behavior and records one call outside the summary. Every copied Stage
+Runner must produce a quote record and an append record. A Stage Runner that
+keeps local result-recording mechanics produces no record, so this section fails
+before the extraction.
 
 Section 23.U builds real deployment units. Each scenario copies the production
 Stage Runners and `lib_batch_stage.sh` into a temporary directory, so a scenario
