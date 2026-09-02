@@ -340,6 +340,213 @@ assert_eq "${append_summary_path}.lockdir " \
     "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
     "the append failure keeps the current lock-release behavior"
 
+# ---- setup: the created status and the failed Failure Artifact -------------
+#
+# A real setup run needs flow and transport base folders that the Stage Runner
+# can copy without an OpenFOAM installation. One invalid row in the same run
+# proves the failed status, the Failure Artifact bytes, and the final status.
+
+# make_setup_bases <root> - flow and transport base folders for a real setup run.
+make_setup_bases() {
+    local flow="${1}/simpleFoam_files" transport="${1}/scalarTransportDeffFoam_files"
+    local field
+
+    mkdir -p "${flow}/0" "${flow}/system" "${flow}/constant/triSurface"
+    for field in U p k nut epsilon; do
+        printf 'FoamFile { object %s; }\n' "$field" > "${flow}/0/${field}"
+    done
+    printf 'FoamFile { object controlDict; }\napplication simpleFoam;\nendTime 3000;\n' \
+        > "${flow}/system/controlDict"
+    printf 'FoamFile { object turbulenceProperties; }\nsimulationType RAS;\n' \
+        > "${flow}/constant/turbulenceProperties"
+    printf 'FoamFile { object blockMeshDict; }\nvertices ( <xMin> <yMin> <zMin> <xMax> <yMax> <zMax> );\nblocks ( hex ( <nx> <ny> <nz> ) );\n' \
+        > "${flow}/system/blockMeshDict"
+    printf 'FoamFile { object snappyHexMeshDict; }\nsnap <snap_ctrl>;\n' \
+        > "${flow}/system/snappyHexMeshDict"
+    printf 'solid f18p2\nendsolid f18p2\n' > "${flow}/constant/triSurface/f18p2_all.stl"
+
+    mkdir -p "${transport}/0" "${transport}/system"
+    printf 'FoamFile { object T; }\n' > "${transport}/0/T"
+    printf 'FoamFile { object controlDict; }\napplication scalarTransportDeffFoam;\n' \
+        > "${transport}/system/controlDict"
+}
+
+# make_setup_command_stubs <workspace> - the extra commands that a real setup
+# run requires. The stubs give the exact log text that the Stage Runner parses,
+# so the section needs no OpenFOAM installation and no host command.
+make_setup_command_stubs() {
+    local bin_dir="${1}/_setup_bin"
+    mkdir -p "$bin_dir"
+
+    cat > "${bin_dir}/surfaceTransformPoints" <<'STUB'
+#!/usr/bin/env bash
+echo "Set centre of rotation to (100 200 0)"
+exit 0
+STUB
+
+    cat > "${bin_dir}/surfaceCheck" <<'STUB'
+#!/usr/bin/env bash
+echo "Overall bounds (0 0 0) (10 10 10)"
+exit 0
+STUB
+
+    cat > "${bin_dir}/foamDictionary" <<'STUB'
+#!/usr/bin/env bash
+entry=""; file=""; previous=""
+for arg in "$@"; do
+    case "$previous" in
+        -entry) entry="$arg" ;;
+        -value) file="$arg" ;;
+    esac
+    previous="$arg"
+done
+if [[ -n "$file" && -f "$file" ]]; then
+    awk -v key="${entry##*.}" '
+        $1 == key {
+            line = $0
+            sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", line)
+            gsub(/;/, "", line)
+            print line
+            exit
+        }' "$file"
+fi
+exit 0
+STUB
+
+    chmod +x "${bin_dir}/surfaceTransformPoints" "${bin_dir}/surfaceCheck" \
+        "${bin_dir}/foamDictionary"
+    setup_stub_bin="$bin_dir"
+}
+
+workspace="$(new_workspace setup_created)"
+install_fakes "$workspace"
+make_setup_bases "$workspace"
+make_setup_command_stubs "$workspace"
+make_csv "${workspace}/output_batch_1.csv" 0
+printf 'case_1,notanumber,270.0\n' >> "${workspace}/output_batch_1.csv"
+
+setup_saved_path="$PATH"
+PATH="${setup_stub_bin}:${PATH}"
+
+out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$SETUP_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+
+# No setup stub stays resolvable after this section.
+PATH="$setup_saved_path"
+
+assert_ne 124 "$status" "the real setup run completes without an external kill"
+assert_status 1 "$status" "one invalid setup row keeps the current non-zero status"
+
+expected="csv_file,row_number,case_id,case_name,wd,ws,ws_for_setup,case_dir,status,message"$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"270.000\",\"3.5\",\"3.5\",\"${workspace}/case_0/flow\",\"created\",\"flow case created\""$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/trd\",\"270.000\",\"3.5\",\"3.5\",\"${workspace}/case_0/trd\",\"created\",\"transport case created\""$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"3\",\"case_1\",\"\",\"270.0\",\"notanumber\",\"\",\"\",\"failed\",\"invalid WS\""$'\n'
+
+assert_file_bytes "${workspace}/setup_cases_summary.csv" "$expected" "setup created"
+assert_file_bytes "${workspace}/.setup_cases_failed" \
+    "${workspace}/output_batch_1.csv,3"$'\n' "the setup Failure Artifact"
+
+# ---- transport: the continued status ---------------------------------------
+#
+# An existing transport marker with an existing transport mesh and initial state
+# selects continuation.
+
+workspace="$(new_workspace transport_continued)"
+install_fakes "$workspace"
+make_csv "${workspace}/output_batch_1.csv" 0
+flow_dir="${workspace}/case_0/flow"
+trd_dir="${workspace}/case_0/trd"
+make_flow_case "$flow_dir" 2
+make_flow_mesh "$flow_dir"
+make_flow_result "$flow_dir" 3000
+printf 'flow-U-at-3000\n' > "${flow_dir}/3000/U"
+printf 'flow-nut-at-3000\n' > "${flow_dir}/3000/nut"
+printf 'flow-phi-at-3000\n' > "${flow_dir}/3000/phi"
+make_transport_case "$trd_dir" 2 T 300
+mkdir -p "${trd_dir}/constant/polyMesh"
+for name in points boundary faces owner neighbour; do
+    printf 'transport-mesh-%s\n' "$name" > "${trd_dir}/constant/polyMesh/${name}"
+done
+printf 'transport-U\n' > "${trd_dir}/0/U"
+printf 'transport-nut\n' > "${trd_dir}/0/nut"
+printf 'transport-phi\n' > "${trd_dir}/0/phi"
+printf 'done\n' > "${trd_dir}/transport.marker"
+
+out="$(cd "$workspace" && FAKE_SOLVER_TIMES="300" \
+        timeout "$STAGE_TIMEOUT" bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" && status=0 || status=$?
+
+assert_ne 124 "$status" "the transport continuation completes without an external kill"
+assert_status 0 "$status" "the transport continuation keeps exit status 0"
+
+expected="csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow|case_0/trd\",\"${workspace}/case_0/trd\",\"continued\",\"OK (resumed)\""$'\n'
+
+assert_file_bytes "${workspace}/run_transport_cases_summary.csv" "$expected" \
+    "transport continued"
+
+# ---- mesh: the failed Failure Artifact -------------------------------------
+
+workspace="$(new_workspace mesh_failure)"
+install_fakes "$workspace"
+make_csv "${workspace}/output_batch_1.csv" 0
+make_flow_case "${workspace}/case_0/flow" 2
+
+out="$(cd "$workspace" && FAKE_FAIL_COMMANDS="blockMesh" \
+        timeout "$STAGE_TIMEOUT" bash "$MESH_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+
+assert_ne 0 "$status" "a failed mesh Case keeps a non-zero Stage status"
+expected="csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"failed\",\"see log: ${workspace}/_mesh_logs/case_0_flow.log\""$'\n'
+assert_file_bytes "${workspace}/run_mesh_cases_summary.csv" "$expected" \
+    "the failed mesh summary"
+assert_file_bytes "${workspace}/.run_mesh_cases_failed" "case_0/flow"$'\n' \
+    "the mesh Failure Artifact"
+
+# ---- transport: the failed Failure Artifact ---------------------------------
+
+workspace="$(new_workspace transport_failure)"
+install_fakes "$workspace"
+make_csv "${workspace}/output_batch_1.csv" 0
+make_flow_case "${workspace}/case_0/flow" 2
+make_flow_mesh "${workspace}/case_0/flow"
+make_flow_result "${workspace}/case_0/flow" 3000
+# endTime 100 cannot cover the requested save time 300.
+make_transport_case "${workspace}/case_0/trd" 2 T 100
+
+out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$TRANSPORT_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" && status=0 || status=$?
+
+assert_ne 0 "$status" "a failed transport Case keeps a non-zero Stage status"
+expected="csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n'
+expected+="\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow|case_0/trd\",\"${workspace}/case_0/trd\",\"failed\",\"see log: ${workspace}/_transport_logs/case_0_trd.log\""$'\n'
+assert_file_bytes "${workspace}/run_transport_cases_summary.csv" "$expected" \
+    "the failed transport summary"
+assert_file_bytes "${workspace}/.run_transport_cases_failed" "case_0/trd"$'\n' \
+    "the transport Failure Artifact"
+
+# ---- post-processing: the failed Failure Artifact ---------------------------
+
+workspace="$(new_workspace post_failure)"
+install_fakes "$workspace"
+make_csv "${workspace}/output_batch_1.csv" 0
+make_flow_case "${workspace}/case_0/flow" 2
+make_flow_result "${workspace}/case_0/flow" 3000
+make_transport_case "${workspace}/case_0/trd" 2 T 300
+
+out="$(cd "$workspace" && FAKE_FAIL_COMMANDS="foamToVTK" \
+        timeout "$STAGE_TIMEOUT" bash "$POST_SCRIPT" \
+        -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
+
+assert_ne 0 "$status" "a failed conversion keeps a non-zero post-processing status"
+expected="case_id,case_dir,status,message"$'\n'
+expected+="\"case_0\",\"${workspace}/case_0\",\"failed\",\"VTU conversion failed; see ${workspace}/case_0/vtk/logs\""$'\n'
+assert_file_bytes "${workspace}/run_post_processing_cases_summary.csv" "$expected" \
+    "the failed post-processing summary"
+assert_file_bytes "${workspace}/.run_post_processing_cases_failed" "case_0"$'\n' \
+    "the post-processing Failure Artifact"
+
 # ---- the Stage Runners use the shared result-recording helpers --------------
 #
 # This section builds one copied deployment unit inside the isolated test

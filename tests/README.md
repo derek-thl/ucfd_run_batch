@@ -171,6 +171,22 @@ no inner-quote escaping, so the Case directory field can hold one raw double
 quote. Only the message field doubles an inner double quote. I-G2 does not
 normalize post-processing to the other four Stage Runners.
 
+Section 23.W covers the statuses that current public fixtures can produce. A
+real setup run with flow and transport base folders gives `created`, and one
+invalid row in the same run gives `failed`. The real setup run also needs
+`surfaceCheck`, `surfaceTransformPoints`, and `foamDictionary`, so the section
+adds scenario-local stubs that give the exact log text the Stage Runner parses
+and restores the earlier `PATH` afterwards. A transport run with an existing
+marker, an existing transport mesh, and an existing initial state gives
+`continued`.
+
+Section 23.W also holds one failed observation for each Stage Runner. Each
+observation asserts the exact Failure Artifact path and bytes, the exact failed
+summary row, and the existing non-zero Stage status. The setup Failure Artifact
+records the DOE Batch CSV path and the row number. The mesh, flow, and transport
+Failure Artifacts record the Case name. The post-processing Failure Artifact
+records the Case ID.
+
 One section proves a deterministic summary-row append failure. An external
 `foamToVTK` wrapper runs after the post-processing Stage Runner writes its
 header and before it appends a Case row. The wrapper moves the initialized
