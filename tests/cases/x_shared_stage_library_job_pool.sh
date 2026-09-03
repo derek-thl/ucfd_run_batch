@@ -68,7 +68,8 @@ write_case_control() {
 
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'control_active=%q\n' "$control_active"
+        printf 'control_dir=%q\n' "$control_dir"
+    printf 'control_active=%q\n' "$control_active"
     printf 'control_seen=%q\n' "$control_seen"
         printf 'control_peaks=%q\n' "$control_peaks"
         printf 'control_events=%q\n' "$control_events"
@@ -123,9 +124,35 @@ if ( set -o noclobber; : > "${control_seen}/${control_token}" ) 2>/dev/null; the
 
     printf '%s\n' "$(active_count)" >> "$control_peaks"
 fi
+
+# The suppression control removes both record channels once, so only the
+# caller-owned wait counter can keep the Stage result non-zero.
+if [[ -n "${X_SUPPRESS_SUMMARY:-}" ]] && mkdir "${control_dir}/suppress_once" 2>/dev/null; then
+    if [[ -f "$X_SUPPRESS_SUMMARY" ]]; then
+        mv -- "$X_SUPPRESS_SUMMARY" "${control_dir}/summary_evidence"
+        ln -s /proc/version "$X_SUPPRESS_SUMMARY"
+    fi
+    if [[ -n "${X_SUPPRESS_ARTIFACT:-}" && -f "$X_SUPPRESS_ARTIFACT" ]]; then
+        mv -- "$X_SUPPRESS_ARTIFACT" "${control_dir}/artifact_evidence"
+        ln -s /proc/version "$X_SUPPRESS_ARTIFACT"
+    fi
+    printf 'suppressed\n' >> "$control_events"
+fi
+
+# The selected Case fails while the parent shell is inside a job-pool wait. The
+# control fails before any parseable output, so a Stage Runner that reads the
+# command output also observes the failure.
+if [[ -n "${X_FAIL_TOKEN:-}" && "$control_token" == "${X_FAIL_TOKEN}" ]]; then
+    if (( control_owner == 1 )); then
+        rm -f -- "${control_active}/${control_token}"
+        printf 'exit %s 1\n' "$control_token" >> "$control_events"
+    fi
+    exit 1
+fi
 CONTROL
         printf '%s' "$extra"
         cat <<'CONTROL'
+
 
 "$real_command" "$@"
 delegated_status=$?
@@ -138,6 +165,21 @@ exit "$delegated_status"
 CONTROL
     } > "${bin_dir}/${command_name}"
     chmod +x "${bin_dir}/${command_name}"
+}
+
+# assert_sleep_argument <record> <argument> <expectation> <label>
+# The scenario-local sleep control records every sleep argument. The Case
+# control itself sleeps 0.05 seconds, so an assertion names only the exact
+# production argument that it proves.
+assert_sleep_argument() {
+    local record="$1" argument="$2" expectation="$3" label="$4" count
+    count="$(grep -c "^${argument}\$" "$record" || true)"
+
+    if [[ "$expectation" == "present" ]]; then
+        assert_ne 0 "$count" "${label}: the production sleep ${argument} runs"
+    else
+        assert_eq 0 "$count" "${label}: no production sleep ${argument} runs"
+    fi
 }
 
 # control_peak - the largest observed number of concurrent Case processes.
@@ -308,6 +350,12 @@ assert_eq "$CASE_COUNT" "$(fake_call_count checkMesh)" \
     "every mesh Case runs checkMesh exactly once"
 assert_eq "" "$(find "$workspace" -name 'run_*_cases_status.*' | sort | tr '\n' ' ')" \
     "no private accounting directory enters the mesh Batch Workspace"
+assert_sleep_argument "$SLEEP_RECORD" 0.1 present "mesh free-slot"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "mesh on Bash 4.3 or later"
+# The mesh final drain forces progress on every cycle, so more than one
+# progress line appears inside the throttle window.
+assert_ne 1 "$(grep -c 'Mesh progress:' <<< "$out")" \
+    "the mesh final drain keeps its forced progress call"
 
 # ---- flow: the job pool keeps the exact limit and completes every Case ------
 
@@ -361,6 +409,11 @@ assert_eq "$CASE_COUNT" "$(fake_call_count reconstructPar)" \
     "every flow Case runs reconstructPar exactly once"
 assert_eq "" "$(find "$workspace" -name 'run_*_cases_status.*' | sort | tr '\n' ' ')" \
     "no private accounting directory enters the flow Batch Workspace"
+assert_sleep_argument "$SLEEP_RECORD" 0.1 present "flow free-slot"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "flow on Bash 4.3 or later"
+# The flow final drain resets the progress throttle before each callback.
+assert_ne 1 "$(grep -c 'Progress: launched=' <<< "$out")" \
+    "the flow final drain resets the progress throttle"
 
 # ---- transport: the job pool keeps the exact limit -------------------------
 
@@ -415,6 +468,11 @@ for index in 0 1 2 3; do
 done
 assert_eq "" "$(find "$workspace" -name 'run_*_cases_status.*' | sort | tr '\n' ' ')" \
     "no private accounting directory enters the transport Batch Workspace"
+assert_sleep_argument "$SLEEP_RECORD" 0.1 absent "transport"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "transport on Bash 4.3 or later"
+# The transport final drain resets the progress throttle before each callback.
+assert_ne 1 "$(grep -c 'Transport progress:' <<< "$out")" \
+    "the transport final drain resets the progress throttle"
 
 # ---- post-processing: the job pool keeps the exact limit -------------------
 
@@ -465,6 +523,8 @@ done
 # Post-processing gives no aggregate progress output.
 assert_not_contains "$out" "Progress: launched=" \
     "post-processing gives no aggregate progress output"
+assert_sleep_argument "$SLEEP_RECORD" 0.1 absent "post-processing"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "post-processing on Bash 4.3 or later"
 
 # ---- setup: the job pool keeps the exact limit -----------------------------
 #
@@ -513,6 +573,8 @@ assert_eq "$(printf '%s' "$setup_expected" | sort)" \
 assert_file_bytes_exact "${workspace}/.setup_cases_failed" "" \
     "the setup pool run keeps an empty Failure Artifact"
 assert_contains "$out" "Done." "the setup pool run keeps its success message"
+assert_sleep_argument "$SLEEP_RECORD" 0.1 absent "setup"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "setup on Bash 4.3 or later"
 
 # ---- shared-helper delegation through a copied deployment unit -------------
 #
@@ -674,3 +736,515 @@ run_copied_stage post post "${delegation_master}/run_post_processing_cases.sh" \
     -i output_batch_1.csv -O . -j 1
 assert_helper_delegation post-processing "$HELPER_RECORD" yes
 PATH="$pool_saved_path"
+
+# The natural Bash 4.3-or-later path selects wait -n in every Stage Runner.
+for stage in setup mesh flow transport post; do
+    assert_ne 0 "$(grep -c '^wait_n_selected$' "${HELPER_RECORD_DIR}/${stage}.log" || true)" \
+        "the copied ${stage} Stage Runner records that wait -n is selected"
+    assert_eq 0 "$(grep -c '^fallback_poll$' "${HELPER_RECORD_DIR}/${stage}.log" || true)" \
+        "the copied ${stage} Stage Runner does not use the fallback poll on this Bash"
+done
+
+# Every control record lives outside every Batch Workspace.
+assert_eq "" "$(find "$CONTRACT_TEST_RUN_DIR" -path "${CONTROL_ROOT}" -prune -o \
+        -name 'peaks' -print -o -name 'events' -print | grep -v "^${CONTROL_ROOT}" | sort | tr '\n' ' ')" \
+    "no job-pool control record enters a Batch Workspace"
+
+# ---- a controlled Case failure during a job-pool wait ----------------------
+#
+# One Case fails while the parent shell is inside a job-pool wait. Each Stage
+# Runner must keep its exact current failed status, summary row, Failure
+# Artifact bytes, marker behavior, and failure message.
+
+FAIL_TOKEN="case_1"
+
+# ---- mesh failure ----
+new_pool_workspace mesh_fail_pool
+for index in 0 1 2 3; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+done
+new_control mesh_fail_pool
+fail_bin="${workspace}/_control_bin"
+mkdir -p "$fail_bin"
+write_case_control "$fail_bin" blockMesh "${FAKE_BIN_DIR}/blockMesh"
+new_sleep_record mesh_fail_pool
+pool_saved_path="$PATH"
+PATH="${fail_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "$MESH_SCRIPT" -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" \
+    && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" "the mesh failure run completes without an external kill"
+assert_failure "$status" "one failed mesh Case keeps a non-zero Stage status"
+assert_pool_shape "mesh failure"
+assert_eq 3 "$(summary_status_count "${workspace}/run_mesh_cases_summary.csv" meshed)" \
+    "the mesh failure run keeps three meshed rows"
+assert_eq 1 "$(summary_status_count "${workspace}/run_mesh_cases_summary.csv" failed)" \
+    "the mesh failure run keeps one failed row"
+assert_file_bytes_exact "${workspace}/.run_mesh_cases_failed" "case_1/flow"$'\n' \
+    "the mesh failure run Failure Artifact"
+assert_file_missing "${workspace}/case_1/flow/restart.marker" \
+    "the failed mesh Case writes no restart marker"
+assert_contains "$out" "One or more mesh jobs failed." \
+    "the mesh failure run keeps its failure message"
+assert_not_contains "$out" "All mesh jobs finished." \
+    "the mesh failure run does not report success"
+
+# ---- flow failure ----
+new_pool_workspace flow_fail_pool
+for index in 0 1 2 3; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+    make_flow_mesh "${workspace}/case_${index}/flow"
+    printf 'FoamFile { object wallDistance; }\n' \
+        > "${workspace}/case_${index}/flow/0/wallDistance"
+done
+new_control flow_fail_pool
+fail_bin="${workspace}/_control_bin"
+mkdir -p "$fail_bin"
+write_case_control "$fail_bin" simpleFoam "${FAKE_BIN_DIR}/simpleFoam"
+new_sleep_record flow_fail_pool
+pool_saved_path="$PATH"
+PATH="${fail_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "$FLOW_SCRIPT" -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" \
+    && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" "the flow failure run completes without an external kill"
+assert_failure "$status" "one failed flow Case keeps a non-zero Stage status"
+assert_pool_shape "flow failure"
+assert_eq 3 "$(summary_status_count "${workspace}/run_flow_cases_summary.csv" solved)" \
+    "the flow failure run keeps three solved rows"
+assert_eq 1 "$(summary_status_count "${workspace}/run_flow_cases_summary.csv" failed)" \
+    "the flow failure run keeps one failed row"
+assert_file_bytes_exact "${workspace}/.run_flow_cases_failed" "case_1/flow"$'\n' \
+    "the flow failure run Failure Artifact"
+assert_file_missing "${workspace}/case_1/flow/flow.marker" \
+    "the failed flow Case writes no flow marker"
+assert_contains "$out" "One or more flow jobs failed." \
+    "the flow failure run keeps its failure message"
+
+# ---- transport failure ----
+new_pool_workspace transport_fail_pool
+for index in 0 1 2 3; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+    make_flow_mesh "${workspace}/case_${index}/flow"
+    make_flow_result "${workspace}/case_${index}/flow" 3000
+    make_transport_case "${workspace}/case_${index}/trd" 2 T 300
+done
+new_control transport_fail_pool
+fail_bin="${workspace}/_control_bin"
+mkdir -p "$fail_bin"
+write_case_control "$fail_bin" scalarTransportDeffFoam \
+    "${FAKE_BIN_DIR}/scalarTransportDeffFoam"
+new_sleep_record transport_fail_pool
+pool_saved_path="$PATH"
+PATH="${fail_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j "$JOB_LIMIT" \
+        --save-times 300 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" \
+    "the transport failure run completes without an external kill"
+assert_failure "$status" "one failed transport Case keeps a non-zero Stage status"
+assert_pool_shape "transport failure"
+assert_eq 3 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" solved)" \
+    "the transport failure run keeps three solved rows"
+assert_eq 1 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" failed)" \
+    "the transport failure run keeps one failed row"
+assert_file_bytes_exact "${workspace}/.run_transport_cases_failed" "case_1/trd"$'\n' \
+    "the transport failure run Failure Artifact"
+assert_file_missing "${workspace}/case_1/trd/transport.marker" \
+    "the failed transport Case writes no transport marker"
+assert_contains "$out" "One or more transport jobs failed." \
+    "the transport failure run keeps its failure message"
+
+# ---- post-processing failure ----
+new_pool_workspace post_fail_pool
+for index in 0 1 2 3; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+    make_flow_result "${workspace}/case_${index}/flow" 3000
+    make_transport_case "${workspace}/case_${index}/trd" 2 T 300
+done
+new_control post_fail_pool
+fail_bin="${workspace}/_control_bin"
+mkdir -p "$fail_bin"
+write_case_control "$fail_bin" foamToVTK "${FAKE_BIN_DIR}/foamToVTK"
+new_sleep_record post_fail_pool
+pool_saved_path="$PATH"
+PATH="${fail_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "$POST_SCRIPT" -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" \
+    && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" \
+    "the post-processing failure run completes without an external kill"
+assert_failure "$status" \
+    "one failed post-processing Case keeps a non-zero Stage status"
+assert_pool_shape "post-processing failure"
+assert_eq 3 "$(summary_status_count "${workspace}/run_post_processing_cases_summary.csv" completed 3)" \
+    "the post-processing failure run keeps three completed rows"
+assert_eq 1 "$(summary_status_count "${workspace}/run_post_processing_cases_summary.csv" failed 3)" \
+    "the post-processing failure run keeps one failed row"
+assert_file_bytes_exact "${workspace}/.run_post_processing_cases_failed" "case_1"$'\n' \
+    "the post-processing failure run Failure Artifact"
+assert_contains "$out" "One or more post-processing jobs failed." \
+    "the post-processing failure run keeps its failure message"
+
+# ---- setup failure ----
+new_pool_workspace setup_fail_pool
+make_setup_bases "$workspace"
+new_control setup_fail_pool
+fail_bin="${workspace}/_control_bin"
+mkdir -p "$fail_bin"
+make_setup_side_commands "$fail_bin"
+write_case_control "$fail_bin" surfaceTransformPoints "${SLEEP_REAL%/*}/true" \
+    'echo "Set centre of rotation to (100 200 0)"
+'
+new_sleep_record setup_fail_pool
+pool_saved_path="$PATH"
+PATH="${fail_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "$SETUP_SCRIPT" -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" \
+    && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" "the setup failure run completes without an external kill"
+assert_failure "$status" "one failed setup row keeps a non-zero Stage status"
+assert_pool_shape "setup failure"
+# A setup row job that stops mid-way records no summary row. The Failure
+# Artifact records the row, and the Stage status stays non-zero.
+assert_eq 6 "$(summary_status_count "${workspace}/setup_cases_summary.csv" created 9)" \
+    "the setup failure run keeps the created rows of the other Cases"
+assert_eq 0 "$(summary_status_count "${workspace}/setup_cases_summary.csv" failed 9)" \
+    "the failed setup row writes no summary row"
+assert_file_bytes_exact "${workspace}/.setup_cases_failed" \
+    "${workspace}/output_batch_1.csv,3"$'\n' \
+    "the setup failure run Failure Artifact"
+assert_contains "$out" "Some rows failed." \
+    "the setup failure run keeps its failure message"
+
+# ---- the Orchestrator keeps its failure propagation for each Stage ---------
+
+# build_orchestrated <name> <runner-source> <runner-name>
+build_orchestrated() {
+    workspace="$(new_workspace "$1")"
+    install_fakes "$workspace"
+    assert_fakes_active
+    use_stub_records "$workspace"
+    master="${workspace}/master_batch"
+    output="${workspace}/out"
+    make_stub_master "$master" master
+    cp -f -- "$2" "${master}/${3}"
+    cp -f -- "${MASTER_SRC_DIR}/lib_batch_stage.sh" "${master}/lib_batch_stage.sh"
+    mkdir -p "$output" "${output}/batch_1"
+    make_csv "${workspace}/output_batch_1.csv" 0 1 2 3
+    cp -f -- "${workspace}/output_batch_1.csv" "${output}/batch_1/output_batch_1.csv"
+}
+
+# assert_orchestrated_failure <runner-name> <output>
+assert_orchestrated_failure() {
+    assert_ne 124 "$status" "the orchestrated ${1} run completes without an external kill"
+    assert_failure "$status" "the orchestrated ${1} run keeps a non-zero status"
+    assert_contains "$2" "Stage failed  : ${1}" \
+        "the Orchestrator names the failed ${1} Stage"
+    assert_contains "$2" "Batch failed: batch_1" \
+        "the Orchestrator marks the batch failed for ${1}"
+    assert_not_contains "$2" "All requested batches and stages finished successfully." \
+        "the Orchestrator reports no overall success for ${1}"
+}
+
+# ---- orchestrated mesh ----
+build_orchestrated orch_mesh "$MESH_SCRIPT" run_mesh_cases.sh
+for index in 0 1 2 3; do
+    make_flow_case "${output}/batch_1/case_${index}/flow" 2
+done
+new_control orch_mesh
+orch_bin="${workspace}/_control_bin"
+mkdir -p "$orch_bin"
+write_case_control "$orch_bin" blockMesh "${FAKE_BIN_DIR}/blockMesh"
+pool_saved_path="$PATH"
+PATH="${orch_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        timeout "$STAGE_TIMEOUT" bash "$RUN_BATCH" --stage mesh \
+        -j "$JOB_LIMIT" -m "$master" -o "$output" \
+        "${workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+assert_orchestrated_failure run_mesh_cases.sh "$out"
+assert_pool_shape "orchestrated mesh"
+
+# ---- orchestrated flow ----
+build_orchestrated orch_flow "$FLOW_SCRIPT" run_flow_cases.sh
+for index in 0 1 2 3; do
+    make_flow_case "${output}/batch_1/case_${index}/flow" 2
+    make_flow_mesh "${output}/batch_1/case_${index}/flow"
+    printf 'FoamFile { object wallDistance; }\n' \
+        > "${output}/batch_1/case_${index}/flow/0/wallDistance"
+done
+new_control orch_flow
+orch_bin="${workspace}/_control_bin"
+mkdir -p "$orch_bin"
+write_case_control "$orch_bin" simpleFoam "${FAKE_BIN_DIR}/simpleFoam"
+pool_saved_path="$PATH"
+PATH="${orch_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        timeout "$STAGE_TIMEOUT" bash "$RUN_BATCH" --stage flow \
+        -j "$JOB_LIMIT" -m "$master" -o "$output" \
+        "${workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+assert_orchestrated_failure run_flow_cases.sh "$out"
+assert_pool_shape "orchestrated flow"
+
+# ---- orchestrated transport ----
+build_orchestrated orch_transport "$TRANSPORT_SCRIPT" run_transport_cases.sh
+for index in 0 1 2 3; do
+    make_flow_case "${output}/batch_1/case_${index}/flow" 2
+    make_flow_mesh "${output}/batch_1/case_${index}/flow"
+    make_flow_result "${output}/batch_1/case_${index}/flow" 3000
+    make_transport_case "${output}/batch_1/case_${index}/trd" 2 T 300
+done
+new_control orch_transport
+orch_bin="${workspace}/_control_bin"
+mkdir -p "$orch_bin"
+write_case_control "$orch_bin" scalarTransportDeffFoam \
+    "${FAKE_BIN_DIR}/scalarTransportDeffFoam"
+pool_saved_path="$PATH"
+PATH="${orch_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        timeout "$STAGE_TIMEOUT" bash "$RUN_BATCH" --stage transport \
+        -j "$JOB_LIMIT" --save-times 300 -m "$master" -o "$output" \
+        "${workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+assert_orchestrated_failure run_transport_cases.sh "$out"
+assert_pool_shape "orchestrated transport"
+
+# ---- orchestrated post-processing ----
+build_orchestrated orch_post "$POST_SCRIPT" run_post_processing_cases.sh
+for index in 0 1 2 3; do
+    make_flow_case "${output}/batch_1/case_${index}/flow" 2
+    make_flow_result "${output}/batch_1/case_${index}/flow" 3000
+    make_transport_case "${output}/batch_1/case_${index}/trd" 2 T 300
+done
+new_control orch_post
+orch_bin="${workspace}/_control_bin"
+mkdir -p "$orch_bin"
+write_case_control "$orch_bin" foamToVTK "${FAKE_BIN_DIR}/foamToVTK"
+pool_saved_path="$PATH"
+PATH="${orch_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        timeout "$STAGE_TIMEOUT" bash "$RUN_BATCH" --stage post \
+        -j "$JOB_LIMIT" -m "$master" -o "$output" \
+        "${workspace}/output_batch_1.csv" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+assert_orchestrated_failure run_post_processing_cases.sh "$out"
+assert_pool_shape "orchestrated post-processing"
+
+# ---- the caller-owned wait counters stay load-bearing ----------------------
+#
+# Neither the summary nor the Failure Artifact can record the failure, so only
+# the caller-owned wait-status counter keeps the Stage result non-zero. Setup
+# uses FAILED_ROW_JOBS and post-processing uses JOB_FAILURES.
+
+# ---- setup: FAILED_ROW_JOBS ----
+new_pool_workspace setup_counter
+make_setup_bases "$workspace"
+new_control setup_counter
+counter_bin="${workspace}/_control_bin"
+mkdir -p "$counter_bin"
+make_setup_side_commands "$counter_bin"
+write_case_control "$counter_bin" surfaceTransformPoints "${SLEEP_REAL%/*}/true" \
+    'echo "Set centre of rotation to (100 200 0)"
+'
+pool_saved_path="$PATH"
+PATH="${counter_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_SUPPRESS_SUMMARY="${workspace}/setup_cases_summary.csv" \
+        X_SUPPRESS_ARTIFACT="${workspace}/.setup_cases_failed" \
+        timeout "$STAGE_TIMEOUT" bash "$SETUP_SCRIPT" \
+        -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_contains "$(cat "$control_events")" "suppressed" \
+    "the setup suppression control replaced both record channels"
+assert_eq "/proc/version" "$(readlink "${workspace}/.setup_cases_failed")" \
+    "no setup Failure Artifact record is available to the final gate"
+assert_ne 124 "$status" "the setup counter run completes without an external kill"
+assert_failure "$status" \
+    "FAILED_ROW_JOBS alone keeps the setup Stage result non-zero"
+
+# ---- post-processing: JOB_FAILURES ----
+# This observation uses one Case. A failed append inside the summary lock leaves
+# the lock held, so a second Case would wait without a limit. That lock
+# behavior is pre-existing, and I-G3 must not change it.
+workspace="$(new_workspace post_counter)"
+install_fakes "$workspace"
+assert_fakes_active
+make_csv "${workspace}/output_batch_1.csv" 0
+make_flow_case "${workspace}/case_0/flow" 2
+make_flow_result "${workspace}/case_0/flow" 3000
+make_transport_case "${workspace}/case_0/trd" 2 T 300
+new_control post_counter
+counter_bin="${workspace}/_control_bin"
+mkdir -p "$counter_bin"
+write_case_control "$counter_bin" foamToVTK "${FAKE_BIN_DIR}/foamToVTK"
+pool_saved_path="$PATH"
+PATH="${counter_bin}:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C \
+        X_SUPPRESS_SUMMARY="${workspace}/run_post_processing_cases_summary.csv" \
+        X_SUPPRESS_ARTIFACT="${workspace}/.run_post_processing_cases_failed" \
+        timeout "$STAGE_TIMEOUT" bash "$POST_SCRIPT" \
+        -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_contains "$(cat "$control_events")" "suppressed" \
+    "the post-processing suppression control replaced both record channels"
+assert_eq "/proc/version" \
+    "$(readlink "${workspace}/.run_post_processing_cases_failed")" \
+    "no post-processing Failure Artifact record is available to the final gate"
+assert_ne 124 "$status" \
+    "the post-processing counter run completes without an external kill"
+assert_failure "$status" \
+    "JOB_FAILURES alone keeps the post-processing Stage result non-zero"
+
+# ---- the forced Bash 4.0 through 4.2 fallback path -------------------------
+#
+# A copied deployment unit overrides only batch_stage_job_pool_wait_n_supported
+# so that it returns non-zero. Every Stage Runner must then use the
+# 0.5-second polling path and must not call a wait-status callback.
+
+new_pool_workspace fallback
+make_setup_bases "$workspace"
+for index in 0 1; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+    make_flow_mesh "${workspace}/case_${index}/flow"
+    printf 'FoamFile { object wallDistance; }\n' \
+        > "${workspace}/case_${index}/flow/0/wallDistance"
+    make_flow_result "${workspace}/case_${index}/flow" 3000
+    make_transport_case "${workspace}/case_${index}/trd" 2 T 300
+done
+make_csv "${workspace}/output_batch_1.csv" 0 1
+fallback_master="${workspace}/master_batch"
+make_instrumented_unit "$fallback_master"
+cat >> "${fallback_master}/lib_batch_stage.sh" <<'OVERRIDE'
+
+# Branch control. Only the support test changes, so every scheduling loop takes
+# the Bash 4.0 through 4.2 fallback path.
+batch_stage_job_pool_wait_n_supported() {
+    return 1
+}
+OVERRIDE
+fallback_bin="${workspace}/_control_bin"
+mkdir -p "$fallback_bin"
+make_setup_side_commands "$fallback_bin"
+printf '#!/usr/bin/env bash\necho "Set centre of rotation to (100 200 0)"\nexit 0\n' \
+    > "${fallback_bin}/surfaceTransformPoints"
+chmod +x "${fallback_bin}/surfaceTransformPoints"
+
+# run_fallback_stage <stage> <script> <args...>
+run_fallback_stage() {
+    local stage="$1"
+    shift
+    HELPER_RECORD="${HELPER_RECORD_DIR}/fallback_${stage}.log"
+    SLEEP_RECORD="${SLEEP_CONTROL_DIR}/fallback_${stage}.log"
+    : > "$HELPER_RECORD"
+    : > "$SLEEP_RECORD"
+    ( cd "$workspace" && X_HELPER_RECORD="$HELPER_RECORD" \
+        X_SLEEP_RECORD="$SLEEP_RECORD" LC_ALL=C \
+        timeout "$STAGE_TIMEOUT" bash "$@" ) >/dev/null 2>&1 && status=0 || status=$?
+}
+
+pool_saved_path="$PATH"
+PATH="${fallback_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+for spec in "setup:setup_cases.sh" "mesh:run_mesh_cases.sh" "flow:run_flow_cases.sh" \
+            "post:run_post_processing_cases.sh"; do
+    stage="${spec%%:*}"
+    runner="${spec##*:}"
+    run_fallback_stage "$stage" "${fallback_master}/${runner}" \
+        -i output_batch_1.csv -O . -j 1
+    assert_ne 124 "$status" "the fallback ${stage} run completes without an external kill"
+    assert_status 0 "$status" "the fallback ${stage} run keeps exit status 0"
+    assert_ne 0 "$(grep -c '^fallback_poll$' "$HELPER_RECORD" || true)" \
+        "the fallback ${stage} run uses the Bash 4.0 through 4.2 polling path"
+    assert_eq 0 "$(grep -c '^wait_n_selected$' "$HELPER_RECORD" || true)" \
+        "the fallback ${stage} run never selects wait -n"
+    assert_sleep_argument "$SLEEP_RECORD" 0.5 present "fallback ${stage}"
+done
+run_fallback_stage transport "${fallback_master}/run_transport_cases.sh" \
+    -i output_batch_1.csv -O . -j 1 --save-times 300
+assert_ne 124 "$status" "the fallback transport run completes without an external kill"
+assert_status 0 "$status" "the fallback transport run keeps exit status 0"
+assert_ne 0 "$(grep -c '^fallback_poll$' "$HELPER_RECORD" || true)" \
+    "the fallback transport run uses the Bash 4.0 through 4.2 polling path"
+assert_eq 0 "$(grep -c '^wait_n_selected$' "$HELPER_RECORD" || true)" \
+    "the fallback transport run never selects wait -n"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 present "fallback transport"
+PATH="$pool_saved_path"
+
+# ---- the setup final drain stays caller-owned ------------------------------
+#
+# The copied setup Stage Runner changes only the exact Bash-version condition
+# in its existing wait_for_all_rows function, so the direct-PID older-Bash
+# branch runs. Every other line stays unchanged, and the free-slot wait keeps
+# using the shared helper.
+
+new_pool_workspace setup_drain
+make_setup_bases "$workspace"
+drain_master="${workspace}/master_batch"
+make_instrumented_unit "$drain_master"
+
+drain_condition='    if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then'
+assert_eq 1 "$(grep -c -F -x "$drain_condition" "${drain_master}/setup_cases.sh")" \
+    "the copied setup Stage Runner holds exactly one Bash-version condition"
+drain_before="$(wc -l < "${drain_master}/setup_cases.sh")"
+python3 - "${drain_master}/setup_cases.sh" "$drain_condition" <<'PYTHON'
+import sys
+path, condition = sys.argv[1], sys.argv[2]
+source = open(path).read()
+assert source.count(condition + "\n") == 1
+open(path, "w").write(source.replace(condition + "\n", "    if false; then\n"))
+PYTHON
+assert_eq "$drain_before" "$(wc -l < "${drain_master}/setup_cases.sh")" \
+    "the copied setup Stage Runner keeps its line count"
+
+new_control setup_drain
+drain_bin="${workspace}/_control_bin"
+mkdir -p "$drain_bin"
+make_setup_side_commands "$drain_bin"
+write_case_control "$drain_bin" surfaceTransformPoints "${SLEEP_REAL%/*}/true" \
+    'echo "Set centre of rotation to (100 200 0)"
+'
+HELPER_RECORD="${HELPER_RECORD_DIR}/setup_drain.log"
+: > "$HELPER_RECORD"
+
+pool_saved_path="$PATH"
+PATH="${drain_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+out="$(cd "$workspace" && LC_ALL=C X_FAIL_TOKEN="$FAIL_TOKEN" \
+        X_HELPER_RECORD="$HELPER_RECORD" timeout "$STAGE_TIMEOUT" \
+        bash "${drain_master}/setup_cases.sh" \
+        -i output_batch_1.csv -O . -j "$JOB_LIMIT" 2>&1)" && status=0 || status=$?
+PATH="$pool_saved_path"
+
+assert_ne 124 "$status" "the setup drain run completes without an external kill"
+assert_failure "$status" \
+    "the older-Bash setup final drain keeps the exact non-zero Stage status"
+assert_pool_shape "setup drain"
+assert_file_bytes_exact "${workspace}/.setup_cases_failed" \
+    "${workspace}/output_batch_1.csv,3"$'\n' \
+    "the older-Bash setup final drain keeps the exact Failure Artifact"
+assert_eq 6 "$(summary_status_count "${workspace}/setup_cases_summary.csv" created 9)" \
+    "the older-Bash setup final drain keeps the created rows"
+assert_contains "$out" "Some rows failed." \
+    "the older-Bash setup final drain keeps its failure message"
+# The free-slot wait still delegates to the shared helper.
+assert_ne 0 "$(grep -c '^wait_for_slot$' "$HELPER_RECORD" || true)" \
+    "the copied setup Stage Runner still uses the shared free-slot helper"
+assert_eq 0 "$(grep -c '^wait_for_all$' "$HELPER_RECORD" || true)" \
+    "the setup final drain never uses the shared wait-for-all helper"

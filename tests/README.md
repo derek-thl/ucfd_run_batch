@@ -69,6 +69,7 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.U | Shared Stage library deployment foundation | `cases/u_shared_stage_library_deployment.sh` |
 | 23.V | Shared Stage library locking characterization | `cases/v_shared_stage_library_locking.sh` |
 | 23.W | Shared result-recording extraction | `cases/w_shared_stage_library_result_recording.sh` |
+| 23.X | Shared Stage job-pool scheduling | `cases/x_shared_stage_library_job_pool.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
@@ -150,6 +151,56 @@ Each observation rejects status `124`, because the 120-second `STAGE_TIMEOUT` is
 only a test safety limit and never an accepted Stage result. Each `/dev/full`
 observation verifies the exact seven-column header, exactly one data row, and
 every field value of that row.
+
+Section 23.X characterizes the job-pool scheduling of all five Stage Runners
+and then proves that they delegate to the four shared helpers. Every assertion
+uses a direct Stage Runner CLI or the Orchestrator CLI. Every control record
+lives in a sibling directory under `CONTRACT_TEST_RUN_DIR`, so no record enters
+a Batch Workspace.
+
+Each Stage Runner runs four Cases with `-j 2` behind one named control command:
+`surfaceTransformPoints` for setup, `blockMesh` for mesh, `simpleFoam` for flow,
+`scalarTransportDeffFoam` for transport, and `foamToVTK` for post-processing.
+The control identifies the Case from the working directory and the argument
+vector, because post-processing calls its control three times per Case in three
+directories and setup calls its control from a directory without a Case
+component. A persistent seen marker keeps one entry for each Case, and a
+separate active marker measures concurrency. The control holds each Case until
+a second Case process is active, and a finite internal deadline releases every
+participant. The scenario then proves that no Stage Runner exceeds two
+concurrent Case processes, that two Case processes overlap, and that every Case
+launches exactly once.
+
+A fail token makes one Case fail while the parent is inside a job-pool wait. The
+control fails before its parseable output, because setup reads its control
+output and tolerates a non-zero control status. Each Stage Runner keeps its
+exact failed status, summary rows, Failure Artifact bytes, marker behavior, and
+failure message. A real Orchestrator invocation for each Stage keeps the
+`Stage failed`, `Batch failed`, and overall failure behavior.
+
+Two observations prove that a caller-owned wait counter stays load-bearing. A
+suppression control replaces both the summary and the Failure Artifact with a
+symbolic link to `/proc/version`, so only `FAILED_ROW_JOBS` for setup and
+`JOB_FAILURES` for post-processing can keep the Stage result non-zero. The
+post-processing observation uses one Case, because a failed append inside the
+summary lock leaves that lock held and a second Case would wait without a limit.
+That lock behavior is pre-existing.
+
+A scenario-local `sleep` control records every sleep argument, so the scenario
+proves that mesh and flow keep the 0.1-second post-cycle sleep, that setup,
+transport, and post-processing gain none, and that the fallback path uses
+0.5-second polling.
+
+Three copied deployment units carry compatible instrumentation. The first
+records shared-helper delegation and proves that setup uses the running-count
+and free-slot helpers while the other four also use the wait-for-all helper.
+That observation fails before the extraction, so it is the red evidence. The
+second overrides only `batch_stage_job_pool_wait_n_supported` to return
+non-zero, which forces the Bash 4.0 through 4.2 polling path and proves that the
+fallback branch calls no wait-status callback. The third changes only the exact
+Bash-version condition in the setup `wait_for_all_rows` function, which selects
+the direct-PID older-Bash branch and proves that the setup final drain stays
+caller-owned and unchanged.
 
 Section 23.P covers the Issue #47 summary append-failure contract for mesh,
 flow, and transport. Each Stage Runner has four controlled observations, and all
