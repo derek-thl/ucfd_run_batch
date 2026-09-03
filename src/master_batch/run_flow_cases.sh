@@ -176,19 +176,14 @@ show_progress() {
 }
 
 wait_for_free_slot() {
-    local max_jobs="$1"
-    local running
-    while true; do
-        running=$(jobs -rp | wc -l | tr -d ' ')
-        (( running < max_jobs )) && break
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-        sleep 0.1
-    done
+    batch_stage_job_pool_wait_for_slot "$1" show_progress : 0.1
+}
+
+# The final drain resets the progress throttle before each progress call.
+flow_drain_progress() {
+    _LAST_PROGRESS_TIME=0
+    show_progress
+    return 0
 }
 
 append_summary() {
@@ -735,18 +730,7 @@ main() {
     done < <(find_csv_files)
 
     # drain: wait for all background jobs to finish
-    local running
-    while true; do
-        running=$(jobs -rp | wc -l | tr -d ' ')
-        (( running == 0 )) && break
-        _LAST_PROGRESS_TIME=0
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_all flow_drain_progress : 0
 
     _LAST_PROGRESS_TIME=0
     show_progress

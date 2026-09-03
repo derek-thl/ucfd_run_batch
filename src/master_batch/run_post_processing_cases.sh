@@ -605,28 +605,19 @@ process_case() {
 # readable failure artifact must still make the stage non-zero.
 JOB_FAILURES=0
 
+# The caller owns the wait-status meaning. Post-processing counts each non-zero
+# wait once, in both the free-slot wait and the final drain.
+post_wait_status() {
+    (( $1 == 0 )) || JOB_FAILURES=$((JOB_FAILURES + 1))
+    return 0
+}
+
 wait_for_slot() {
-    while (($(jobs -rp | wc -l) >= PARALLEL_JOBS)); do
-        if ((BASH_VERSINFO[0] > 4 ||
-             (BASH_VERSINFO[0] == 4 &&
-              BASH_VERSINFO[1] >= 3))); then
-            wait -n || JOB_FAILURES=$((JOB_FAILURES + 1))
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_slot "$PARALLEL_JOBS" : post_wait_status 0
 }
 
 wait_for_all_jobs() {
-    while (($(jobs -rp | wc -l) > 0)); do
-        if ((BASH_VERSINFO[0] > 4 ||
-             (BASH_VERSINFO[0] == 4 &&
-              BASH_VERSINFO[1] >= 3))); then
-            wait -n || JOB_FAILURES=$((JOB_FAILURES + 1))
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_all : post_wait_status 0
 }
 
 # =============================================================================
