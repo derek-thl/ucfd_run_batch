@@ -290,19 +290,14 @@ show_progress() {
     info "Progress: launched=${STARTED_CASES}/${TOTAL_ROWS}, processed=${processed}/${TOTAL_ROWS}, running=${running}/${PARALLEL_JOBS}, created=${created}, skipped=${skipped}, failed=${failed}, dry_run=${dry_run}"
 }
 
+# The caller owns the wait-status meaning. Setup counts each non-zero wait once.
+setup_slot_wait_status() {
+    (( $1 == 0 )) || FAILED_ROW_JOBS=$(( FAILED_ROW_JOBS + 1 ))
+    return 0
+}
+
 wait_for_free_slot() {
-    local max_jobs="$1"
-    local running
-    while true; do
-        running=$(jobs -rp | wc -l | tr -d ' ')
-        (( running < max_jobs )) && break
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
-            wait -n || FAILED_ROW_JOBS=$(( FAILED_ROW_JOBS + 1 ))
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_slot "$1" show_progress setup_slot_wait_status 0
 }
 
 # =============================================================================

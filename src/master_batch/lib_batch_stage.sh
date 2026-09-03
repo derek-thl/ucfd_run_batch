@@ -88,3 +88,97 @@ batch_stage_csv_append_row() {
     local IFS=,
     printf '%s\n' "$*" >> "$__batch_stage_csv_append_row_target"
 }
+
+# batch_stage_job_pool_running_count
+#
+# The helper counts only active background processes and writes the decimal
+# count to standard output. The helper writes no diagnostic.
+batch_stage_job_pool_running_count() {
+    jobs -rp | wc -l | tr -d ' '
+}
+
+# batch_stage_job_pool_wait_n_supported
+#
+# The helper returns 0 only when this Bash supports `wait -n`. Bash 4.0 through
+# 4.2 therefore stays on the fallback path. The helper inspects only
+# BASH_VERSINFO and writes no output.
+batch_stage_job_pool_wait_n_supported() {
+    (( BASH_VERSINFO[0] > 4 ||
+       (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) ))
+}
+
+# batch_stage_job_pool_wait_for_slot <maximum-running> <before-wait-callback>
+#     <wait-status-callback> <post-cycle-seconds>
+#
+# The helper waits until fewer than <maximum-running> background processes are
+# active. Each callback is one command name that the helper invokes directly.
+# The helper never uses eval, a command string, or an environment override.
+#
+# The helper never launches a Case, never counts a child status, never owns a
+# caller counter, and never uses a wait status as its own return status. A
+# non-zero child status reaches the caller-owned wait-status callback before it
+# can affect the caller shell. The wait-status callback is not called on the
+# Bash 4.0 through 4.2 fallback path.
+#
+# Every local name uses the __batch_stage_job_pool_ prefix, because Bash
+# functions use dynamic scoping and a caller callback may use its own locals.
+batch_stage_job_pool_wait_for_slot() {
+    local __batch_stage_job_pool_maximum="$1"
+    local __batch_stage_job_pool_before="$2"
+    local __batch_stage_job_pool_status="$3"
+    local __batch_stage_job_pool_post_cycle_seconds="$4"
+    local __batch_stage_job_pool_wait_status
+
+    while true; do
+        if (( $(batch_stage_job_pool_running_count) < __batch_stage_job_pool_maximum )); then
+            return 0
+        fi
+
+        "$__batch_stage_job_pool_before"
+
+        if batch_stage_job_pool_wait_n_supported; then
+            __batch_stage_job_pool_wait_status=0
+            wait -n || __batch_stage_job_pool_wait_status=$?
+            "$__batch_stage_job_pool_status" "$__batch_stage_job_pool_wait_status"
+        else
+            sleep 0.5
+        fi
+
+        if [[ "$__batch_stage_job_pool_post_cycle_seconds" != "0" ]]; then
+            sleep "$__batch_stage_job_pool_post_cycle_seconds"
+        fi
+    done
+}
+
+# batch_stage_job_pool_wait_for_all <before-wait-callback> <wait-status-callback>
+#     <post-cycle-seconds>
+#
+# The helper waits until no active background process remains. The helper uses
+# `jobs -rp` and never `jobs -p`. Every other rule of
+# batch_stage_job_pool_wait_for_slot applies without change.
+batch_stage_job_pool_wait_for_all() {
+    local __batch_stage_job_pool_before="$1"
+    local __batch_stage_job_pool_status="$2"
+    local __batch_stage_job_pool_post_cycle_seconds="$3"
+    local __batch_stage_job_pool_wait_status
+
+    while true; do
+        if (( $(batch_stage_job_pool_running_count) == 0 )); then
+            return 0
+        fi
+
+        "$__batch_stage_job_pool_before"
+
+        if batch_stage_job_pool_wait_n_supported; then
+            __batch_stage_job_pool_wait_status=0
+            wait -n || __batch_stage_job_pool_wait_status=$?
+            "$__batch_stage_job_pool_status" "$__batch_stage_job_pool_wait_status"
+        else
+            sleep 0.5
+        fi
+
+        if [[ "$__batch_stage_job_pool_post_cycle_seconds" != "0" ]]; then
+            sleep "$__batch_stage_job_pool_post_cycle_seconds"
+        fi
+    done
+}

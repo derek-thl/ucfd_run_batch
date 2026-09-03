@@ -311,26 +311,17 @@ show_progress() {
 }
 
 wait_for_slot() {
-    while (( $(jobs -rp | wc -l | tr -d ' ') >= PARALLEL_JOBS )); do
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-        sleep 0.1
-    done
+    batch_stage_job_pool_wait_for_slot "$PARALLEL_JOBS" show_progress : 0.1
+}
+
+# The final drain keeps its forced progress call.
+mesh_drain_progress() {
+    show_progress 1
+    return 0
 }
 
 wait_all_cases() {
-    while (( $(jobs -rp | wc -l | tr -d ' ') > 0 )); do
-        show_progress 1
-        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_all mesh_drain_progress : 0
 }
 
 # =============================================================================

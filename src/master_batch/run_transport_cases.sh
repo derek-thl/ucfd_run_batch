@@ -572,26 +572,18 @@ job_status_failures() {
 }
 
 wait_for_free_slot() {
-    while (( $(jobs -rp | wc -l | tr -d ' ') >= PARALLEL_JOBS )); do
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_slot "$PARALLEL_JOBS" show_progress : 0
+}
+
+# The final drain resets the progress throttle before each progress call.
+transport_drain_progress() {
+    _LAST_PROGRESS_TIME=0
+    show_progress
+    return 0
 }
 
 wait_for_all_jobs() {
-    while (( $(jobs -rp | wc -l | tr -d ' ') > 0 )); do
-        _LAST_PROGRESS_TIME=0
-        show_progress
-        if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || true
-        else
-            sleep 0.5
-        fi
-    done
+    batch_stage_job_pool_wait_for_all transport_drain_progress : 0
 }
 
 # ---- Case logic --------------------------------------------------------------
