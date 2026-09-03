@@ -107,12 +107,21 @@ safe_path_token() {
     sanitize_token "$s"
 }
 
+# with_lock applies the Issue #47 append and lock-release status matrix. The
+# callback status has precedence, and exactly one release attempt runs. A
+# successful callback must not hide a non-zero release status, and a release
+# status must not replace a callback failure.
 with_lock() {
     local lock="$1"
     shift
+    local callback_status=0 release_status=0
+
     batch_stage_lock_acquire "$lock" 0.05
-    "$@"
-    batch_stage_lock_release "$lock"
+    "$@" || callback_status=$?
+    batch_stage_lock_release "$lock" || release_status=$?
+
+    (( callback_status == 0 )) || return "$callback_status"
+    return "$release_status"
 }
 
 append_summary_unlocked() {
@@ -140,6 +149,56 @@ append_fail_unlocked() { echo "$1" >> "$FAIL_FILE"; }
 mark_failed() { with_lock "${SUMMARY_CSV}.lockdir" append_fail_unlocked "$1"; }
 
 now_stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# ---- private Case completion accounting (Issue #47) -------------------------
+# The parent records one status for every launched Case process, so a failed
+# result append cannot hide a failed Case. The accounting directory lives
+# outside the Batch Workspace and never becomes a public artifact.
+JOB_STATUS_DIR=""
+
+job_status_cleanup() {
+    [[ -n "${JOB_STATUS_DIR:-}" ]] || return 0
+    [[ -d "$JOB_STATUS_DIR" ]] || return 0
+    rm -rf -- "$JOB_STATUS_DIR"
+    return 0
+}
+
+job_status_init() {
+    local parent parent_abs
+
+    parent="${TMPDIR:-/tmp}"
+    parent_abs="$(cd -- "$parent" 2>/dev/null && pwd -P)" ||
+        die "TMPDIR is not a usable directory for private Case accounting: $parent"
+
+    # The private accounting directory must stay outside the Batch Workspace, so
+    # that it never becomes a Batch Workspace artifact. An unusable location is
+    # an explicit failure, not a silent Batch Workspace write.
+    if [[ "$parent_abs" == "$OUT_ABS" || "$parent_abs" == "$OUT_ABS"/* ]]; then
+        die "TMPDIR must not be inside the Batch Workspace: $parent_abs"
+    fi
+
+    JOB_STATUS_DIR="$(mktemp -d "${parent_abs}/run_mesh_cases_status.XXXXXX")"
+    trap job_status_cleanup EXIT
+}
+
+# job_status_failures - launched Case processes without a valid zero record.
+job_status_failures() {
+    local ordinal record value failures=0
+
+    for (( ordinal = 1; ordinal <= STARTED_CASES; ordinal++ )); do
+        record="${JOB_STATUS_DIR}/${ordinal}"
+        if [[ ! -f "$record" ]]; then
+            failures=$(( failures + 1 ))
+            continue
+        fi
+        value="$(cat -- "$record" 2>/dev/null || true)"
+        if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value != 0 )); then
+            failures=$(( failures + 1 ))
+        fi
+    done
+
+    printf '%s' "$failures"
+}
 
 # =============================================================================
 # 2. PROGRESS / STATE HELPERS
@@ -584,11 +643,16 @@ mesh_one_case() {
         mesh_current_case
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "$CASE_STATUS" "$CASE_MESSAGE"
     ) > "$log_file" 2>&1 || {
+        local summary_status=0 fail_record_status=0
         set_case_stage "failed" "mesh job failed; see log: $log_file"
-        append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file"
-        mark_failed "$case_name"
+        append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file" ||
+            summary_status=$?
+        mark_failed "$case_name" || fail_record_status=$?
         info "MESH FAILED: $case_name | log: $log_file"
         clear_case_stage
+        # Neither attempt can stop this handler. The Case process result stays
+        # non-zero, and the parent accounting keeps the Stage non-zero.
+        : "$summary_status" "$fail_record_status"
         return 1
     }
 
@@ -641,7 +705,14 @@ dispatch_case_row() {
     # Important:
     # Redirect stdin from /dev/null so background OpenFOAM commands cannot
     # consume the CSV stream used by the parent while-read loop.
-    mesh_one_case "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" < /dev/null &
+    local job_ordinal="$STARTED_CASES"
+    (
+        job_status=0
+        mesh_one_case "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" < /dev/null ||
+            job_status=$?
+        printf '%s\n' "$job_status" > "${JOB_STATUS_DIR}/${job_ordinal}" || exit 91
+        exit "$job_status"
+    ) &
 
     show_progress
 }
@@ -692,6 +763,7 @@ count_total_cases() {
 main() {
     validate_config
     count_total_cases
+    job_status_init
 
     info "Output folder   : $OUT_ABS"
     info "Summary CSV     : $SUMMARY_CSV"
@@ -713,7 +785,9 @@ main() {
     wait_all_cases
     show_progress 1
 
-    if [[ -s "$FAIL_FILE" ]]; then
+    local job_failures
+    job_failures="$(job_status_failures)"
+    if [[ -s "$FAIL_FILE" ]] || (( job_failures > 0 )); then
         die "One or more mesh jobs failed. See $SUMMARY_CSV and $LOG_DIR"
     fi
 

@@ -211,10 +211,19 @@ append_summary() {
     batch_stage_csv_quote f_status "$status"
     batch_stage_csv_quote f_msg "$msg"
 
+    local append_status=0 release_status=0
+
     batch_stage_csv_append_row "$SUMMARY_CSV" \
         "$f_csv_file" "$f_row_no" "$f_case_id" "$f_case_name" "$f_case_dir" \
-        "$f_status" "$f_msg"
-    batch_stage_lock_release "$lock"
+        "$f_status" "$f_msg" || append_status=$?
+
+    batch_stage_lock_release "$lock" || release_status=$?
+
+    # The Issue #47 status matrix. The append status has precedence, and
+    # exactly one release attempt runs. A successful append must not hide a
+    # non-zero release status.
+    (( append_status == 0 )) || return "$append_status"
+    return "$release_status"
 }
 
 # mark_failed returns the failure-artifact append status. The lock release
@@ -511,11 +520,62 @@ show_progress() {
 FAIL_RECORD_ERRORS=0
 JOB_FAILURES=0
 
+# ---- private Case completion accounting (Issue #47) -------------------------
+# JOB_FAILURES keeps its current purpose. The private records supplement it, so
+# a Case process that finishes before a slot wait or the final drain cannot
+# escape the accounting. The accounting directory lives outside the Batch
+# Workspace and never becomes a public artifact.
+JOB_STATUS_DIR=""
+
+job_status_cleanup() {
+    [[ -n "${JOB_STATUS_DIR:-}" ]] || return 0
+    [[ -d "$JOB_STATUS_DIR" ]] || return 0
+    rm -rf -- "$JOB_STATUS_DIR"
+    return 0
+}
+
+job_status_init() {
+    local parent parent_abs
+
+    parent="${TMPDIR:-/tmp}"
+    parent_abs="$(cd -- "$parent" 2>/dev/null && pwd -P)" ||
+        die "TMPDIR is not a usable directory for private Case accounting: $parent"
+
+    # The private accounting directory must stay outside the Batch Workspace, so
+    # that it never becomes a Batch Workspace artifact. An unusable location is
+    # an explicit failure, not a silent Batch Workspace write.
+    if [[ "$parent_abs" == "$OUT_ABS" || "$parent_abs" == "$OUT_ABS"/* ]]; then
+        die "TMPDIR must not be inside the Batch Workspace: $parent_abs"
+    fi
+
+    JOB_STATUS_DIR="$(mktemp -d "${parent_abs}/run_transport_cases_status.XXXXXX")"
+    trap job_status_cleanup EXIT
+}
+
+# job_status_failures - launched Case processes without a valid zero record.
+job_status_failures() {
+    local ordinal record value failures=0
+
+    for (( ordinal = 1; ordinal <= STARTED_CASES; ordinal++ )); do
+        record="${JOB_STATUS_DIR}/${ordinal}"
+        if [[ ! -f "$record" ]]; then
+            failures=$(( failures + 1 ))
+            continue
+        fi
+        value="$(cat -- "$record" 2>/dev/null || true)"
+        if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value != 0 )); then
+            failures=$(( failures + 1 ))
+        fi
+    done
+
+    printf '%s' "$failures"
+}
+
 wait_for_free_slot() {
     while (( $(jobs -rp | wc -l | tr -d ' ') >= PARALLEL_JOBS )); do
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
+            wait -n || true
         else
             sleep 0.5
         fi
@@ -527,7 +587,7 @@ wait_for_all_jobs() {
         _LAST_PROGRESS_TIME=0
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
+            wait -n || true
         else
             sleep 0.5
         fi
@@ -792,9 +852,14 @@ run_one_case() {
     ); then
         return 0
     else
-        append_summary "$csv_abs" "$row_no" "$case_id" "${flow_name}|${transport_name}" "$transport_dir" "failed" "see log: $log_file"
-        mark_failed "$transport_name"
+        local summary_status=0 fail_record_status=0
+        append_summary "$csv_abs" "$row_no" "$case_id" "${flow_name}|${transport_name}" "$transport_dir" "failed" "see log: $log_file" ||
+            summary_status=$?
+        mark_failed "$transport_name" || fail_record_status=$?
         info "TRANSPORT FAILED: $transport_name | log=$log_file"
+        # Neither attempt can stop this handler. The Case process result stays
+        # non-zero, and the parent accounting keeps the Stage non-zero.
+        : "$summary_status" "$fail_record_status"
         return 1
     fi
 }
@@ -847,7 +912,14 @@ dispatch_row() {
     wait_for_free_slot
     STARTED_CASES=$((STARTED_CASES + 1))
     info "TRANSPORT RUNNING [$STARTED_CASES/$TOTAL_CASES]: $transport_name | flow=$flow_name | log=$LOG_DIR/$(safe_path_token "$transport_name").log"
-    run_one_case "$csv_abs" "$row_no" "$case_root" "$flow_name" "$flow_dir" "$transport_name" "$transport_dir" < /dev/null &
+    local job_ordinal="$STARTED_CASES"
+    (
+        job_status=0
+        run_one_case "$csv_abs" "$row_no" "$case_root" "$flow_name" "$flow_dir" "$transport_name" "$transport_dir" < /dev/null ||
+            job_status=$?
+        printf '%s\n' "$job_status" > "${JOB_STATUS_DIR}/${job_ordinal}" || exit 91
+        exit "$job_status"
+    ) &
     show_progress
 }
 
@@ -890,6 +962,7 @@ count_total_cases() {
 main() {
     validate_config
     count_total_cases
+    job_status_init
 
     info "Output folder         : $OUT_ABS"
     [[ -n "$BASE_TRANSPORT_ABS" ]] && info "Base transport dir    : $BASE_TRANSPORT_ABS"
@@ -922,6 +995,12 @@ main() {
     # write error must also make the stage non-zero.
     local failed_rows
     failed_rows="$(count_status '^failed$')"
+
+    # JOB_FAILURES keeps its purpose: the number of failed Case jobs. The value
+    # now comes from the private completion records, so a Case process that
+    # finishes before a slot wait or the final drain cannot escape it.
+    JOB_FAILURES="$(job_status_failures)"
+
     if [[ -s "$FAIL_FILE" ]] || (( failed_rows > 0 )) ||
        (( JOB_FAILURES > 0 )) || (( FAIL_RECORD_ERRORS > 0 )); then
         die "One or more transport jobs failed. See $SUMMARY_CSV and $LOG_DIR"

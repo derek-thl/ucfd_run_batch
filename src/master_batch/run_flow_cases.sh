@@ -206,11 +206,69 @@ append_summary() {
     batch_stage_csv_quote f_status "$status"
     batch_stage_csv_quote f_msg "$msg"
 
+    local append_status=0 release_status=0
+
     batch_stage_csv_append_row "$SUMMARY_CSV" \
         "$f_csv_file" "$f_row_no" "$f_case_id" "$f_case_name" "$f_case_dir" \
-        "$f_status" "$f_msg"
+        "$f_status" "$f_msg" || append_status=$?
 
-    batch_stage_lock_release "$lock"
+    batch_stage_lock_release "$lock" || release_status=$?
+
+    # The Issue #47 status matrix. The append status has precedence, and
+    # exactly one release attempt runs. A successful append must not hide a
+    # non-zero release status.
+    (( append_status == 0 )) || return "$append_status"
+    return "$release_status"
+}
+
+# ---- private Case completion accounting (Issue #47) -------------------------
+# The parent records one status for every launched Case process, so a failed
+# result append cannot hide a failed Case. The accounting directory lives
+# outside the Batch Workspace and never becomes a public artifact.
+JOB_STATUS_DIR=""
+
+job_status_cleanup() {
+    [[ -n "${JOB_STATUS_DIR:-}" ]] || return 0
+    [[ -d "$JOB_STATUS_DIR" ]] || return 0
+    rm -rf -- "$JOB_STATUS_DIR"
+    return 0
+}
+
+job_status_init() {
+    local parent parent_abs
+
+    parent="${TMPDIR:-/tmp}"
+    parent_abs="$(cd -- "$parent" 2>/dev/null && pwd -P)" ||
+        die "TMPDIR is not a usable directory for private Case accounting: $parent"
+
+    # The private accounting directory must stay outside the Batch Workspace, so
+    # that it never becomes a Batch Workspace artifact. An unusable location is
+    # an explicit failure, not a silent Batch Workspace write.
+    if [[ "$parent_abs" == "$OUT_ABS" || "$parent_abs" == "$OUT_ABS"/* ]]; then
+        die "TMPDIR must not be inside the Batch Workspace: $parent_abs"
+    fi
+
+    JOB_STATUS_DIR="$(mktemp -d "${parent_abs}/run_flow_cases_status.XXXXXX")"
+    trap job_status_cleanup EXIT
+}
+
+# job_status_failures - launched Case processes without a valid zero record.
+job_status_failures() {
+    local ordinal record value failures=0
+
+    for (( ordinal = 1; ordinal <= STARTED_CASES; ordinal++ )); do
+        record="${JOB_STATUS_DIR}/${ordinal}"
+        if [[ ! -f "$record" ]]; then
+            failures=$(( failures + 1 ))
+            continue
+        fi
+        value="$(cat -- "$record" 2>/dev/null || true)"
+        if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value != 0 )); then
+            failures=$(( failures + 1 ))
+        fi
+    done
+
+    printf '%s' "$failures"
 }
 
 # =============================================================================
@@ -535,14 +593,21 @@ solve_one_case() {
 
         append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "$CASE_STATUS" "$CASE_MESSAGE"
     ) > "$log_file" 2>&1 || {
-        append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file"
+        local summary_status=0 fail_record_status=0 fail_release_status=0
+        append_summary "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" "failed" "see log: $log_file" ||
+            summary_status=$?
 
         local lock="${SUMMARY_CSV}.lockdir"
         batch_stage_lock_acquire "$lock" 0.05
-        echo "$case_name" >> "$FAIL_FILE"
-        batch_stage_lock_release "$lock"
+        if ! echo "$case_name" >> "$FAIL_FILE"; then
+            fail_record_status=1
+        fi
+        batch_stage_lock_release "$lock" || fail_release_status=$?
 
         info "Case failed: $case_name"
+        # Neither attempt can stop this handler. The Case process result stays
+        # non-zero, and the parent accounting keeps the Stage non-zero.
+        : "$summary_status" "$fail_record_status" "$fail_release_status"
         return 1
     }
 }
@@ -585,7 +650,14 @@ dispatch_case_row() {
     # Important:
     # Prevent OpenFOAM/MPI commands in the background from consuming
     # the parent while-read CSV stream.
-    solve_one_case "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" < /dev/null &
+    local job_ordinal="$STARTED_CASES"
+    (
+        job_status=0
+        solve_one_case "$csv_abs" "$row_no" "$case_id" "$case_name" "$case_dir" < /dev/null ||
+            job_status=$?
+        printf '%s\n' "$job_status" > "${JOB_STATUS_DIR}/${job_ordinal}" || exit 91
+        exit "$job_status"
+    ) &
 
     show_progress
 }
@@ -647,6 +719,7 @@ count_total_cases() {
 main() {
     validate_global_config
     count_total_cases
+    job_status_init
 
     info "Output folder      : $OUT_ABS"
     info "Summary CSV        : $SUMMARY_CSV"
@@ -678,7 +751,9 @@ main() {
     _LAST_PROGRESS_TIME=0
     show_progress
 
-    if [[ -s "$FAIL_FILE" ]]; then
+    local job_failures
+    job_failures="$(job_status_failures)"
+    if [[ -s "$FAIL_FILE" ]] || (( job_failures > 0 )); then
         die "One or more flow jobs failed. See $SUMMARY_CSV and $LOG_DIR"
     fi
 

@@ -137,9 +137,9 @@ endless stream and the Stage Runner never completed.
   row, `All transport jobs finished.`, and the transport marker.
 - The failed `/dev/full` observation proves a non-zero status, the exact failed
   summary row, the `write error: No space left on device` diagnostic, the lock
-  release, and no transport marker. The observation also keeps the current
-  absence of the per-Case `TRANSPORT FAILED:` line, because the failed append
-  status ends the Case job before that line.
+  release, and no transport marker. The observation also keeps the per-Case
+  `TRANSPORT FAILED:` line, because Issue #47 requires that line even when the
+  Failure Artifact append fails.
 - The readable regular Failure Artifact observation keeps the current progress
   behavior. Two Cases fail, so the progress line must report `failed=2`. The
   observation holds the exact progress line, so the field set, the field order,
@@ -150,6 +150,37 @@ Each observation rejects status `124`, because the 120-second `STAGE_TIMEOUT` is
 only a test safety limit and never an accepted Stage result. Each `/dev/full`
 observation verifies the exact seven-column header, exactly one data row, and
 every field value of that row.
+
+Section 23.P covers the Issue #47 summary append-failure contract for mesh,
+flow, and transport. Each Stage Runner has four controlled observations, and all
+of them use a direct Stage Runner CLI or the Orchestrator CLI.
+
+- The append-failure control wraps the last required Case command, `checkMesh`
+  for mesh and `reconstructPar` for flow and transport. After that command and
+  before the Case result append, the control moves the initialized summary to an
+  evidence path and links the original summary path to `/proc/version`.
+  `/proc/version` is readable and finite, it reports file size zero, and it
+  rejects an append, so the append fails promptly and no later summary reader
+  hangs or fails. The scenario proves those four properties before it uses the
+  target. A directory gives different `awk` results on different hosts, and
+  `/dev/full` can feed an endless stream to a later reader, so neither is used.
+- The dual-failure control also replaces the Failure Artifact. Neither the
+  summary nor the Failure Artifact can then record the failure, so only the
+  private Case completion record keeps the Stage result non-zero. Each of those
+  runs uses a test-local `TMPDIR`, and the scenario proves that the private
+  accounting directory is removed after Stage exit.
+- The lock-release regression prepends a test-local `rmdir` wrapper. The wrapper
+  delegates the exact summary lock removal to the real `rmdir`, proves the
+  removal, and then returns status `23`. That gives append status `0` with a
+  non-zero release status, so the scenario proves that a successful append never
+  hides a release failure. This regression passes before and after the Issue #47
+  correction.
+- The uncontrolled observations keep the exact successful summary bytes, the
+  success message, the absent Failure Artifact, and the Case artifacts.
+
+Every control uses a create-once marker, stays inside the isolated test
+workspace, restores the earlier `PATH`, and runs under a finite timeout with
+`LC_ALL=C`.
 
 Section 23.W proves that the I-G2 result-recording extraction keeps every public
 result-recording behavior. The scenario runs all five Stage Runners through

@@ -634,10 +634,10 @@ assert_exact_summary "${workspace}/run_transport_cases_summary.csv" \
     "transport /dev/full failed" "$expected_row"
 assert_contains "$out" "write error: No space left on device" \
     "the failed /dev/full run keeps the Failure Artifact write error"
-# The failed append status ends the Case job before the per-Case line. This
-# scenario keeps that current behavior.
-assert_not_contains "$out" "TRANSPORT FAILED:" \
-    "the failed /dev/full run keeps the current absence of the per-Case line"
+# Issue #47 requires the per-Case failure line even when the Failure Artifact
+# append fails, so the line is now present.
+assert_contains "$out" "TRANSPORT FAILED:" \
+    "the failed /dev/full run keeps the per-Case failure line"
 assert_contains "$out" "One or more transport jobs failed." \
     "the failed /dev/full run reports Stage failure"
 assert_not_contains "$out" "All transport jobs finished." \
