@@ -598,6 +598,16 @@ assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "setup on Bash 4.3 or later"
 HELPER_RECORD_DIR="${CONTROL_ROOT}/helpers"
 mkdir -p "$HELPER_RECORD_DIR"
 
+# make_plain_unit <master_dir> - a copied deployment unit with no instrumentation.
+make_plain_unit() {
+    local master="$1" name
+    mkdir -p "$master"
+    for name in lib_batch_stage.sh setup_cases.sh run_mesh_cases.sh \
+            run_flow_cases.sh run_transport_cases.sh run_post_processing_cases.sh; do
+        cp -f -- "${MASTER_SRC_DIR}/${name}" "${master}/${name}"
+    done
+}
+
 # make_instrumented_unit <master_dir>
 make_instrumented_unit() {
     local master="$1" name
@@ -1257,3 +1267,70 @@ assert_ne 0 "$(grep -c '^wait_for_slot$' "$HELPER_RECORD" || true)" \
     "the copied setup Stage Runner still uses the shared free-slot helper"
 assert_eq 0 "$(grep -c '^wait_for_all$' "$HELPER_RECORD" || true)" \
     "the setup final drain never uses the shared wait-for-all helper"
+
+# ---- the production fallback path, without instrumentation ----------------
+#
+# This copied deployment unit carries no instrumentation. Only
+# batch_stage_job_pool_wait_n_supported is overridden, so the production wait
+# helpers take the Bash 4.0 through 4.2 branch. The scenario-local sleep
+# control then records the production 0.5-second poll.
+
+new_pool_workspace fallback_production
+make_setup_bases "$workspace"
+for index in 0 1; do
+    make_flow_case "${workspace}/case_${index}/flow" 2
+    make_flow_mesh "${workspace}/case_${index}/flow"
+    printf 'FoamFile { object wallDistance; }\n' \
+        > "${workspace}/case_${index}/flow/0/wallDistance"
+    make_flow_result "${workspace}/case_${index}/flow" 3000
+    make_transport_case "${workspace}/case_${index}/trd" 2 T 300
+done
+make_csv "${workspace}/output_batch_1.csv" 0 1
+production_master="${workspace}/master_batch"
+make_plain_unit "$production_master"
+cat >> "${production_master}/lib_batch_stage.sh" <<'OVERRIDE'
+
+# Branch control. Only the support test changes, so every production scheduling
+# loop takes the Bash 4.0 through 4.2 fallback path.
+batch_stage_job_pool_wait_n_supported() {
+    return 1
+}
+OVERRIDE
+
+production_bin="${workspace}/_control_bin"
+mkdir -p "$production_bin"
+make_setup_side_commands "$production_bin"
+printf '#!/usr/bin/env bash\necho "Set centre of rotation to (100 200 0)"\nexit 0\n' \
+    > "${production_bin}/surfaceTransformPoints"
+chmod +x "${production_bin}/surfaceTransformPoints"
+
+# run_production_fallback <stage> <script> <args...>
+run_production_fallback() {
+    local stage="$1"
+    shift
+    SLEEP_RECORD="${SLEEP_CONTROL_DIR}/production_${stage}.log"
+    : > "$SLEEP_RECORD"
+    ( cd "$workspace" && X_SLEEP_RECORD="$SLEEP_RECORD" LC_ALL=C \
+        timeout "$STAGE_TIMEOUT" bash "$@" ) >/dev/null 2>&1 && status=0 || status=$?
+}
+
+pool_saved_path="$PATH"
+PATH="${production_bin}:${SLEEP_CONTROL_DIR}/bin:${PATH}"
+for spec in "setup:setup_cases.sh" "mesh:run_mesh_cases.sh" "flow:run_flow_cases.sh" \
+            "post:run_post_processing_cases.sh"; do
+    stage="${spec%%:*}"
+    runner="${spec##*:}"
+    run_production_fallback "$stage" "${production_master}/${runner}" \
+        -i output_batch_1.csv -O . -j 1
+    assert_ne 124 "$status" \
+        "the production fallback ${stage} run completes without an external kill"
+    assert_status 0 "$status" "the production fallback ${stage} run keeps exit status 0"
+    assert_sleep_argument "$SLEEP_RECORD" 0.5 present "production fallback ${stage}"
+done
+run_production_fallback transport "${production_master}/run_transport_cases.sh" \
+    -i output_batch_1.csv -O . -j 1 --save-times 300
+assert_ne 124 "$status" \
+    "the production fallback transport run completes without an external kill"
+assert_status 0 "$status" "the production fallback transport run keeps exit status 0"
+assert_sleep_argument "$SLEEP_RECORD" 0.5 present "production fallback transport"
+PATH="$pool_saved_path"
