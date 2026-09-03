@@ -673,7 +673,7 @@ make_mesh_fixture release_mesh
 make_lock_release_control "$workspace" "${workspace}/run_mesh_cases_summary.csv.lockdir"
 release_saved_path="$PATH"
 PATH="${release_control_bin}:${PATH}"
-out="$(cd "$workspace" && timeout 120 bash "$MESH_SCRIPT" \
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$MESH_SCRIPT" \
         -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
 PATH="$release_saved_path"
 
@@ -703,7 +703,7 @@ make_flow_fixture release_flow yes
 make_lock_release_control "$workspace" "${workspace}/run_flow_cases_summary.csv.lockdir"
 release_saved_path="$PATH"
 PATH="${release_control_bin}:${PATH}"
-out="$(cd "$workspace" && timeout 120 bash "$FLOW_SCRIPT" \
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$FLOW_SCRIPT" \
         -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?
 PATH="$release_saved_path"
 
@@ -745,7 +745,7 @@ make_transport_success_fixture release_transport
 make_lock_release_control "$workspace" "${workspace}/run_transport_cases_summary.csv.lockdir"
 release_saved_path="$PATH"
 PATH="${release_control_bin}:${PATH}"
-out="$(cd "$workspace" && timeout 120 bash "$TRANSPORT_SCRIPT" \
+out="$(cd "$workspace" && LC_ALL=C timeout 120 bash "$TRANSPORT_SCRIPT" \
         -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" && status=0 || status=$?
 PATH="$release_saved_path"
 
@@ -1062,7 +1062,7 @@ assert_private_accounting_removed() {
 
 # ---- mesh dual failure ----
 make_mesh_fixture dual_mesh
-dual_tmpdir="${workspace}/_tmp"
+dual_tmpdir="${workspace}_tmp"
 mkdir -p "$dual_tmpdir"
 make_append_failure_control "$workspace" checkMesh \
     "${workspace}/run_mesh_cases_summary.csv" "${workspace}/.run_mesh_cases_failed"
@@ -1103,7 +1103,7 @@ assert_private_accounting_removed "$dual_tmpdir" "mesh"
 
 # ---- flow dual failure ----
 make_flow_fixture dual_flow yes
-dual_tmpdir="${workspace}/_tmp"
+dual_tmpdir="${workspace}_tmp"
 mkdir -p "$dual_tmpdir"
 make_append_failure_control "$workspace" reconstructPar \
     "${workspace}/run_flow_cases_summary.csv" "${workspace}/.run_flow_cases_failed"
@@ -1144,7 +1144,7 @@ assert_private_accounting_removed "$dual_tmpdir" "flow"
 
 # ---- transport dual failure ----
 make_transport_success_fixture dual_transport
-dual_tmpdir="${workspace}/_tmp"
+dual_tmpdir="${workspace}_tmp"
 mkdir -p "$dual_tmpdir"
 make_append_failure_control "$workspace" reconstructPar \
     "${workspace}/run_transport_cases_summary.csv" \
@@ -1193,7 +1193,7 @@ assert_private_accounting_removed "$dual_tmpdir" "transport"
 
 # ---- mesh success ----
 make_mesh_fixture success_mesh
-success_tmpdir="${workspace}/_tmp"
+success_tmpdir="${workspace}_tmp"
 mkdir -p "$success_tmpdir"
 out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
         bash "$MESH_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
@@ -1215,7 +1215,7 @@ assert_private_accounting_removed "$success_tmpdir" "uncontrolled mesh"
 
 # ---- flow success ----
 make_flow_fixture success_flow yes
-success_tmpdir="${workspace}/_tmp"
+success_tmpdir="${workspace}_tmp"
 mkdir -p "$success_tmpdir"
 out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
         bash "$FLOW_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
@@ -1237,7 +1237,7 @@ assert_private_accounting_removed "$success_tmpdir" "uncontrolled flow"
 
 # ---- transport success ----
 make_transport_success_fixture success_transport
-success_tmpdir="${workspace}/_tmp"
+success_tmpdir="${workspace}_tmp"
 mkdir -p "$success_tmpdir"
 out="$(cd "$workspace" && LC_ALL=C TMPDIR="$success_tmpdir" timeout 120 \
         bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" \
@@ -1256,3 +1256,54 @@ assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
 assert_file_exists "${workspace}/case_0/trd/transport.marker" \
     "the uncontrolled transport run keeps its Case artifacts"
 assert_private_accounting_removed "$success_tmpdir" "uncontrolled transport"
+
+# ---- private accounting never enters the Batch Workspace (Issue #47) -------
+#
+# The private accounting directory must stay outside the Batch Workspace. A
+# TMPDIR at or below the Batch Workspace is an explicit failure, not a silent
+# Batch Workspace write.
+
+# assert_no_private_accounting <workspace> <label>
+assert_no_private_accounting() {
+    assert_eq "" \
+        "$(find "$1" -name 'run_*_cases_status.*' | sort | tr '\n' ' ')" \
+        "${2}: no private accounting directory is created in the Batch Workspace"
+}
+
+make_mesh_fixture inside_tmpdir_mesh
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$workspace" timeout 120 \
+        bash "$MESH_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+
+assert_failure "$status" "a TMPDIR inside the Batch Workspace fails the mesh Stage"
+assert_contains "$out" "TMPDIR must not be inside the Batch Workspace" \
+    "the mesh Stage names the rejected private accounting location"
+assert_not_contains "$out" "All mesh jobs finished." \
+    "the mesh Stage does not report success after the rejection"
+assert_no_private_accounting "$workspace" "mesh"
+
+make_flow_fixture inside_tmpdir_flow yes
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="${workspace}/case_0" timeout 120 \
+        bash "$FLOW_SCRIPT" -i output_batch_1.csv -O . -j 1 2>&1)" \
+    && status=0 || status=$?
+
+assert_failure "$status" \
+    "a TMPDIR below the Batch Workspace fails the flow Stage"
+assert_contains "$out" "TMPDIR must not be inside the Batch Workspace" \
+    "the flow Stage names the rejected private accounting location"
+assert_not_contains "$out" "All flow jobs finished." \
+    "the flow Stage does not report success after the rejection"
+assert_no_private_accounting "$workspace" "flow"
+
+make_transport_success_fixture inside_tmpdir_transport
+out="$(cd "$workspace" && LC_ALL=C TMPDIR="$workspace" timeout 120 \
+        bash "$TRANSPORT_SCRIPT" -i output_batch_1.csv -O . -j 1 --save-times 300 2>&1)" \
+    && status=0 || status=$?
+
+assert_failure "$status" \
+    "a TMPDIR inside the Batch Workspace fails the transport Stage"
+assert_contains "$out" "TMPDIR must not be inside the Batch Workspace" \
+    "the transport Stage names the rejected private accounting location"
+assert_not_contains "$out" "All transport jobs finished." \
+    "the transport Stage does not report success after the rejection"
+assert_no_private_accounting "$workspace" "transport"

@@ -535,7 +535,20 @@ job_status_cleanup() {
 }
 
 job_status_init() {
-    JOB_STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run_transport_cases_status.XXXXXX")"
+    local parent parent_abs
+
+    parent="${TMPDIR:-/tmp}"
+    parent_abs="$(cd -- "$parent" 2>/dev/null && pwd -P)" ||
+        die "TMPDIR is not a usable directory for private Case accounting: $parent"
+
+    # The private accounting directory must stay outside the Batch Workspace, so
+    # that it never becomes a Batch Workspace artifact. An unusable location is
+    # an explicit failure, not a silent Batch Workspace write.
+    if [[ "$parent_abs" == "$OUT_ABS" || "$parent_abs" == "$OUT_ABS"/* ]]; then
+        die "TMPDIR must not be inside the Batch Workspace: $parent_abs"
+    fi
+
+    JOB_STATUS_DIR="$(mktemp -d "${parent_abs}/run_transport_cases_status.XXXXXX")"
     trap job_status_cleanup EXIT
 }
 
@@ -562,7 +575,7 @@ wait_for_free_slot() {
     while (( $(jobs -rp | wc -l | tr -d ' ') >= PARALLEL_JOBS )); do
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
+            wait -n || true
         else
             sleep 0.5
         fi
@@ -574,7 +587,7 @@ wait_for_all_jobs() {
         _LAST_PROGRESS_TIME=0
         show_progress
         if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
-            wait -n || JOB_FAILURES=$(( JOB_FAILURES + 1 ))
+            wait -n || true
         else
             sleep 0.5
         fi
@@ -980,12 +993,16 @@ main() {
     # The final gate must not trust the failure artifact alone. A failed
     # summary row, a discarded non-zero child exit, or a failure-artifact
     # write error must also make the stage non-zero.
-    local failed_rows job_failures
+    local failed_rows
     failed_rows="$(count_status '^failed$')"
-    job_failures="$(job_status_failures)"
+
+    # JOB_FAILURES keeps its purpose: the number of failed Case jobs. The value
+    # now comes from the private completion records, so a Case process that
+    # finishes before a slot wait or the final drain cannot escape it.
+    JOB_FAILURES="$(job_status_failures)"
+
     if [[ -s "$FAIL_FILE" ]] || (( failed_rows > 0 )) ||
-       (( JOB_FAILURES > 0 )) || (( FAIL_RECORD_ERRORS > 0 )) ||
-       (( job_failures > 0 )); then
+       (( JOB_FAILURES > 0 )) || (( FAIL_RECORD_ERRORS > 0 )); then
         die "One or more transport jobs failed. See $SUMMARY_CSV and $LOG_DIR"
     fi
     rm -f "$FAIL_FILE"

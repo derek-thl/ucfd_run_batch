@@ -137,9 +137,9 @@ endless stream and the Stage Runner never completed.
   row, `All transport jobs finished.`, and the transport marker.
 - The failed `/dev/full` observation proves a non-zero status, the exact failed
   summary row, the `write error: No space left on device` diagnostic, the lock
-  release, and no transport marker. The observation also keeps the current
-  absence of the per-Case `TRANSPORT FAILED:` line, because the failed append
-  status ends the Case job before that line.
+  release, and no transport marker. The observation also keeps the per-Case
+  `TRANSPORT FAILED:` line, because Issue #47 requires that line even when the
+  Failure Artifact append fails.
 - The readable regular Failure Artifact observation keeps the current progress
   behavior. Two Cases fail, so the progress line must report `failed=2`. The
   observation holds the exact progress line, so the field set, the field order,

@@ -235,7 +235,20 @@ job_status_cleanup() {
 }
 
 job_status_init() {
-    JOB_STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/run_flow_cases_status.XXXXXX")"
+    local parent parent_abs
+
+    parent="${TMPDIR:-/tmp}"
+    parent_abs="$(cd -- "$parent" 2>/dev/null && pwd -P)" ||
+        die "TMPDIR is not a usable directory for private Case accounting: $parent"
+
+    # The private accounting directory must stay outside the Batch Workspace, so
+    # that it never becomes a Batch Workspace artifact. An unusable location is
+    # an explicit failure, not a silent Batch Workspace write.
+    if [[ "$parent_abs" == "$OUT_ABS" || "$parent_abs" == "$OUT_ABS"/* ]]; then
+        die "TMPDIR must not be inside the Batch Workspace: $parent_abs"
+    fi
+
+    JOB_STATUS_DIR="$(mktemp -d "${parent_abs}/run_flow_cases_status.XXXXXX")"
     trap job_status_cleanup EXIT
 }
 
