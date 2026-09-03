@@ -354,7 +354,7 @@ assert_sleep_argument "$SLEEP_RECORD" 0.1 present "mesh free-slot"
 assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "mesh on Bash 4.3 or later"
 # The mesh final drain forces progress on every cycle, so more than one
 # progress line appears inside the throttle window.
-assert_ne 1 "$(grep -c 'Mesh progress:' <<< "$out")" \
+assert_eq 1 "$(( $(grep -c 'Mesh progress:' <<< "$out") >= 2 ? 1 : 0 ))" \
     "the mesh final drain keeps its forced progress call"
 
 # ---- flow: the job pool keeps the exact limit and completes every Case ------
@@ -412,7 +412,7 @@ assert_eq "" "$(find "$workspace" -name 'run_*_cases_status.*' | sort | tr '\n' 
 assert_sleep_argument "$SLEEP_RECORD" 0.1 present "flow free-slot"
 assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "flow on Bash 4.3 or later"
 # The flow final drain resets the progress throttle before each callback.
-assert_ne 1 "$(grep -c 'Progress: launched=' <<< "$out")" \
+assert_eq 1 "$(( $(grep -c 'Progress: launched=' <<< "$out") >= 2 ? 1 : 0 ))" \
     "the flow final drain resets the progress throttle"
 
 # ---- transport: the job pool keeps the exact limit -------------------------
@@ -471,7 +471,7 @@ assert_eq "" "$(find "$workspace" -name 'run_*_cases_status.*' | sort | tr '\n' 
 assert_sleep_argument "$SLEEP_RECORD" 0.1 absent "transport"
 assert_sleep_argument "$SLEEP_RECORD" 0.5 absent "transport on Bash 4.3 or later"
 # The transport final drain resets the progress throttle before each callback.
-assert_ne 1 "$(grep -c 'Transport progress:' <<< "$out")" \
+assert_eq 1 "$(( $(grep -c 'Transport progress:' <<< "$out") >= 2 ? 1 : 0 ))" \
     "the transport final drain resets the progress throttle"
 
 # ---- post-processing: the job pool keeps the exact limit -------------------
