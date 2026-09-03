@@ -686,6 +686,13 @@ assert_contains "$out" "One or more mesh jobs failed." \
     "the mesh Stage keeps its existing failure message"
 assert_eq 1 "$(summary_status_count "${workspace}/run_mesh_cases_summary.csv" meshed)" \
     "the successful mesh summary row stays present"
+assert_file_bytes_exact "${workspace}/run_mesh_cases_summary.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"meshed\",\"OK\""$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"failed\",\"see log: ${workspace}/_mesh_logs/case_0_flow.log\""$'\n' \
+    "the mesh lock-release summary keeps the successful row and the fallback failed row"
+assert_file_bytes_exact "${workspace}/.run_mesh_cases_failed" "case_0/flow"$'\n' \
+    "the mesh lock-release Failure Artifact"
+assert_eq 1 "$(fake_call_count checkMesh)" \
+    "the mesh lock-release Case work runs checkMesh exactly once"
 assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
     "the mesh lock-release run leaves no lock directory"
 assert_file_exists "${workspace}/case_0/flow/restart.marker" \
@@ -709,6 +716,13 @@ assert_contains "$out" "One or more flow jobs failed." \
     "the flow Stage keeps its existing failure message"
 assert_eq 1 "$(summary_status_count "${workspace}/run_flow_cases_summary.csv" solved)" \
     "the successful flow summary row stays present"
+assert_file_bytes_exact "${workspace}/run_flow_cases_summary.csv" \
+    "csv_file,row_number,case_id,case_name,case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"solved\",\"OK\""$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow\",\"${workspace}/case_0/flow\",\"failed\",\"see log: ${workspace}/_flow_logs/case_0_flow.log\""$'\n' \
+    "the flow lock-release summary keeps the successful row and the fallback failed row"
+assert_file_bytes_exact "${workspace}/.run_flow_cases_failed" "case_0/flow"$'\n' \
+    "the flow lock-release Failure Artifact"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the flow lock-release Case work runs reconstructPar exactly once"
 assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
     "the flow lock-release run leaves no lock directory"
 assert_file_exists "${workspace}/case_0/flow/flow.marker" \
@@ -744,6 +758,13 @@ assert_contains "$out" "One or more transport jobs failed." \
     "the transport Stage keeps its existing failure message"
 assert_eq 1 "$(summary_status_count "${workspace}/run_transport_cases_summary.csv" solved)" \
     "the successful transport summary row stays present"
+assert_file_bytes_exact "${workspace}/run_transport_cases_summary.csv" \
+    "csv_file,row_number,case_id,flow_case_transport_case,transport_case_dir,status,message"$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow|case_0/trd\",\"${workspace}/case_0/trd\",\"solved\",\"OK\""$'\n'"\"${workspace}/output_batch_1.csv\",\"2\",\"case_0\",\"case_0/flow|case_0/trd\",\"${workspace}/case_0/trd\",\"failed\",\"see log: ${workspace}/_transport_logs/case_0_trd.log\""$'\n' \
+    "the transport lock-release summary keeps the successful row and the fallback failed row"
+assert_file_bytes_exact "${workspace}/.run_transport_cases_failed" "case_0/trd"$'\n' \
+    "the transport lock-release Failure Artifact"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the transport lock-release Case work runs reconstructPar exactly once"
 assert_eq "" "$(find "$workspace" -name '*.lockdir' | sort | tr '\n' ' ')" \
     "the transport lock-release run leaves no lock directory"
 assert_file_exists "${workspace}/case_0/trd/transport.marker" \
@@ -847,8 +868,8 @@ assert_contains "$(cat "${workspace}/.run_mesh_cases_failed")" "case_0/flow" \
     "the mesh Failure Artifact identifies the affected Case"
 assert_file_exists "${workspace}/case_0/flow/restart.marker" \
     "completed mesh Case work stays present after a failed append"
-assert_ne 0 "$(fake_call_count checkMesh)" \
-    "the command record proves that mesh Case work completed"
+assert_eq 1 "$(fake_call_count checkMesh)" \
+    "the mesh append control command runs exactly once"
 
 # ---- flow: the summary append fails ----
 make_flow_fixture append_flow yes
@@ -886,8 +907,8 @@ assert_contains "$(cat "${workspace}/.run_flow_cases_failed")" "case_0/flow" \
     "the flow Failure Artifact identifies the affected Case"
 assert_file_exists "${workspace}/case_0/flow/flow.marker" \
     "completed flow Case work stays present after a failed append"
-assert_ne 0 "$(fake_call_count reconstructPar)" \
-    "the command record proves that flow Case work completed"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the flow append control command runs exactly once"
 
 # ---- transport: the summary append fails ----
 make_transport_success_fixture append_transport
@@ -969,6 +990,8 @@ assert_contains "$out" "Batch failed: batch_1" \
     "the Orchestrator marks the batch failed after a failed mesh append"
 assert_not_contains "$out" "All requested batches and stages finished successfully." \
     "the Orchestrator does not report overall success"
+assert_eq 1 "$(fake_call_count checkMesh)" \
+    "the orchestrated mesh control command runs exactly once"
 
 # ---- Orchestrator: flow ----
 build_orchestrated_stage orch_flow "$FLOW_SCRIPT" run_flow_cases.sh
@@ -993,6 +1016,8 @@ assert_contains "$out" "Batch failed: batch_1" \
     "the Orchestrator marks the batch failed after a failed flow append"
 assert_not_contains "$out" "All requested batches and stages finished successfully." \
     "the Orchestrator does not report overall success after a flow append failure"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the orchestrated flow control command runs exactly once"
 
 # ---- Orchestrator: transport ----
 build_orchestrated_stage orch_transport "$TRANSPORT_SCRIPT" run_transport_cases.sh
@@ -1018,6 +1043,8 @@ assert_contains "$out" "Batch failed: batch_1" \
     "the Orchestrator marks the batch failed after a failed transport append"
 assert_not_contains "$out" "All requested batches and stages finished successfully." \
     "the Orchestrator does not report overall success after a transport append failure"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the orchestrated transport control command runs exactly once"
 
 # ---- both the summary and the Failure Artifact append fail (Issue #47) ------
 #
@@ -1048,6 +1075,8 @@ PATH="$append_saved_path"
 
 assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
     "the mesh dual control replaced both artifacts exactly once"
+assert_eq 1 "$(fake_call_count checkMesh)" \
+    "the mesh dual control command runs exactly once"
 assert_ne 124 "$status" "the mesh dual-failure run completes without an external kill"
 assert_failure "$status" \
     "the private mesh Case completion record alone keeps the Stage non-zero"
@@ -1087,6 +1116,8 @@ PATH="$append_saved_path"
 
 assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
     "the flow dual control replaced both artifacts exactly once"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the flow dual control command runs exactly once"
 assert_ne 124 "$status" "the flow dual-failure run completes without an external kill"
 assert_failure "$status" \
     "the private flow Case completion record alone keeps the Stage non-zero"
@@ -1127,6 +1158,8 @@ PATH="$append_saved_path"
 
 assert_file_bytes_exact "$append_control_marker" "summary=1"$'\n'"fail_file=1"$'\n' \
     "the transport dual control replaced both artifacts exactly once"
+assert_eq 1 "$(fake_call_count reconstructPar)" \
+    "the transport dual control command runs exactly once"
 assert_ne 124 "$status" \
     "the transport dual-failure run completes without an external kill"
 assert_failure "$status" \
