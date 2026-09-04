@@ -182,3 +182,88 @@ batch_stage_job_pool_wait_for_all() {
         fi
     done
 }
+
+# batch_stage_csv_tokenize <output-array-name> <line>
+#
+# The helper splits one CSV record into the named dynamically scoped caller
+# array. Comma is the only delimiter. The `read -a` operation clears the caller
+# array before it assigns, so no element of an earlier record survives.
+#
+# The helper keeps the current simple Bash parser without change. It adds no
+# quote parsing, quote removal, quote unescaping, carriage-return removal, or
+# row-shape validation. An empty field between two commas stays empty, the one
+# empty element after a trailing delimiter stays dropped, and a field count that
+# differs from the header count stays accepted.
+#
+# The helper writes no standard output and no standard error, and returns the
+# exact `read` status. An absent line argument gives an empty line.
+batch_stage_csv_tokenize() {
+    IFS=, read -r -a "$1" <<< "${2-}"
+}
+
+# batch_stage_csv_normalize_header <trim-callback> <header-value>
+#
+# The helper normalizes one header field. It calls the caller trim callback once
+# for the exact supplied value, captures that output with one plain assignment,
+# and lowercases the captured value with one echo and tr pipeline. Only the
+# lowercase value reaches standard output, and the helper returns the exact
+# status of that pipeline.
+#
+# The helper invokes the callback directly, so each Stage Runner keeps its own
+# trim behavior. The helper removes no quote, carriage-return byte, or
+# whitespace of its own, writes no diagnostic, and guards no failure. The
+# caller `set -e` behavior stays the failure path.
+batch_stage_csv_normalize_header() {
+    local __batch_stage_csv_normalize_header_value
+    __batch_stage_csv_normalize_header_value="$("$1" "${2-}")"
+    echo "$__batch_stage_csv_normalize_header_value" | tr '[:upper:]' '[:lower:]'
+}
+
+# batch_stage_csv_find_column <index-array-name> <alias>...
+#
+# The helper inspects the caller-named associative index for each alias in the
+# exact caller-supplied order. Each alias is lowercased with one echo and tr
+# pipeline, and Bash indirect expansion reads the named index. The helper writes
+# the decimal zero-based index of the first matching alias and returns 0. When
+# no alias matches, the helper writes nothing and returns 1.
+#
+# Alias priority stays caller-owned, so the first alias in the caller list stays
+# authoritative. The helper defines no alias list, decides no required column,
+# calls no Stage Runner diagnostic, writes no diagnostic, and never modifies the
+# named index. The named index must be a caller `declare -A` associative array,
+# and no alias may hold `$`, a backtick, `[`, or `]`.
+batch_stage_csv_find_column() {
+    local __batch_stage_csv_find_column_index="$1"
+    shift
+    local __batch_stage_csv_find_column_alias
+    local __batch_stage_csv_find_column_key
+    local __batch_stage_csv_find_column_reference
+
+    for __batch_stage_csv_find_column_alias in "$@"; do
+        __batch_stage_csv_find_column_key="$(
+            echo "$__batch_stage_csv_find_column_alias" | tr '[:upper:]' '[:lower:]')"
+        __batch_stage_csv_find_column_reference="${__batch_stage_csv_find_column_index}[${__batch_stage_csv_find_column_key}]"
+        if [[ -n "${!__batch_stage_csv_find_column_reference+x}" ]]; then
+            echo "${!__batch_stage_csv_find_column_reference}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# batch_stage_csv_get_cell <trim-callback> <row-line> <zero-based-index>
+#
+# The helper tokenizes the exact supplied row line, selects the exact zero-based
+# index, substitutes an empty string when that index is absent, and invokes the
+# caller trim callback with the selected value as its last command. The callback
+# therefore owns the exact output and the exact status, and the helper captures
+# neither.
+#
+# The helper validates no index, field count, field value, Case ID, or row, and
+# removes no carriage-return byte, whitespace, or quote byte of its own.
+batch_stage_csv_get_cell() {
+    local -a __batch_stage_csv_get_cell_cells
+    batch_stage_csv_tokenize __batch_stage_csv_get_cell_cells "${2-}"
+    "$1" "${__batch_stage_csv_get_cell_cells[${3-}]:-}"
+}

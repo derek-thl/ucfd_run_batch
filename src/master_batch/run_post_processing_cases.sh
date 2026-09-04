@@ -216,6 +216,14 @@ validate_config() {
 # 3. CSV HANDLING
 # =============================================================================
 declare -A COLUMN_INDEX=()
+
+# Each shared parser helper reads this column index through the caller-supplied
+# index name, so no direct read of the index stays visible in this Stage Runner.
+# The side-effect-free reference below prevents ShellCheck SC2034 for an index
+# that only a shared helper reads. A suppression directive is not used. The
+# reference writes no output, creates no process, and changes no value.
+: "${#COLUMN_INDEX[@]}"
+
 declare -A SEEN_CASES=()
 CASE_COLUMN=""
 
@@ -259,35 +267,28 @@ find_csv_file() {
 
 load_csv_header() {
     local csv_file="$1"
-    local header column column_lower index
+    local header column_lower index
     local -a columns
 
     header="$(head -n 1 "$csv_file")"
     header="${header//$'\r'/}"
-    IFS=',' read -r -a columns <<<"$header"
+    batch_stage_csv_tokenize columns "$header"
 
     COLUMN_INDEX=()
 
     for index in "${!columns[@]}"; do
-        column="$(trim "${columns[$index]}")"
-        column_lower="$(lower "$column")"
+        column_lower="$(batch_stage_csv_normalize_header trim "${columns[$index]}")"
         COLUMN_INDEX["$column_lower"]="$index"
     done
 
-    if [[ -n "${COLUMN_INDEX[case]+x}" ]]; then
-        CASE_COLUMN="${COLUMN_INDEX[case]}"
-    else
+    CASE_COLUMN="$(batch_stage_csv_find_column COLUMN_INDEX Case)" ||
         die "Required CSV column not found: Case"
-    fi
 }
 
 get_csv_cell() {
     local row="$1"
     local index="$2"
-    local -a cells
-
-    IFS=',' read -r -a cells <<<"$row"
-    trim "${cells[$index]:-}"
+    batch_stage_csv_get_cell trim "$row" "$index"
 }
 
 # =============================================================================

@@ -70,6 +70,7 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.V | Shared Stage library locking characterization | `cases/v_shared_stage_library_locking.sh` |
 | 23.W | Shared result-recording extraction | `cases/w_shared_stage_library_result_recording.sh` |
 | 23.X | Shared Stage job-pool scheduling | `cases/x_shared_stage_library_job_pool.sh` |
+| 23.Y | Shared Stage CSV parsing | `cases/y_shared_stage_library_csv_parsing.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
@@ -201,6 +202,73 @@ fallback branch calls no wait-status callback. The third changes only the exact
 Bash-version condition in the setup `wait_for_all_rows` function, which selects
 the direct-PID older-Bash branch and proves that the setup final drain stays
 caller-owned and unchanged.
+
+Section 23.Y characterizes the CSV parsing of all five Stage Runners and then
+proves that they delegate to the four shared parser helpers. Every assertion
+uses a direct Stage Runner CLI. The base characterization group runs the
+production deployment unit with no instrumentation, so every parsing result is
+production behavior.
+
+Most observations need no Case directory, because each Stage Runner selects and
+trims the Case cell before it inspects the Case directory. A skipped row or a
+failed row therefore reports the exact selected cell, and one CSV shape gives
+one observation for each of the five Stage Runners.
+
+The group covers a reordered header where the `Case` column is not column zero,
+mixed-case and whitespace header names, a CRLF header and a CRLF data row, every
+documented setup alias, caller alias priority, two header fields that normalize
+to one key, an empty field between two commas, a missing field, a dropped
+trailing empty field, a quoted comma, a doubled double quote, quote bytes, the
+missing-column diagnostics, a header without a final newline, the empty, `NA`,
+normalized and duplicate Case rules, blank rows, row numbers, the setup dynamic
+stack headers, two DOE Batch CSV files in one invocation, and a header field
+that normalizes to an empty string.
+
+Three observations discriminate the Stage-specific trim behavior:
+
+- A `"Case"` header stays accepted by post-processing, which removes one leading
+  and one trailing double quote, and stays a required-column failure in setup,
+  mesh, flow, and transport, which keep both quote bytes.
+- A Case cell that holds one double quote normalizes to `NA` in mesh, flow, and
+  transport, and becomes an empty Case in post-processing, so the two Case rules
+  report different public messages.
+- The setup summary echoes an invalid WS cell, so a quoted numeric value and a
+  doubled double quote prove by exact bytes that the parser unescapes nothing.
+
+The quoted-comma observation also rejects an RFC-compliant interpretation,
+because the simple parser splits the value at the comma inside the quotes and
+moves every later field by one index.
+
+The multi-CSV observations use two `output_batch_*.csv` files in one invocation.
+The second CSV holds fewer columns than the first CSV and puts `Case` first, so
+a stale caller header element from the first CSV would move the Case column past
+the last field of a second-CSV row. Two more observations omit a required column
+from the second CSV, so no column index of the first CSV can resolve for the
+second CSV. Post-processing keeps its current single-CSV selection.
+
+A header field that normalizes to an empty string reaches the caller-owned
+associative-index assignment, which the Bash runtime rejects. Each Stage Runner
+keeps status `1`, writes no summary data row, writes no Failure Artifact data,
+and runs no OpenFOAM command. The assertion requires the index variable name and
+the runtime message, and it never compares a Bash-generated source line number.
+
+Setup `STABILITY_COL` has no public consumer, so the base group proves that the
+Stability column stays optional and changes no public result. The exact optional
+alias vector is proven by the delegation group.
+
+One copied deployment unit carries compatible instrumentation. Each instrumented
+helper keeps the approved logic, output, and status, and appends one record to a
+sibling directory outside every Batch Workspace. The records prove tokenization
+through header parsing and cell lookup, the exact associative index of each
+Stage Runner, and the exact alias vectors. The delegation group runs each Stage
+Runner with `-j 1`, so no concurrent child appends to one record file. That
+group fails before the extraction, so it is the red evidence.
+
+The delegation CSV adds one `"note"` header that holds two quote bytes. The
+normalization record holds the captured caller-callback output, which the
+approved helper already assigns to one variable, so the record proves which
+Stage Runner trim function ran inside the shared helper: post-processing records
+`note` and the other four Stage Runners record `"note"`.
 
 Section 23.P covers the Issue #47 summary append-failure contract for mesh,
 flow, and transport. Each Stage Runner has four controlled observations, and all

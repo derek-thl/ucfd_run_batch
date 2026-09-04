@@ -468,6 +468,14 @@ validate_global_config() {
 # =============================================================================
 
 declare -A COL=()
+
+# Each shared parser helper reads this column index through the caller-supplied
+# index name, so no direct read of the index stays visible in this Stage Runner.
+# The side-effect-free reference below prevents ShellCheck SC2034 for an index
+# that only a shared helper reads. A suppression directive is not used. The
+# reference writes no output, creates no process, and changes no value.
+: "${#COL[@]}"
+
 declare -A SEEN_CASES=()
 headers=()
 header_line=""
@@ -480,44 +488,29 @@ load_csv_header() {
     local csv_abs="$1"
     header_line="$(head -n 1 "$csv_abs")"
     header_line="${header_line//$'\r'/}"
-    IFS=',' read -r -a headers <<< "$header_line"
+    batch_stage_csv_tokenize headers "$header_line"
 
     COL=()
-    local i h h_lc
+    local i h_lc
     for i in "${!headers[@]}"; do
-        h="$(trim "${headers[$i]}")"
-        h_lc="$(lower "$h")"
+        h_lc="$(batch_stage_csv_normalize_header trim "${headers[$i]}")"
         COL["$h_lc"]="$i"
     done
 
-    CASE_COL="$(find_col Case case)" || die "Required column not found in $csv_abs: Case"
-    WS_COL="$(find_col WS ws wind_speed U_ref u_ref met__WS_mps)" || die "Required column not found in $csv_abs: WS / wind_speed / U_ref / met__WS_mps"
-    WD_COL="$(find_col WD wd wind_direction ref_wind_dir relative_wind_direction met__WD_deg)" || die "Required column not found in $csv_abs: WD / wind_direction / met__WD_deg"
+    CASE_COL="$(batch_stage_csv_find_column COL Case case)" || die "Required column not found in $csv_abs: Case"
+    WS_COL="$(batch_stage_csv_find_column COL WS ws wind_speed U_ref u_ref met__WS_mps)" || die "Required column not found in $csv_abs: WS / wind_speed / U_ref / met__WS_mps"
+    WD_COL="$(batch_stage_csv_find_column COL WD wd wind_direction ref_wind_dir relative_wind_direction met__WD_deg)" || die "Required column not found in $csv_abs: WD / wind_direction / met__WD_deg"
 
     STABILITY_COL=""
-    if tmp_col="$(find_col Stability stability atmospheric_stability met__stability 2>/dev/null)"; then
+    if tmp_col="$(batch_stage_csv_find_column COL Stability stability atmospheric_stability met__stability 2>/dev/null)"; then
         STABILITY_COL="$tmp_col"
     fi
-}
-
-find_col() {
-    local alias
-    for alias in "$@"; do
-        alias="$(lower "$alias")"
-        if [[ -n "${COL[$alias]+x}" ]]; then
-            echo "${COL[$alias]}"
-            return 0
-        fi
-    done
-    return 1
 }
 
 get_cell_from_row() {
     local row_line="$1"
     local idx="$2"
-    local -a cells
-    IFS=',' read -r -a cells <<< "$row_line"
-    trim "${cells[$idx]:-}"
+    batch_stage_csv_get_cell trim "$row_line" "$idx"
 }
 
 find_csv_files() {
@@ -957,12 +950,10 @@ setup_transport_case_from_row() {
 get_cell_by_header() {
     local row_line="$1"
     local header_name="$2"
-    local key idx
+    local idx
 
-    key="$(lower "$header_name")"
-    [[ -n "${COL[$key]+x}" ]] || { echo ""; return 0; }
+    idx="$(batch_stage_csv_find_column COL "$header_name")" || { echo ""; return 0; }
 
-    idx="${COL[$key]}"
     get_cell_from_row "$row_line" "$idx"
 }
 
