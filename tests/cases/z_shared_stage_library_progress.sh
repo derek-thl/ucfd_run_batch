@@ -962,14 +962,24 @@ INSTRUMENT
 }
 
 # run_copied_stage <record-name> <script> <args...>
+# The copied run discards the console output, because the delegation records
+# carry the evidence. The run keeps the exact process status. Status 124 is
+# never an accepted Stage result, and each of these five copied observations
+# uses a success path, so the status must be 0.
 run_copied_stage() {
     local record_name="$1"
     shift
+    local copied_status=0
     HELPER_RECORD="${HELPER_RECORD_DIR}/${record_name}.log"
     : > "$HELPER_RECORD"
     ( cd "$workspace" && Z_HELPER_RECORD="$HELPER_RECORD" \
         Z_CLOCK_DIR="$Z_CLOCK_DIR" Z_CLOCK_RECORD="$CLOCK_RECORD" \
-        LC_ALL=C timeout "$STAGE_TIMEOUT" bash "$@" ) >/dev/null 2>&1 || true
+        LC_ALL=C timeout "$STAGE_TIMEOUT" bash "$@" ) >/dev/null 2>&1 ||
+        copied_status=$?
+    assert_ne 124 "$copied_status" \
+        "the copied ${record_name} Stage Runner completes without an external kill"
+    assert_status 0 "$copied_status" \
+        "the copied ${record_name} Stage Runner keeps exit status 0"
 }
 
 # tick_records - the recorded aggregate-progress timing-helper calls.
