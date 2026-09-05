@@ -1072,9 +1072,12 @@ PATH="$saved_path"
 
 # ---- every control record lives outside every Batch Workspace ---------------
 
-assert_eq "" "$(find "$CONTRACT_TEST_RUN_DIR" -path "$CONTROL_ROOT" -prune -o \
-        \( -name 'record' -o -name 'sequence' -o -name 'events' \) -print |
-        grep -v "^${CONTROL_ROOT}" | sort | tr '\n' ' ')" \
+mapfile -t z_workspaces < <(find "$CONTRACT_TEST_RUN_DIR" -maxdepth 1 -type d \
+    -name "${CONTRACT_TEST_NAME:-case}.*" | sort)
+assert_ne 0 "${#z_workspaces[@]}" "the scenario created its Batch Workspaces"
+assert_eq "" "$(find "${z_workspaces[@]}" \
+        \( -name 'record' -o -name 'sequence' -o -name 'claim.*' \
+           -o -name 'events' \) -print | sort | tr '\n' ' ')" \
     "no progress control record enters a Batch Workspace"
 
 printf 'Scenario Z passed.\n'

@@ -147,13 +147,16 @@ has_cmd() {
 _LAST_PROGRESS_TIME=0
 
 show_progress() {
-    local running completed skipped failed now
+    local running completed skipped failed
+    # The shared helper owns only the timing gate. This Stage Runner keeps the
+    # one-second interval, the unforced call, every timing reset, and every
+    # progress field.
+    local progress_due
 
-    now=$(date +%s)
-    (( now - _LAST_PROGRESS_TIME < 1 )) && return 0
-    _LAST_PROGRESS_TIME=$now
+    batch_stage_progress_tick progress_due _LAST_PROGRESS_TIME 1 0
+    (( progress_due == 1 )) || return 0
 
-    running="$(jobs -rp | wc -l | tr -d ' ')"
+    running="$(batch_stage_job_pool_running_count)"
     completed=0
     skipped=0
     failed=0

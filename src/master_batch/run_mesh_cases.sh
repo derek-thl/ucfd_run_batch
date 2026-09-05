@@ -285,12 +285,16 @@ show_running_cases() {
 
 _LAST_PROGRESS_TIME=0
 show_progress() {
-    local force="${1:-0}" now running meshed continued skipped failed done pending
-    now=$(date +%s)
-    (( force == 1 || now - _LAST_PROGRESS_TIME >= PROGRESS_INTERVAL )) || return 0
-    _LAST_PROGRESS_TIME=$now
+    local force="${1:-0}" running meshed continued skipped failed done pending
+    # The shared helper owns only the timing gate. This Stage Runner keeps
+    # PROGRESS_INTERVAL, the force argument, the last-time variable, and every
+    # progress field.
+    local progress_due
 
-    running="$(jobs -rp | wc -l | tr -d ' ')"
+    batch_stage_progress_tick progress_due _LAST_PROGRESS_TIME "$PROGRESS_INTERVAL" "$force"
+    (( progress_due == 1 )) || return 0
+
+    running="$(batch_stage_job_pool_running_count)"
     read -r meshed continued skipped < <(
         awk -F, 'NR>1 {
             gsub(/"/, "", $6);

@@ -480,12 +480,16 @@ count_status() {
 }
 
 show_progress() {
-    local now running solved continued skipped failed pending state f case_name st msg updated log_file
-    now="$(date +%s)"
-    (( now - _LAST_PROGRESS_TIME < PROGRESS_INTERVAL )) && return 0
-    _LAST_PROGRESS_TIME="$now"
+    local running solved continued skipped failed pending state f case_name st msg updated log_file
+    # The shared helper owns only the timing gate. This Stage Runner keeps
+    # PROGRESS_INTERVAL, the unforced call, every timing reset, and every
+    # progress field.
+    local progress_due
 
-    running="$(jobs -rp | wc -l | tr -d ' ')"
+    batch_stage_progress_tick progress_due _LAST_PROGRESS_TIME "$PROGRESS_INTERVAL" 0
+    (( progress_due == 1 )) || return 0
+
+    running="$(batch_stage_job_pool_running_count)"
     read -r solved continued skipped < <(
         awk -F, 'NR>1 {
             gsub(/"/, "", $6);
