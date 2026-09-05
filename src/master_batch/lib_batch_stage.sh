@@ -267,3 +267,62 @@ batch_stage_csv_get_cell() {
     batch_stage_csv_tokenize __batch_stage_csv_get_cell_cells "${2-}"
     "$1" "${__batch_stage_csv_get_cell_cells[${3-}]:-}"
 }
+
+# batch_stage_progress_tick <due-output-variable> <last-time-variable>
+#     <interval-seconds> <force>
+#
+# The helper decides whether one aggregate-progress update is due. The helper
+# reads the current second exactly once, compares that second with the
+# caller-owned last-time value, and writes the decimal decision to the
+# caller-owned due-output variable. The helper updates the caller-owned
+# last-time variable only when the update is due.
+#
+# The helper reads the caller-owned last-time value through Bash indirect
+# expansion, so the helper needs no name reference and stays compatible with
+# Bash 4.0. Both caller assignments use `printf -v`, so the helper needs no
+# eval, no command string, no temporary file, no process substitution, and no
+# environment override.
+#
+# The helper returns the exact non-zero `date` status before it changes either
+# caller variable. A caller with `errexit` therefore keeps its current failure
+# effect. The due decision uses an `if` condition, so a not-due result cannot
+# activate caller `errexit`.
+#
+# The helper writes no standard output, writes no standard error, calls no
+# callback, counts no process, and owns no persistent library variable. The
+# helper adds no clock correction, no monotonic clock, no interval limit, no
+# sleep, no retry, no timeout, and no date fallback. The caller keeps every
+# progress message, every counter, every interval value, every force value, and
+# every timing reset.
+#
+# Every local name uses the __batch_stage_progress_tick_ prefix, because Bash
+# functions use dynamic scoping and a caller supplies its own due-output,
+# last-time, and progress variable names.
+batch_stage_progress_tick() {
+    local __batch_stage_progress_tick_due_name="$1"
+    local __batch_stage_progress_tick_last_name="$2"
+    local __batch_stage_progress_tick_interval="$3"
+    local __batch_stage_progress_tick_force="$4"
+    local __batch_stage_progress_tick_now
+    local __batch_stage_progress_tick_status=0
+
+    __batch_stage_progress_tick_now="$(date +%s)" ||
+        __batch_stage_progress_tick_status=$?
+
+    if (( __batch_stage_progress_tick_status != 0 )); then
+        return "$__batch_stage_progress_tick_status"
+    fi
+
+    if (( __batch_stage_progress_tick_force == 1 ||
+          __batch_stage_progress_tick_now -
+          ${!__batch_stage_progress_tick_last_name} >=
+          __batch_stage_progress_tick_interval )); then
+        printf -v "$__batch_stage_progress_tick_due_name" '%s' 1
+        printf -v "$__batch_stage_progress_tick_last_name" '%s' \
+            "$__batch_stage_progress_tick_now"
+        return 0
+    fi
+
+    printf -v "$__batch_stage_progress_tick_due_name" '%s' 0
+    return 0
+}

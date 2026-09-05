@@ -71,6 +71,7 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.W | Shared result-recording extraction | `cases/w_shared_stage_library_result_recording.sh` |
 | 23.X | Shared Stage job-pool scheduling | `cases/x_shared_stage_library_job_pool.sh` |
 | 23.Y | Shared Stage CSV parsing | `cases/y_shared_stage_library_csv_parsing.sh` |
+| 23.Z | Shared Stage progress primitives | `cases/z_shared_stage_library_progress.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
@@ -269,6 +270,69 @@ normalization record holds the captured caller-callback output, which the
 approved helper already assigns to one variable, so the record proves which
 Stage Runner trim function ran inside the shared helper: post-processing records
 `note` and the other four Stage Runners record `"note"`.
+
+Section 23.Z characterizes the aggregate-progress timing gate and the
+aggregate-progress active-process count of all five Stage Runners, and then
+proves that the four aggregate-progress Stage Runners delegate to the shared
+timing helper and to the existing shared active-count helper. Every assertion
+uses a direct Stage Runner CLI.
+
+The scenario installs one test-local `date` control. The control resolves the
+real `date` before the control directory enters `PATH`, intercepts only the
+exact one-argument call `date +%s`, and delegates every other argument vector
+with the exact real status. Each intercepted call claims one sequence index
+with an atomic `noclobber` creation, so the sequence update is finite and
+concurrency-safe. The control repeats the final sequence value after the
+sequence is exhausted. Only the four `show_progress` functions call `date +%s`,
+so the record holds only aggregate-progress clock calls.
+
+The timing assertions never require one fixed number of callback invocations. A
+scenario oracle replays the recorded seconds through the exact current
+arithmetic and prints the number of due decisions. The assertion compares that
+number with the emitted progress lines, so an extra free-slot or final-drain
+callback consumes one more recorded second and changes both sides in the same
+way.
+
+Two sequence shapes give the intended time transitions:
+
+- An advancing sequence gives one gap below the interval and one gap at the
+  exact interval, and then a tail that steps by more than the interval. Every
+  forced call and every timing-reset call in that tail is due under the plain
+  interval rule as well, so the oracle stays exact for mesh, flow, and
+  transport.
+- A single-value sequence keeps every call inside one interval. Only a forced
+  call or a timing reset can then emit a second line. Mesh proves its forced
+  final-drain calls, flow and transport prove both final timing resets, and
+  setup proves that its final call is neither forced nor reset, because setup
+  emits exactly one line and never reports `running=0/1`.
+
+The clock-controlled timing group uses a concurrency limit of `1` and needs
+`wait -n`. On Bash 4.0 through 4.2 the scenario reports a named skip for that
+group only. Scenario X remains the required forced fallback-path evidence.
+
+The Case controls hold one Case process until the parent Stage Runner records
+one more clock call. An emitted progress line therefore observes an active Case,
+and each free-slot and final-drain callback runs while a Case is active. The
+mesh and transport running-Case detail observations use an overlap hold instead,
+so two Cases are active at the same time. Every hold has a finite deadline,
+preserves the exact argument vector, and returns the exact delegated status.
+
+The uninstrumented group uses a fully due sequence, so every progress call
+emits, and it asserts the exact final progress line of setup, mesh, flow, and
+transport with the complete field set, the field order, and the current counter
+values. Separate mixed observations give a non-default `created`, `dry_run`,
+`meshed`, `continued`, `solved`, `skipped`, and `failed` value. The
+post-processing observation proves the unchanged per-Case messages, the absent
+aggregate-progress prefixes, and zero aggregate-progress clock calls.
+
+The delegation group appends compatible instrumented definitions of
+`batch_stage_progress_tick` and `batch_stage_job_pool_running_count` to one
+copied library. Each definition keeps the production behavior and records one
+call. `FUNCNAME` records only the calling function, which separates a
+`show_progress` active-count call from a job-pool wait active-count call. The
+records prove the exact interval and force argument of each Stage Runner, and
+they prove one clock call for each timing-helper call. The group fails before
+the extraction, so it is the red evidence.
 
 Section 23.P covers the Issue #47 summary append-failure contract for mesh,
 flow, and transport. Each Stage Runner has four controlled observations, and all

@@ -261,14 +261,17 @@ count_total_rows() {
 }
 
 show_progress() {
-    local running processed created skipped failed dry_run now
+    local running processed created skipped failed dry_run
+    # The shared helper owns only the timing gate. This Stage Runner keeps the
+    # one-second interval, the unforced call, the last-time variable, and every
+    # progress field.
+    local progress_due
 
-    now=$(date +%s)
     # throttle: print at most once per second
-    (( now - _LAST_PROGRESS_TIME < 1 )) && return 0
-    _LAST_PROGRESS_TIME=$now
+    batch_stage_progress_tick progress_due _LAST_PROGRESS_TIME 1 0
+    (( progress_due == 1 )) || return 0
 
-    running="$(jobs -rp | wc -l | tr -d ' ')"
+    running="$(batch_stage_job_pool_running_count)"
     processed=0
     created=0
     skipped=0
