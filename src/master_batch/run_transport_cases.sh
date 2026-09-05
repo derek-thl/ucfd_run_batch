@@ -343,35 +343,36 @@ validate_config() {
 
 # ---- CSV helpers -------------------------------------------------------------
 declare -A COL=()
+
+# Each shared parser helper reads this column index through the caller-supplied
+# index name, so no direct read of the index stays visible in this Stage Runner.
+# The side-effect-free reference below prevents ShellCheck SC2034 for an index
+# that only a shared helper reads. A suppression directive is not used. The
+# reference writes no output, creates no process, and changes no value.
+: "${#COL[@]}"
+
 declare -A SEEN_CASES=()
 CASE_COL=""
 
-find_col() {
-    local alias
-    for alias in "$@"; do
-        alias="$(lower "$alias")"
-        [[ -n "${COL[$alias]+x}" ]] && { echo "${COL[$alias]}"; return 0; }
-    done
-    return 1
-}
-
 load_csv_header() {
-    local csv_abs="$1" i h
+    local csv_abs="$1" i h header_line
     local -a header
-    IFS=',' read -r -a header < "$csv_abs"
+    # Transport keeps one unguarded direct read of the first CSV record. A header
+    # without a final newline therefore keeps its current non-zero read effect
+    # and its current absence of a diagnostic.
+    IFS= read -r header_line < "$csv_abs"
+    batch_stage_csv_tokenize header "$header_line"
     COL=()
     for i in "${!header[@]}"; do
-        h="$(lower "$(trim "${header[$i]}")")"
+        h="$(batch_stage_csv_normalize_header trim "${header[$i]}")"
         COL["$h"]="$i"
     done
-    CASE_COL="$(find_col Case case)" || die "Required column not found in $csv_abs: Case"
+    CASE_COL="$(batch_stage_csv_find_column COL Case case)" || die "Required column not found in $csv_abs: Case"
 }
 
 get_cell() {
     local line="$1" idx="$2"
-    local -a cells
-    IFS=',' read -r -a cells <<< "$line"
-    trim "${cells[$idx]:-}"
+    batch_stage_csv_get_cell trim "$line" "$idx"
 }
 
 find_csv_files() {
