@@ -1489,9 +1489,10 @@ Each `foamToVTK` invocation MUST use:
 ```text
 -time <time>
 -no-boundary
--no-point-data
 -fields <field list>
 ```
+
+Each VTU output MUST contain point data. The runner MUST NOT pass `-no-point-data`.
 
 The runner locates the generated `internal.vtu`, copies it to the stable project filename, and removes the temporary OpenFOAM `VTK/` directory.
 
@@ -1528,7 +1529,10 @@ list of transport times
 SCALAR_FIELD
 flow zero-time field selection
 flow result field selection
+VTU point-data policy
 ```
+
+A completion marker that does not record the VTU point-data policy is not current. The post stage MUST rebuild that case.
 
 If all of these are true:
 
@@ -2226,6 +2230,15 @@ Expected:
 - an old self-contained Stage Runner with no library-requirement declaration keeps its current direct and Orchestrator behavior;
 - an unreadable-library assertion is skipped and reported when `EUID` is `0`;
 - complete compatible deployment units keep all existing behavior and status results.
+
+### AA. VTU point-data output
+
+Use the post-processing Stage Runner CLI.
+
+Expected:
+
+- no recorded `foamToVTK` argument vector contains `-no-point-data`, and each recorded argument vector keeps `-time`, `-no-boundary`, and `-fields`, with the flow zero-time selection `(U p wallDistance)`, the flow result selection `(U p)`, and the transport selection `($SCALAR_FIELD)`;
+- a completion marker without the VTU point-data policy rebuilds the case one time and writes a current marker, a following run with an unchanged source reports `skipped` and runs no conversion, and `FORCE_POST=1` still rebuilds a current case.
 
 ## 24. Multi-agent GitHub handoff rules
 
