@@ -354,11 +354,12 @@ convert_time_to_vtu() {
         cd "$domain_dir"
         rm -rf VTK
 
-        echo ">>> [$PWD] foamToVTK -time $time_value -no-boundary -no-point-data -fields $fields"
+        # v4 Section 18.3: each VTU output carries point data. The runner passes
+        # no -no-point-data argument.
+        echo ">>> [$PWD] foamToVTK -time $time_value -no-boundary -fields $fields"
         foamToVTK \
             -time "$time_value" \
             -no-boundary \
-            -no-point-data \
             -fields "$fields"
     ) >"$log_file" 2>&1
 
@@ -525,6 +526,10 @@ build_post_signature() {
     printf 'scalar_field=%s\n' "$SCALAR_FIELD"
     printf 'flow_zero_fields=%s\n' "$FLOW_ZERO_FIELDS"
     printf 'flow_result_fields=%s\n' "$FLOW_RESULT_FIELDS"
+    # v4 Section 18.4: the signature records the VTU point-data policy. A marker
+    # without this line comes from a pre-point-data runner. The stored signature
+    # then differs and the stage rebuilds the case one time.
+    printf 'vtu_point_data=%s\n' 'included'
 }
 
 process_case() {
