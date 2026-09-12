@@ -2231,6 +2231,91 @@ Expected:
 - an unreadable-library assertion is skipped and reported when `EUID` is `0`;
 - complete compatible deployment units keep all existing behavior and status results.
 
+### V. Shared Stage library locking characterization
+
+Run the five Stage Runner CLIs with concurrent Cases and with a held summary lock.
+
+Expected:
+
+- concurrent setup writes keep the 10-column summary schema, mesh, flow, and transport keep the 7-column schema, and post-processing keeps the 4-column schema, with one complete line for every selected Case;
+- each concurrent Stage keeps its current exit status, and setup, flow, transport, and post-processing keep their current summary status values;
+- a selected mesh state file that disappears during a concurrent run does not stop that run: the run completes without an external kill, keeps exit status `0`, runs every required mesh command for every Case, and keeps every summary line;
+- a held `<summary>.lockdir` makes each Stage Runner write the summary header and then wait, and that Stage Runner appends no data line while the lock stays held;
+- a forced Case failure keeps the current non-zero status of each Stage;
+- a transport Failure Artifact on `/dev/full` keeps Stage completion: the solved run, the failed run, and a regular-file Failure Artifact run each complete without an external kill, each write the exact 7-column header and one exact data line, and each leave no Case state file;
+- a lock path with spaces and shell metacharacters stays one exact argument;
+- no lock directory survives a completed run.
+
+### W. Shared result-recording extraction
+
+Run the five Stage Runner CLIs and compare the exact summary bytes.
+
+Expected:
+
+- setup writes the exact 10-column summary bytes, mesh, flow, and transport write the exact 7-column bytes, and post-processing writes the exact 4-column bytes;
+- setup, mesh, flow, and transport double an embedded double quote in each summary value, post-processing doubles an embedded double quote in the message value and keeps one raw double-quote byte in the Case directory value, and the last line of each summary keeps its final newline byte;
+- a Batch Workspace path component that holds a space, a comma, a double quote, and a newline stays one exact value;
+- an empty value stays `""`, and the failed status and the failed message do not change;
+- setup keeps the `created` status, transport keeps the `continued` status, and post-processing keeps the `completed` status;
+- a failed Case keeps a non-zero Stage status, and the Failure Artifact of setup, mesh, flow, transport, and post-processing keeps its name and its exact contents;
+- a post-processing summary line append failure keeps a non-zero Stage status;
+- concurrent summary lines stay complete and parseable;
+- each Stage Runner records its result through the shared helpers `batch_stage_csv_quote` and `batch_stage_csv_append_row`.
+
+### X. Shared Stage job-pool scheduling
+
+Run the five Stage Runner CLIs and the Orchestrator CLI with four Cases and a job limit of two.
+
+Expected:
+
+- each Stage launches every selected Case exactly once, keeps no more concurrent Case processes than the job limit, and lets two Case processes overlap;
+- each job-pool run keeps its current exit status and needs no external kill;
+- a controlled Case failure during a job-pool wait keeps the current status of each Stage, and the Orchestrator keeps its current failure propagation for each Stage;
+- the caller-owned wait counters stay load-bearing: setup keeps `FAILED_ROW_JOBS` and post-processing keeps `JOB_FAILURES` when neither the summary nor the Failure Artifact can record the failure;
+- a forced Bash 4.0 through 4.2 branch uses the 0.5-second polling path and calls no wait-status callback, and the production library without instrumentation takes the same path;
+- the setup final drain stays caller-owned, and the setup free-slot wait uses the shared helper;
+- each Stage Runner schedules through the shared helpers `batch_stage_job_pool_wait_for_slot`, `batch_stage_job_pool_wait_for_all`, `batch_stage_job_pool_running_count`, and `batch_stage_job_pool_wait_n_supported`;
+- no job-pool control record enters a Batch Workspace.
+
+### Y. Shared Stage CSV parsing
+
+Run the five Stage Runner CLIs with DOE Batch CSV inputs and compare the exact summary bytes.
+
+Expected:
+
+- a reordered header with mixed case and with whitespace selects the same columns;
+- a CRLF header and a CRLF data line give the same result as the LF form;
+- every documented setup column alias resolves, and the first alias of the caller list stays authoritative when the header holds two aliases for one column;
+- two header fields that normalize to one key keep the later field index;
+- an empty field, a missing field, and a trailing delimiter keep their current empty-value result and add no field-count diagnostic;
+- the parser splits a data value at a comma inside double quotes, keeps a doubled double quote as data, and keeps both quote bytes of a quoted numeric value;
+- setup, mesh, flow, and transport keep a quote byte in the Case value, so the Case ID normalizes to `NA`, and post-processing removes one leading and one trailing double quote and reports the empty-Case diagnostic;
+- post-processing accepts a quoted `Case` header, and setup, mesh, flow, and transport keep the quote bytes, so the required column stays absent;
+- an absent required column fails the lookup with status `1` and names that column;
+- a header without a final newline stops transport before the required-column lookup and writes no diagnostic, and the other four Stage Runners keep their current `head -n 1` result;
+- a blank line, an empty Case value, an `NA` Case value, a normalized Case value, and a duplicate Case line keep their current selection, their current line numbering, and their current duplicate suppression;
+- the setup dynamic stack-header lookup keeps its current selected value, keeps its current warning for an absent or empty header, and keeps its backward-compatible fallback header;
+- two DOE Batch CSV files in one invocation resolve each header on its own, and no column of the first file resolves for the second file;
+- a header field that normalizes to an empty string keeps the Bash runtime rejection: status `1`, no Case work, no OpenFOAM command, no summary data line, and no Failure Artifact data;
+- each Stage Runner parses through the shared helpers `batch_stage_csv_tokenize`, `batch_stage_csv_normalize_header`, `batch_stage_csv_find_column`, and `batch_stage_csv_get_cell`.
+
+### Z. Shared Stage progress primitives
+
+Run the five Stage Runner CLIs with a deterministic clock.
+
+Expected:
+
+- a second aggregate-progress call in the same second gives no output, and the unforced final call inside the same second also gives no output;
+- an elapsed second makes one call due, and a forced final-drain call bypasses the interval gate;
+- setup keeps the exact line `>>> Progress: launched=<n>/<n>, processed=<n>/<n>, running=<n>/<n>, created=<n>, skipped=<n>, failed=<n>, dry_run=<n>`;
+- flow keeps the exact line `>>> Progress: launched=<n>/<n>, completed=<n>, running=<n>/<n>, skipped=<n>, failed=<n>`;
+- mesh keeps the exact line `>>> Mesh progress: total=<n>, launched=<n>, running=<n>/<n>, pending=<n>, meshed=<n>, continued=<n>, skipped=<n>, failed=<n>`;
+- transport keeps the exact line `>>> Transport progress: total=<n>, launched=<n>, running=<n>/<n>, pending=<n>, solved=<n>, continued=<n>, skipped=<n>, failed=<n>`;
+- `PROGRESS_MAX_ACTIVE` limits the running-Case detail and adds the omitted-detail message;
+- post-processing gives no aggregate-progress line, and it keeps its per-Case launch message and its success message;
+- the four aggregate-progress Stage Runners delegate to the shared helpers `batch_stage_progress_tick` and `batch_stage_job_pool_running_count`;
+- no progress control record enters a Batch Workspace.
+
 ### AA. VTU point-data output
 
 Use the post-processing Stage Runner CLI.
