@@ -2253,7 +2253,7 @@ Run the five Stage Runner CLIs and compare the exact summary bytes.
 Expected:
 
 - setup writes the exact 10-column summary bytes, mesh, flow, and transport write the exact 7-column bytes, and post-processing writes the exact 4-column bytes;
-- every summary value keeps its double quotes, an embedded double quote stays doubled, and the last line keeps its final newline byte;
+- setup, mesh, flow, and transport double an embedded double quote in each summary value, post-processing doubles an embedded double quote in the message value and keeps one raw double-quote byte in the Case directory value, and the last line of each summary keeps its final newline byte;
 - a Batch Workspace path component that holds a space, a comma, a double quote, and a newline stays one exact value;
 - an empty value stays `""`, and the failed status and the failed message do not change;
 - setup keeps the `created` status, transport keeps the `continued` status, and post-processing keeps the `completed` status;
