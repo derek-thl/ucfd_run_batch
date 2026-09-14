@@ -1,0 +1,475 @@
+name: openfoam-evidence
+
+# Manual real-OpenFOAM evidence run for the A4-1a evidence Item.
+#
+# This workflow runs OpenCFD OpenFOAM v2506 through the Orchestrator for one
+# DOE Batch CSV row and one Case, with the Stages setup, mesh, flow, and
+# post-processing. The transport Stage never runs.
+#
+# The workflow starts only through workflow_dispatch. It is never a required
+# check. GitHub registers the trigger only for a workflow file that exists on
+# the default branch, so this file reaches main before any dispatch.
+#
+# The workflow tunes nothing. The run uses the committed setup defaults, and a
+# real product failure stays a real product failure.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: OpenFOAM v2506 four-Stage evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENFOAM_PACKAGE: openfoam2506-default
+      OPENFOAM_BASHRC: /usr/lib/openfoam/openfoam2506/etc/bashrc
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+      LIB: ${{ runner.temp }}/evidence_lib.sh
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. The clock. This step is first, before checkout, installation, and
+      #    preparation, so the absolute deadline covers every later phase.
+      # ---------------------------------------------------------------------
+      - name: Start the evidence clock
+        run: |
+          start="$(date +%s)"
+          echo "EVIDENCE_CLOCK_START=${start}" >> "$GITHUB_ENV"
+          echo "CAPTURE_DEADLINE=$(( start + 6300 ))" >> "$GITHUB_ENV"
+          echo "CAPTURE_START_GUARD_SECONDS=60" >> "$GITHUB_ENV"
+          {
+            echo "CHECKOUT_RESULT=NOT_ATTEMPTED"
+            echo "INSTALL_RESULT=NOT_ATTEMPTED"
+            echo "PREPARE_RESULT=NOT_ATTEMPTED"
+            echo "ORCHESTRATOR_STARTED=false"
+            echo "OVERALL_RESULT=NOT_ATTEMPTED"
+            echo "STAGE_SETUP=NOT_ATTEMPTED"
+            echo "STAGE_MESH=NOT_ATTEMPTED"
+            echo "STAGE_FLOW=NOT_ATTEMPTED"
+            echo "STAGE_POST=NOT_ATTEMPTED"
+            echo "OPENFOAM_VERSION=UNAVAILABLE"
+            echo "TIMEOUT_WRAPPER_STATUS=NOT_RECORDED"
+          } >> "$GITHUB_ENV"
+          echo "evidence clock start: ${start}"
+          echo "capture deadline    : $(( start + 6300 ))"
+
+      # ---------------------------------------------------------------------
+      # 2. The single status mechanism. Production and every pre-merge status
+      #    check call these same three functions.
+      # ---------------------------------------------------------------------
+      - name: Create the bounded-runner library
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname -- "$LIB")"
+          cat > "$LIB" <<'EVIDENCE_LIB'
+          # budget_seconds <grace> - print raw, grace, guard, available.
+          # available = raw_remaining - termination_grace - capture_start_guard.
+          # Pass only available to timeout.
+          budget_seconds() {
+              local grace="$1" now raw guard available
+              now="$(date +%s)"
+              raw=$(( CAPTURE_DEADLINE - now ))
+              guard="$CAPTURE_START_GUARD_SECONDS"
+              available=$(( raw - grace - guard ))
+              printf '%s %s %s %s\n' "$raw" "$grace" "$guard" "$available"
+          }
+
+          # run_bounded <status_file> <timeout_log> <grace> <available> <command> [args...]
+          # Sets TIMEOUT_WRAPPER_STATUS. Writes the child status atomically to
+          # <status_file>. Terminates every descendant before it returns.
+          run_bounded() {
+              local status_file="$1" timeout_log="$2" grace="$3" available="$4"
+              local pgid_file="${status_file}.pgid"
+              shift 4
+              rm -f -- "$status_file" "${status_file}.tmp" "$pgid_file"
+              set +e
+              LC_ALL=C timeout --verbose --signal=TERM --kill-after="${grace}s" "${available}s" \
+                  bash -c '
+                      status_file="$1"; shift
+                      set -m
+                      set +e
+                      "$@" &
+                      child=$!
+                      printf "%s\n" "$child" > "${status_file}.pgid"
+                      trap "kill -TERM -- -${child} 2>/dev/null" TERM
+                      child_status=0
+                      while kill -0 "$child" 2>/dev/null; do
+                          wait "$child"; child_status=$?
+                      done
+                      printf "%s\n" "$child_status" > "${status_file}.tmp"
+                      mv "${status_file}.tmp" "${status_file}"
+                      exit "$child_status"
+                  ' _ "$status_file" "$@" 2> "$timeout_log"
+              TIMEOUT_WRAPPER_STATUS=$?
+              set -e
+              local pgid own_pgid
+              own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+              if [[ -f "$pgid_file" ]]; then
+                  pgid="$(cat -- "$pgid_file" 2>/dev/null || true)"
+                  if [[ "$pgid" =~ ^[0-9]+$ ]] \
+                     && [[ -n "$own_pgid" ]] && [[ "$pgid" != "$own_pgid" ]] \
+                     && kill -0 -- "-${pgid}" 2>/dev/null; then
+                      kill -KILL -- "-${pgid}" 2>/dev/null || true
+                  fi
+              fi
+              return 0
+          }
+
+          # classify_result <status_file> <timeout_log>
+          # An anchored timeout diagnostic has priority over a status file.
+          classify_result() {
+              local status_file="$1" timeout_log="$2" recorded
+              if [[ -s "$timeout_log" ]] \
+                 && LC_ALL=C grep -Eq '^timeout: sending signal (TERM|KILL)' "$timeout_log"; then
+                  printf 'BUDGET_EXCEEDED\n'; return 0
+              fi
+              if [[ -f "$status_file" ]]; then
+                  recorded="$(cat -- "$status_file")"
+                  if [[ "$recorded" =~ ^[0-9]+$ ]]; then
+                      if [[ "$recorded" == "0" ]]; then printf 'SUCCEEDED\n'
+                      else printf 'FAILED_EXIT_%s\n' "$recorded"; fi
+                      return 0
+                  fi
+              fi
+              printf 'INFRASTRUCTURE_FAILURE\n'
+          }
+          EVIDENCE_LIB
+          bash -n "$LIB"
+          echo "bounded-runner library written to ${LIB}"
+          sha256sum "$LIB"
+
+      # ---------------------------------------------------------------------
+      # 3. The bounded checkout. A checkout stop is never BUDGET_EXCEEDED.
+      # ---------------------------------------------------------------------
+      - name: Check out the repository
+        id: checkout
+        timeout-minutes: 10
+        continue-on-error: true
+        uses: actions/checkout@v5
+
+      - name: Record the checkout phase result
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          if [[ "${{ steps.checkout.outcome }}" == "success" ]]; then
+              echo "CHECKOUT_RESULT=SUCCEEDED" >> "$GITHUB_ENV"
+              echo "checkout phase: SUCCEEDED"
+          else
+              {
+                echo "CHECKOUT_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "CHECKOUT_REASON=checkout outcome ${{ steps.checkout.outcome }}"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "checkout phase: INFRASTRUCTURE_FAILURE (${{ steps.checkout.outcome }})" >&2
+          fi
+
+      # ---------------------------------------------------------------------
+      # 4. Installation. OpenFOAM v2506 from the official openfoam.com method.
+      # ---------------------------------------------------------------------
+      - name: Install OpenFOAM v2506
+        if: always() && env.CHECKOUT_RESULT == 'SUCCEEDED'
+        run: |
+          set -euo pipefail
+          source "$LIB"
+          mkdir -p "$EVIDENCE_DIR"
+          read -r raw grace guard available <<< "$(budget_seconds 30)"
+          {
+            echo "INSTALL_RAW_REMAINING=${raw}"
+            echo "INSTALL_GRACE=${grace}"
+            echo "INSTALL_CAPTURE_GUARD=${guard}"
+            echo "INSTALL_SECONDS=${available}"
+          } >> "$GITHUB_ENV"
+          echo "install budget: raw=${raw} grace=${grace} guard=${guard} available=${available}"
+
+          if (( available <= 0 )); then
+              echo "INSTALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "install phase: BUDGET_EXCEEDED, no time after grace and guard" >&2
+              exit 0
+          fi
+
+          run_bounded "${EVIDENCE_DIR}/install_status.txt" \
+                      "${EVIDENCE_DIR}/install-timeout.log" \
+                      "$grace" "$available" \
+              bash -c '
+                  set -euo pipefail
+                  curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends "$1"
+              ' _ "$OPENFOAM_PACKAGE" > "${EVIDENCE_DIR}/install.log" 2>&1
+          install_result="$(classify_result "${EVIDENCE_DIR}/install_status.txt" \
+                                            "${EVIDENCE_DIR}/install-timeout.log")"
+          echo "INSTALL_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS}" >> "$GITHUB_ENV"
+          if [[ "$install_result" == "SUCCEEDED" ]]; then
+              echo "INSTALL_RESULT=SUCCEEDED" >> "$GITHUB_ENV"
+          elif [[ "$install_result" == "BUDGET_EXCEEDED" ]]; then
+              echo "INSTALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+          else
+              echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE" >> "$GITHUB_ENV"
+              echo "INSTALL_REASON=${install_result}" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE" >> "$GITHUB_ENV"
+          fi
+          echo "install phase: ${install_result}"
+          tail -n 40 "${EVIDENCE_DIR}/install.log" || true
+
+      - name: Record the OpenFOAM version
+        if: always() && env.INSTALL_RESULT == 'SUCCEEDED'
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          # shellcheck disable=SC1090
+          source "$OPENFOAM_BASHRC"
+          version="${WM_PROJECT_VERSION:-UNAVAILABLE}"
+          {
+            echo "WM_PROJECT_VERSION=${version}"
+            echo "simpleFoam: $(command -v simpleFoam || echo UNAVAILABLE)"
+            echo "snappyHexMesh: $(command -v snappyHexMesh || echo UNAVAILABLE)"
+            echo "surfaceTransformPoints: $(command -v surfaceTransformPoints || echo UNAVAILABLE)"
+            echo "foamToVTK: $(command -v foamToVTK || echo UNAVAILABLE)"
+          } | tee "${EVIDENCE_DIR}/openfoam-version.txt"
+          echo "OPENFOAM_VERSION=${version}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # 5. Preparation. The repository already holds the base Case template
+      #    src/master_batch/simpleFoam_files and the DOE Batch CSV
+      #    src/output_batch_1.csv. The contract needs one Case, so the job
+      #    builds a one-row DOE Batch CSV from the committed header and one
+      #    committed data row. The job adds no file to the repository and
+      #    changes no committed dictionary, no committed STL, and no
+      #    committed default.
+      # ---------------------------------------------------------------------
+      - name: Prepare the one-Case DOE Batch CSV
+        if: always() && env.INSTALL_RESULT == 'SUCCEEDED'
+        run: |
+          set -euo pipefail
+          source "$LIB"
+          mkdir -p "$EVIDENCE_DIR"
+          read -r raw grace guard available <<< "$(budget_seconds 15)"
+          {
+            echo "PREPARE_RAW_REMAINING=${raw}"
+            echo "PREPARE_GRACE=${grace}"
+            echo "PREPARE_CAPTURE_GUARD=${guard}"
+            echo "PREPARE_SECONDS=${available}"
+          } >> "$GITHUB_ENV"
+          echo "prepare budget: raw=${raw} grace=${grace} guard=${guard} available=${available}"
+
+          if (( available <= 0 )); then
+              echo "PREPARE_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "prepare phase: BUDGET_EXCEEDED, no time after grace and guard" >&2
+              exit 0
+          fi
+
+          # The preparation body is an inline script, so the job adds no
+          # repository file. run_bounded wraps that script.
+          run_bounded "${EVIDENCE_DIR}/prepare_status.txt" \
+                      "${EVIDENCE_DIR}/prepare-timeout.log" \
+                      "$grace" "$available" \
+              bash -c '
+          set -euo pipefail
+          cd "$1"
+          case_id="$2"
+          source_csv="src/output_batch_1.csv"
+          run_csv="src/output_batch_9.csv"
+          base="src/master_batch/simpleFoam_files"
+
+          # The committed base Case is read-only input. Confirm it, never
+          # rewrite it.
+          for required in \
+              "${base}/system/blockMeshDict" \
+              "${base}/system/snappyHexMeshDict" \
+              "${base}/system/controlDict" \
+              "${base}/system/decomposeParDict" \
+              "${base}/constant/turbulenceProperties" \
+              "${base}/constant/triSurface/f18p2_all.stl" \
+              "${base}/0/U" "${base}/0/p" "${base}/0/k" \
+              "${base}/0/epsilon" "${base}/0/nut" \
+              "$source_csv"; do
+              [[ -f "$required" ]] || { echo "missing committed input: $required" >&2; exit 1; }
+          done
+
+          # One header row and exactly one data row, selected by Case id.
+          head -n 1 -- "$source_csv" > "$run_csv"
+          selected="$(awk -F, -v want="$case_id" \
+              "NR>1 && \$1==want { print; exit }" "$source_csv")"
+          [[ -n "$selected" ]] || { echo "Case ${case_id} not found in ${source_csv}" >&2; exit 1; }
+          printf "%s\n" "$selected" >> "$run_csv"
+
+          echo "== the one-Case DOE Batch CSV =="
+          cat -- "$run_csv"
+          echo "== committed base Case inventory =="
+          find "$base" -type f | sort | head -n 40
+          echo "== base Case file count =="
+          find "$base" -type f | wc -l
+          ' _ "$GITHUB_WORKSPACE" "7" > "${EVIDENCE_DIR}/prepare.log" 2>&1
+          prepare_result="$(classify_result "${EVIDENCE_DIR}/prepare_status.txt" \
+                                            "${EVIDENCE_DIR}/prepare-timeout.log")"
+          echo "PREPARE_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS}" >> "$GITHUB_ENV"
+          if [[ "$prepare_result" == "SUCCEEDED" ]]; then
+              echo "PREPARE_RESULT=SUCCEEDED" >> "$GITHUB_ENV"
+          elif [[ "$prepare_result" == "BUDGET_EXCEEDED" ]]; then
+              echo "PREPARE_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+          else
+              echo "PREPARE_RESULT=INFRASTRUCTURE_FAILURE" >> "$GITHUB_ENV"
+              echo "PREPARE_REASON=${prepare_result}" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE" >> "$GITHUB_ENV"
+          fi
+          echo "prepare phase: ${prepare_result}"
+          cat "${EVIDENCE_DIR}/prepare.log" || true
+
+      # ---------------------------------------------------------------------
+      # 6. The bounded Orchestrator. Four Stages, one Case, -j 1, no tuning.
+      # ---------------------------------------------------------------------
+      - name: Run the Orchestrator
+        if: always() && env.PREPARE_RESULT == 'SUCCEEDED'
+        run: |
+          set -euo pipefail
+          source "$LIB"
+          mkdir -p "$EVIDENCE_DIR"
+          # shellcheck disable=SC1090
+          source "$OPENFOAM_BASHRC"
+          csv="${GITHUB_WORKSPACE}/src/output_batch_9.csv"
+
+          read -r raw grace guard available <<< "$(budget_seconds 60)"
+          {
+            echo "ORCHESTRATOR_RAW_REMAINING=${raw}"
+            echo "ORCHESTRATOR_GRACE=${grace}"
+            echo "ORCHESTRATOR_CAPTURE_GUARD=${guard}"
+            echo "ORCHESTRATOR_SECONDS=${available}"
+          } >> "$GITHUB_ENV"
+          echo "orchestrator budget: raw=${raw} grace=${grace} guard=${guard} available=${available}"
+
+          if (( available <= 0 )); then
+              echo "ORCHESTRATOR_STARTED=false" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=BUDGET_EXCEEDED" >> "$GITHUB_ENV"
+          else
+              echo "ORCHESTRATOR_STARTED=true" >> "$GITHUB_ENV"
+              echo "ORCHESTRATOR_START=$(date +%s)" >> "$GITHUB_ENV"
+              cd "$GITHUB_WORKSPACE"
+              run_bounded "${EVIDENCE_DIR}/orchestrator_status.txt" \
+                          "${EVIDENCE_DIR}/orchestrator-timeout.log" \
+                          "$grace" "$available" \
+                  bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 "$1" \
+                               > "$2" 2>&1' _ "$csv" "${EVIDENCE_DIR}/orchestrator.log"
+              echo "TIMEOUT_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS}" >> "$GITHUB_ENV"
+              echo "OVERALL_RESULT=$(classify_result "${EVIDENCE_DIR}/orchestrator_status.txt" \
+                                                     "${EVIDENCE_DIR}/orchestrator-timeout.log")" \
+                  >> "$GITHUB_ENV"
+              echo "ORCHESTRATOR_END=$(date +%s)" >> "$GITHUB_ENV"
+          fi
+
+      # ---------------------------------------------------------------------
+      # 7. The capture sequence. This step is the next step after the bounded
+      #    execution and records CAPTURE_START before any parsing.
+      # ---------------------------------------------------------------------
+      - name: Capture the evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          capture_start="$(date +%s)"
+          echo "CAPTURE_START=${capture_start}" >> "$GITHUB_ENV"
+          mkdir -p "$EVIDENCE_DIR"
+          deadline="${CAPTURE_DEADLINE:-0}"
+          echo "CAPTURE_START=${capture_start}" | tee "${EVIDENCE_DIR}/capture-clock.txt"
+          {
+            echo "EVIDENCE_CLOCK_START=${EVIDENCE_CLOCK_START:-UNAVAILABLE}"
+            echo "CAPTURE_DEADLINE=${deadline}"
+            echo "CAPTURE_START_GUARD_SECONDS=${CAPTURE_START_GUARD_SECONDS:-UNAVAILABLE}"
+            echo "CAPTURE_START_WITHIN_DEADLINE=$([[ "$capture_start" -le "$deadline" ]] \
+                 && echo true || echo false)"
+          } >> "${EVIDENCE_DIR}/capture-clock.txt"
+
+          # Every grep below is guarded, so a non-match never ends the step.
+          for name in orchestrator.log orchestrator-timeout.log install.log prepare.log; do
+              [[ -f "${EVIDENCE_DIR}/${name}" ]] || echo "UNAVAILABLE" > "${EVIDENCE_DIR}/${name}"
+          done
+          if [[ -f "${EVIDENCE_DIR}/orchestrator_status.txt" ]]; then
+              cp -- "${EVIDENCE_DIR}/orchestrator_status.txt" \
+                    "${EVIDENCE_DIR}/orchestrator_status.captured.txt"
+          else
+              echo "ABSENT" > "${EVIDENCE_DIR}/orchestrator_status.captured.txt"
+          fi
+
+          workspace_root="${GITHUB_WORKSPACE}/src"
+          batch_dir="${workspace_root}/batch_9"
+          {
+            echo "== Batch Workspace tree =="
+            if [[ -d "$batch_dir" ]]; then find "$batch_dir" -maxdepth 4 | sort; else echo "ABSENT"; fi
+          } > "${EVIDENCE_DIR}/batch-workspace-tree.txt"
+
+          mkdir -p "${EVIDENCE_DIR}/summaries" "${EVIDENCE_DIR}/stage-logs"
+          if [[ -d "$batch_dir" ]]; then
+              find "$batch_dir" -maxdepth 1 -name '*_summary.csv' -type f \
+                   -exec cp -t "${EVIDENCE_DIR}/summaries" -- {} + 2>/dev/null || true
+              find "$batch_dir" -name 'log.*' -type f \
+                   -exec cp -t "${EVIDENCE_DIR}/stage-logs" -- {} + 2>/dev/null || true
+              find "$batch_dir" -name 'FAILED_*' -type f \
+                   -exec cp -t "${EVIDENCE_DIR}/stage-logs" -- {} + 2>/dev/null || true
+          fi
+
+          # Stage results from the summary files, when the summaries exist.
+          stage_from_summary() {
+              local file="$1"
+              if [[ -f "$file" ]]; then
+                  tail -n +2 -- "$file" | head -n 1 || true
+              else
+                  echo "ABSENT"
+              fi
+          }
+          {
+            echo "setup:  $(stage_from_summary "${EVIDENCE_DIR}/summaries/setup_cases_summary.csv")"
+            echo "mesh:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_mesh_cases_summary.csv")"
+            echo "flow:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_flow_cases_summary.csv")"
+            echo "post:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_post_processing_cases_summary.csv")"
+          } > "${EVIDENCE_DIR}/stage-summary-lines.txt"
+
+          {
+            echo "CHECKOUT_RESULT=${CHECKOUT_RESULT:-NOT_ATTEMPTED}"
+            echo "INSTALL_RESULT=${INSTALL_RESULT:-NOT_ATTEMPTED}"
+            echo "PREPARE_RESULT=${PREPARE_RESULT:-NOT_ATTEMPTED}"
+            echo "ORCHESTRATOR_STARTED=${ORCHESTRATOR_STARTED:-false}"
+            echo "TIMEOUT_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS:-NOT_RECORDED}"
+            echo "OVERALL_RESULT=${OVERALL_RESULT:-NOT_ATTEMPTED}"
+            echo "OPENFOAM_VERSION=${OPENFOAM_VERSION:-UNAVAILABLE}"
+          } > "${EVIDENCE_DIR}/phase-results.txt"
+          cat "${EVIDENCE_DIR}/phase-results.txt"
+
+      - name: Write the job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## OpenFOAM v2506 evidence run"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| OpenFOAM version | \`${OPENFOAM_VERSION:-UNAVAILABLE}\` |"
+            echo "| Checkout phase | \`${CHECKOUT_RESULT:-NOT_ATTEMPTED}\` |"
+            echo "| Installation phase | \`${INSTALL_RESULT:-NOT_ATTEMPTED}\` |"
+            echo "| Preparation phase | \`${PREPARE_RESULT:-NOT_ATTEMPTED}\` |"
+            echo "| Orchestrator started | \`${ORCHESTRATOR_STARTED:-false}\` |"
+            echo "| Wrapper status | \`${TIMEOUT_WRAPPER_STATUS:-NOT_RECORDED}\` |"
+            echo "| Overall result | \`${OVERALL_RESULT:-NOT_ATTEMPTED}\` |"
+            echo "| Capture start | \`${CAPTURE_START:-UNAVAILABLE}\` |"
+            echo "| Capture deadline | \`${CAPTURE_DEADLINE:-UNAVAILABLE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openfoam-v2506-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
