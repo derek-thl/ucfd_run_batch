@@ -230,9 +230,41 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
+
+          # The OpenFOAM etc/bashrc sources a chain of scripts. An absent file
+          # ends the step under set -e, and an unset variable in that chain
+          # ends the step under set -u. Either stop would leave the phase
+          # without a reason, so the environment load is guarded and every
+          # failure records INFRASTRUCTURE_FAILURE with the exact reason.
+          if [[ ! -f "$OPENFOAM_BASHRC" ]]; then
+              {
+                echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "INSTALL_REASON=OpenFOAM environment file not found: ${OPENFOAM_BASHRC}"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "environment: INFRASTRUCTURE_FAILURE, no file at ${OPENFOAM_BASHRC}" >&2
+              exit 0
+          fi
+
+          set +eu
           # shellcheck disable=SC1090
           source "$OPENFOAM_BASHRC"
-          version="${WM_PROJECT_VERSION:-UNAVAILABLE}"
+          source_status=$?
+          set -eu
+
+          version="${WM_PROJECT_VERSION:-}"
+          if (( source_status != 0 )) || [[ -z "$version" ]]; then
+              {
+                echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "INSTALL_REASON=OpenFOAM environment did not load from ${OPENFOAM_BASHRC}: source status ${source_status}, WM_PROJECT_VERSION '${version}'"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}, version '${version}'" >&2
+              exit 0
+          fi
+
           {
             echo "WM_PROJECT_VERSION=${version}"
             echo "simpleFoam: $(command -v simpleFoam || echo UNAVAILABLE)"
@@ -340,8 +372,37 @@ jobs:
           set -euo pipefail
           source "$LIB"
           mkdir -p "$EVIDENCE_DIR"
+
+          # The same guarded environment load as the version step. The
+          # Orchestrator never starts without a loaded OpenFOAM environment.
+          if [[ ! -f "$OPENFOAM_BASHRC" ]]; then
+              {
+                echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "INSTALL_REASON=OpenFOAM environment file not found: ${OPENFOAM_BASHRC}"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "environment: INFRASTRUCTURE_FAILURE, no file at ${OPENFOAM_BASHRC}" >&2
+              exit 0
+          fi
+
+          set +eu
           # shellcheck disable=SC1090
           source "$OPENFOAM_BASHRC"
+          source_status=$?
+          set -eu
+
+          if (( source_status != 0 )) || [[ -z "${WM_PROJECT_VERSION:-}" ]]; then
+              {
+                echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "INSTALL_REASON=OpenFOAM environment did not load from ${OPENFOAM_BASHRC}: source status ${source_status}, WM_PROJECT_VERSION '${WM_PROJECT_VERSION:-}'"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}" >&2
+              exit 0
+          fi
+
           csv="${GITHUB_WORKSPACE}/src/output_batch_9.csv"
 
           read -r raw grace guard available <<< "$(budget_seconds 60)"
