@@ -31,7 +31,6 @@ jobs:
       OPENFOAM_PACKAGE: openfoam2506-default
       OPENFOAM_BASHRC: /usr/lib/openfoam/openfoam2506/etc/bashrc
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
-      LIB: ${{ runner.temp }}/evidence_lib.sh
 
     steps:
       # ---------------------------------------------------------------------
@@ -67,6 +66,10 @@ jobs:
       - name: Create the bounded-runner library
         run: |
           set -euo pipefail
+          # The runner context is not available in job-level env, so the step
+          # derives the library path from RUNNER_TEMP and publishes it.
+          LIB="${RUNNER_TEMP}/evidence_lib.sh"
+          echo "LIB=${LIB}" >> "$GITHUB_ENV"
           mkdir -p "$(dirname -- "$LIB")"
           cat > "$LIB" <<'EVIDENCE_LIB'
           # budget_seconds <grace> - print raw, grace, guard, available.
@@ -390,7 +393,9 @@ jobs:
                  && echo true || echo false)"
           } >> "${EVIDENCE_DIR}/capture-clock.txt"
 
-          # Every grep below is guarded, so a non-match never ends the step.
+          # Every extraction below is guarded, so a non-match or a missing
+          # file never ends the step. The only grep in this workflow is the
+          # anchored classifier match, which runs inside an if condition.
           for name in orchestrator.log orchestrator-timeout.log install.log prepare.log; do
               [[ -f "${EVIDENCE_DIR}/${name}" ]] || echo "UNAVAILABLE" > "${EVIDENCE_DIR}/${name}"
           done
