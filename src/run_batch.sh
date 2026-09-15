@@ -468,7 +468,7 @@ stage_declares_library() {
     physical="$(readlink -f -- "$1" 2>/dev/null || true)"
     [[ -n "$physical" ]] || physical="$1"
 
-    grep -qF 'readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1' "$physical" 2>/dev/null
+    grep -qF 'readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2' "$physical" 2>/dev/null
 }
 
 # validate_stage_deployment_unit <stage_runner_path>
@@ -486,7 +486,7 @@ validate_stage_deployment_unit() {
     # the Orchestrator environment and never reads standard input.
     probe="$(cat <<'PROBE'
 source "$1" || exit 1
-[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "1" ]] || exit 1
+[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "2" ]] || exit 1
 PROBE
 )"
 
