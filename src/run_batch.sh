@@ -100,6 +100,11 @@ Environment compatibility:
   MASTER_BATCH_DIR        Same purpose as --master-dir.
   RUN_BATCH_OUTPUT_DIR    Same purpose as --output-dir.
   RUN_BATCH_OVERWRITE=1   Same purpose as --overwrite.
+  BATCH_STAGE_MPI_OVERSUBSCRIBE=1
+                          Add --oversubscribe to each MPI launch of the mesh,
+                          flow, and transport stages. The process environment
+                          carries it to each stage runner. run_batch.sh does
+                          not parse it and does not forward it as an argument.
 
 Examples:
   # Full pipeline (same default behavior as v2).
@@ -463,7 +468,7 @@ stage_declares_library() {
     physical="$(readlink -f -- "$1" 2>/dev/null || true)"
     [[ -n "$physical" ]] || physical="$1"
 
-    grep -qF 'readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1' "$physical" 2>/dev/null
+    grep -qF 'readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2' "$physical" 2>/dev/null
 }
 
 # validate_stage_deployment_unit <stage_runner_path>
@@ -481,7 +486,7 @@ validate_stage_deployment_unit() {
     # the Orchestrator environment and never reads standard input.
     probe="$(cat <<'PROBE'
 source "$1" || exit 1
-[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "1" ]] || exit 1
+[[ "${BATCH_STAGE_LIBRARY_API_VERSION:-}" == "2" ]] || exit 1
 PROBE
 )"
 

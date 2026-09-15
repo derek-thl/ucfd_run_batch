@@ -24,7 +24,7 @@
 # only to prevent ShellCheck SC2034 for a variable that only a sourcing Stage
 # Runner reads. A suppression directive is not used. The reference writes no
 # output, creates no process, defines no helper, and changes no value.
-readonly BATCH_STAGE_LIBRARY_API_VERSION=1
+readonly BATCH_STAGE_LIBRARY_API_VERSION=2
 : "$BATCH_STAGE_LIBRARY_API_VERSION"
 
 # batch_stage_lock_acquire <lock-path> <retry-seconds>
@@ -325,4 +325,79 @@ batch_stage_progress_tick() {
 
     printf -v "$__batch_stage_progress_tick_due_name" '%s' 0
     return 0
+}
+
+# batch_stage_mpi_validate_oversubscribe <normalized-policy-variable-name>
+#
+# The helper validates the cross-Stage MPI launcher oversubscription control of
+# specification Section 9.2 and writes the normalized policy into the named
+# caller variable. The helper reads BATCH_STAGE_MPI_OVERSUBSCRIBE exactly one
+# time.
+#
+#     unset, empty, or 0  ->  off
+#     1                   ->  on
+#     any other value     ->  status 1, and no assignment
+#
+# The helper writes no standard output and no standard error, so each Stage
+# Runner keeps its own operator-visible diagnostic. The helper creates no file
+# and no directory, starts no process, and reads no CPU count. The helper
+# changes no rank count.
+batch_stage_mpi_validate_oversubscribe() {
+    case "${BATCH_STAGE_MPI_OVERSUBSCRIBE-}" in
+        ''|0) printf -v "$1" '%s' off ;;
+        1) printf -v "$1" '%s' on ;;
+        *) return 1 ;;
+    esac
+}
+
+# The output array below stays non-exported, so that the name never enters a
+# Stage Runner child-process environment. The side-effect-free reference exists
+# only to prevent ShellCheck SC2034 for an output that only a sourcing Stage
+# Runner reads. A suppression directive is not used. The reference tests only
+# whether the name is set, so it assigns nothing, initializes no array at source
+# time, reads no element value, and depends on no prior vector. The form is safe
+# under `set -u` for a set name and for an unset name.
+: "${BATCH_STAGE_MPI_LAUNCHER[@]+set}"
+
+# batch_stage_mpi_launcher <rank-count> <normalized-policy>
+#
+# The helper builds the MPI launcher argument vector of specification Section
+# 9.2 and replaces the complete content of the global output array:
+#
+#     BATCH_STAGE_MPI_LAUNCHER
+#
+#     off  ->  (mpirun -np <rank-count>)
+#     on   ->  (mpirun --oversubscribe -np <rank-count>)
+#
+# The helper reads only its two arguments. The helper holds no reference to
+# BATCH_STAGE_MPI_OVERSUBSCRIBE, so the raw environment value is read one time
+# for each Stage Runner process. The helper assigns nothing at source time,
+# reads no prior array content, and depends on no prior vector.
+#
+# The status is 1 when the rank count is not a decimal integer with a value of
+# one or more, and 1 when the normalized policy is neither off nor on. The
+# initial normalized value unvalidated therefore gives status 1, and the array
+# stays unchanged. Each call site guards the status, so a stale vector cannot
+# reach mpirun.
+#
+# The helper writes no standard output and no standard error.
+batch_stage_mpi_launcher() {
+    local __batch_stage_mpi_launcher_ranks="${1-}"
+
+    [[ "$__batch_stage_mpi_launcher_ranks" =~ ^[0-9]+$ ]] || return 1
+    (( __batch_stage_mpi_launcher_ranks >= 1 )) || return 1
+
+    case "${2-}" in
+        off)
+            BATCH_STAGE_MPI_LAUNCHER=(
+                mpirun -np "$__batch_stage_mpi_launcher_ranks"
+            )
+            ;;
+        on)
+            BATCH_STAGE_MPI_LAUNCHER=(
+                mpirun --oversubscribe -np "$__batch_stage_mpi_launcher_ranks"
+            )
+            ;;
+        *) return 1 ;;
+    esac
 }

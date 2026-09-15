@@ -73,6 +73,7 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.Y | Shared Stage CSV parsing | `cases/y_shared_stage_library_csv_parsing.sh` |
 | 23.Z | Shared Stage progress primitives | `cases/z_shared_stage_library_progress.sh` |
 | 23.AA | VTU point-data output | `cases/aa_post_point_data_output.sh` |
+| 23.AB | MPI launcher oversubscription opt-in | `cases/ab_mpi_oversubscribe_optin.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
