@@ -13,7 +13,7 @@ export LC_ALL=C
 # target. The check runs before argument parsing, artifact initialization, Case
 # work, and any OpenFOAM command.
 unset BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION BATCH_STAGE_LIBRARY_API_VERSION
-readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1
+readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2
 BATCH_STAGE_LIBRARY="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib_batch_stage.sh"
 
 batch_stage_library_reject() {
@@ -55,6 +55,12 @@ SOLVER="scalarTransportDeffFoam"
 SCALAR_FIELD="${SCALAR_FIELD:-T}"
 TRANSPORT_MARKER="transport.marker"
 
+# The normalized MPI launcher oversubscription policy of specification Section
+# 9.2. The assignment is unconditional, so an inherited value of the same name
+# cannot survive. The shared Stage library validator is the only writer, and it
+# runs one time for each Stage Runner process.
+MPI_OVERSUBSCRIBE_POLICY="unvalidated"
+
 usage() {
     cat <<'USAGE'
 Usage:
@@ -82,6 +88,10 @@ Environment:
                               controlDict endTime must be >= the maximum value.
   PROGRESS_INTERVAL=5
   SCALAR_FIELD=T             Scalar field name used by the transport case.
+  BATCH_STAGE_MPI_OVERSUBSCRIBE=1
+                             Add --oversubscribe to each MPI launch. Unset,
+                             empty, or 0 is off. Any other value is a fatal
+                             error. The control changes no subdomain count.
 USAGE
 }
 
@@ -283,6 +293,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 validate_config() {
+    batch_stage_mpi_validate_oversubscribe MPI_OVERSUBSCRIBE_POLICY ||
+        die "BATCH_STAGE_MPI_OVERSUBSCRIBE must be unset, empty, 0, or 1. Rejected value: '${BATCH_STAGE_MPI_OVERSUBSCRIBE:-}'"
+
     [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] &&
         ((PARALLEL_JOBS >= 1)) ||
         die "PARALLEL_JOBS must be integer >= 1."
@@ -763,10 +776,16 @@ solve_transport_case() {
     run_tee log.decomposePar decomposePar -force
 
     stage "renumberMesh" "renumbering mesh in parallel, np=$np"
-    run_tee log.renumberMesh mpirun -np "$np" renumberMesh -parallel -overwrite
+    batch_stage_mpi_launcher "$np" "$MPI_OVERSUBSCRIBE_POLICY" ||
+        die "Cannot build the MPI launcher vector for np=${np}."
+    run_tee log.renumberMesh \
+        "${BATCH_STAGE_MPI_LAUNCHER[@]}" renumberMesh -parallel -overwrite
 
     stage "$SOLVER" "transport solver is running, np=$np"
-    run_tee "log.${SOLVER}" mpirun -np "$np" "$SOLVER" -parallel
+    batch_stage_mpi_launcher "$np" "$MPI_OVERSUBSCRIBE_POLICY" ||
+        die "Cannot build the MPI launcher vector for np=${np}."
+    run_tee "log.${SOLVER}" \
+        "${BATCH_STAGE_MPI_LAUNCHER[@]}" "$SOLVER" -parallel
 
     case "$RECONSTRUCT_MODE" in
         latest)

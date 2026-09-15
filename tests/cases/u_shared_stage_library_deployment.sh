@@ -24,7 +24,7 @@ STAGE_RUNNERS=(
 # make_deployment_unit <dir> [<library_mode>] - a real deployment unit built
 # from the production Stage Runners.
 #
-# library_mode: complete | absent | no_version | version_2 | unsourceable | unreadable
+# library_mode: complete | absent | no_version | version_3 | unsourceable | unreadable
 make_deployment_unit() {
     local dir="$1" mode="${2:-complete}" name
 
@@ -39,8 +39,8 @@ make_deployment_unit() {
         no_version)
             printf '#!/usr/bin/env bash\n# no API version\n' \
                 > "${dir}/lib_batch_stage.sh" ;;
-        version_2)
-            printf '#!/usr/bin/env bash\nreadonly BATCH_STAGE_LIBRARY_API_VERSION=2\n' \
+        version_3)
+            printf '#!/usr/bin/env bash\nreadonly BATCH_STAGE_LIBRARY_API_VERSION=3\n' \
                 > "${dir}/lib_batch_stage.sh" ;;
         unsourceable)
             # A Bash syntax error only. No command and no side effect.
@@ -85,7 +85,7 @@ done
 
 # ---- every incompatible library shape fails closed --------------------------
 
-for mode in absent no_version version_2 unsourceable; do
+for mode in absent no_version version_3 unsourceable; do
     workspace="$(new_workspace "direct_${mode}")"
     unit="${workspace}/unit"
     make_deployment_unit "$unit" "$mode"
@@ -115,13 +115,15 @@ else
     chmod 644 "${unit}/lib_batch_stage.sh"
 fi
 
-# An inherited API-version value cannot satisfy the check.
+# An inherited API-version value cannot satisfy the check. The inherited value
+# equals the required value, so the assertion proves the inherited-value removal
+# and not a simple version mismatch.
 
 workspace="$(new_workspace inherited_version)"
 unit="${workspace}/unit"
 make_deployment_unit "$unit" no_version
 
-out="$(cd "$workspace" && BATCH_STAGE_LIBRARY_API_VERSION=1 \
+out="$(cd "$workspace" && BATCH_STAGE_LIBRARY_API_VERSION=2 \
         bash "${unit}/setup_cases.sh" --help 2>&1)" && status=0 || status=$?
 
 assert_status 1 "$status" "an inherited API version cannot satisfy the check"

@@ -100,6 +100,11 @@ Environment compatibility:
   MASTER_BATCH_DIR        Same purpose as --master-dir.
   RUN_BATCH_OUTPUT_DIR    Same purpose as --output-dir.
   RUN_BATCH_OVERWRITE=1   Same purpose as --overwrite.
+  BATCH_STAGE_MPI_OVERSUBSCRIBE=1
+                          Add --oversubscribe to each MPI launch of the mesh,
+                          flow, and transport stages. The process environment
+                          carries it to each stage runner. run_batch.sh does
+                          not parse it and does not forward it as an argument.
 
 Examples:
   # Full pipeline (same default behavior as v2).

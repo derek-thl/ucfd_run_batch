@@ -14,7 +14,7 @@ export LC_ALL=C
 # target. The check runs before argument parsing, artifact initialization, Case
 # work, and any OpenFOAM command.
 unset BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION BATCH_STAGE_LIBRARY_API_VERSION
-readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1
+readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2
 BATCH_STAGE_LIBRARY="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib_batch_stage.sh"
 
 batch_stage_library_reject() {
@@ -44,6 +44,12 @@ RESTART_MARKER="restart.marker"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-5}"
 PROGRESS_MAX_ACTIVE="${PROGRESS_MAX_ACTIVE:-8}"
 
+# The normalized MPI launcher oversubscription policy of specification Section
+# 9.2. The assignment is unconditional, so an inherited value of the same name
+# cannot survive. The shared Stage library validator is the only writer, and it
+# runs one time for each Stage Runner process.
+MPI_OVERSUBSCRIBE_POLICY="unvalidated"
+
 # =============================================================================
 # 1. COMMON HELPERS
 # =============================================================================
@@ -66,6 +72,10 @@ Environment:
   FORCE_MESH=1          Force a fresh mesh rebuild in every case.
   PROGRESS_INTERVAL=5   Console progress interval in seconds.
   PROGRESS_MAX_ACTIVE=8 Maximum active mesh cases listed in each progress update.
+  BATCH_STAGE_MPI_OVERSUBSCRIBE=1
+                        Add --oversubscribe to each MPI launch. Unset, empty,
+                        or 0 is off. Any other value is a fatal error. The
+                        control changes no subdomain count.
 USAGE
 }
 
@@ -342,6 +352,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 validate_config() {
+    batch_stage_mpi_validate_oversubscribe MPI_OVERSUBSCRIBE_POLICY ||
+        die "BATCH_STAGE_MPI_OVERSUBSCRIBE must be unset, empty, 0, or 1. Rejected value: '${BATCH_STAGE_MPI_OVERSUBSCRIBE:-}'"
+
     [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] && (( PARALLEL_JOBS >= 1 )) || die "PARALLEL_JOBS must be integer >= 1."
     [[ "$PROGRESS_INTERVAL" =~ ^[0-9]+$ ]] && (( PROGRESS_INTERVAL >= 1 )) || die "PROGRESS_INTERVAL must be integer >= 1."
     [[ "$PROGRESS_MAX_ACTIVE" =~ ^[0-9]+$ ]] && (( PROGRESS_MAX_ACTIVE >= 1 )) || die "PROGRESS_MAX_ACTIVE must be integer >= 1."
@@ -595,7 +608,10 @@ mesh_current_case() {
     run_step "surfaceFeatureExtract" "extracting surface features" "" surfaceFeatureExtract
     run_step "blockMesh" "building background mesh" "" blockMesh
     run_step "decomposePar" "decomposing mesh for parallel snappyHexMesh" "log.decomposePar.mesh" decomposePar -force
-    run_step "snappyHexMesh" "parallel meshing is running, np=${case_np}" "log.snappyHexMesh" mpirun -np "$case_np" snappyHexMesh -parallel -overwrite
+    batch_stage_mpi_launcher "$case_np" "$MPI_OVERSUBSCRIBE_POLICY" ||
+        die "Cannot build the MPI launcher vector for np=${case_np}."
+    run_step "snappyHexMesh" "parallel meshing is running, np=${case_np}" "log.snappyHexMesh" \
+        "${BATCH_STAGE_MPI_LAUNCHER[@]}" snappyHexMesh -parallel -overwrite
     run_step "reconstructParMesh" "reconstructing parallel mesh" "log.reconstructParMesh" reconstructParMesh -constant
     run_step "checkMesh" "checking mesh and generating wallDistance" "log.checkMesh" checkMesh -allGeometry -allTopology -writeAllFields -time 0
 
