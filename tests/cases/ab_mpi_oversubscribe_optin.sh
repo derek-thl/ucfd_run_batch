@@ -432,7 +432,6 @@ ab_launcher_probe() {
     bash -c '
         set -uo pipefail
         library="$1"; preset="$2"; rank_count="$3"; policy="$4"
-        # shellcheck disable=SC1090
         source "$library"
         if [[ "$preset" == sentinel ]]; then
             BATCH_STAGE_MPI_LAUNCHER=(sentinel-value)
