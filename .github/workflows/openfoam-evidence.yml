@@ -560,9 +560,9 @@ jobs:
           # Change 7. The bounded VTU point-data manifest.
           #
           # The array names come from the file header only. A foamToVTK VTU file is a
-          # VTK XML file whose binary payload starts at <AppendedData. The scan stops
-          # at that marker, so it reads no payload byte, it copies no payload byte,
-          # and it needs no header size limit.
+          # VTK XML file whose binary payload starts at <AppendedData. The extraction
+          # input ends exactly at the first byte of that marker, so the parser never
+          # receives an appended-payload byte and needs no header size limit.
           #
           # The byte count and the SHA-256 describe the complete source file, and the
           # checksum streams that file. A checksum is file identity evidence. It is
@@ -578,26 +578,55 @@ jobs:
           }
 
           vtu_header_point_data_names() {
-              # The record separator is the tag opening character, so each record
-              # holds one XML tag and the scan never depends on line structure. A
-              # PointData element and a CellData element that share one line stay
-              # separate records, so a CellData name cannot reach the output. The
-              # scan ends at the AppendedData record, so the complete header is
-              # processed and no payload byte is read.
-              awk 'BEGIN { RS = "<"; ORS = "" }
-                  /^AppendedData[ \/>]/ { exit }
-                  /^PointData[ \/>]/ { inside = 1; next }
-                  /^\/PointData[ >]/ { inside = 0; next }
-                  inside && /Name="/ {
-                      record = $0
-                      while (match(record, /Name="[^"]*"/)) {
-                          printf "%s%s", (count++ ? " " : ""), \
-                              substr(record, RSTART + 6, RLENGTH - 7)
-                          record = substr(record, RSTART + RLENGTH)
-                      }
-                  }
-                  END { printf "\n" }
-              ' < "$1" 2>/dev/null || true
+              # One streaming pass that stops at the appended-payload marker.
+              #
+              # Each dd call issues one read, so it returns the bytes that are
+              # available instead of waiting for a full block. The loop ends as soon
+              # as the marker appears, and the text is then cut at the marker, so the
+              # parser input holds no appended-payload byte and the extraction never
+              # waits for payload that a producer has not released.
+              #
+              # Two earlier forms were wrong. A 65536-byte limit dropped a valid
+              # PointData declaration past that byte. Making the awk record separator
+              # the tag opening character ended the marker record only at the next
+              # such byte, so the parser could wait for, and hold, the complete
+              # payload.
+              #
+              # The scan is scoped to each PointData element, so a CellData element
+              # that shares one line with a PointData end tag contributes no name.
+              # The regular expressions use the string form, so no separator needs
+              # escaping.
+              local vtu_chunk vtu_header=""
+              exec 3< "$1" || return 0
+              while :; do
+                  vtu_chunk="$(dd bs=512 count=1 status=none <&3)"
+                  [[ -n "$vtu_chunk" ]] || break
+                  vtu_header="${vtu_header}${vtu_chunk}"
+                  case "$vtu_header" in *'<AppendedData'*) break ;; esac
+              done
+              exec 3<&-
+              printf '%s' "${vtu_header%%<AppendedData*}" |
+                  awk 'BEGIN { ORS = "" }
+                      { header = header $0 "\n" }
+                      END {
+                          while (match(header, "<PointData[ />]")) {
+                              header = substr(header, RSTART)
+                              closing = match(header, "</PointData[ >]")
+                              if (closing == 0) {
+                                  segment = header
+                                  header = ""
+                              } else {
+                                  segment = substr(header, 1, closing - 1)
+                                  header = substr(header, closing + 1)
+                              }
+                              while (match(segment, "Name=\"[^\"]*\"")) {
+                                  printf "%s%s", (count++ ? " " : ""), \
+                                      substr(segment, RSTART + 6, RLENGTH - 7)
+                                  segment = substr(segment, RSTART + RLENGTH)
+                              }
+                          }
+                          printf "\n"
+                      }' 2>/dev/null || true
           }
 
           vtk_dir_count=0

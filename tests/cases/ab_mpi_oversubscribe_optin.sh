@@ -604,6 +604,17 @@ s7_capture_step_names_every_log_directory() {
         "S7: the capture step names the post-processing conversion log directory"
 }
 
+# ab_extract_vtu_extractor - print the production vtu_header_point_data_names
+# function from the workflow, de-indented so that it can be sourced. The test
+# therefore runs the exact committed code, not a copy of it.
+ab_extract_vtu_extractor() {
+    awk '
+        /^          vtu_header_point_data_names\(\) \{$/ { inside = 1 }
+        inside { print }
+        inside && /^          \}$/ { exit }
+    ' "$WORKFLOW" | sed -e 's/^          //'
+}
+
 s8_capture_step_writes_the_vtu_manifest() {
     local block
     block="$(ab_workflow_step_block "Capture the evidence")"
@@ -613,6 +624,82 @@ s8_capture_step_writes_the_vtu_manifest() {
         "S8: the manifest reads only the bytes before the appended payload"
     assert_contains "$block" "VTU_EVIDENCE=UNAVAILABLE" \
         "S8: the manifest records an explicit unavailable result"
+    assert_not_contains "$block" "VTU_HEADER_BOUND_BYTES" \
+        "S8: the extraction uses no arbitrary header size limit"
+
+    # The extraction must end at the marker. A record separator that ends the
+    # marker record only at the next tag-opening byte makes the parser wait for,
+    # and hold, the complete appended payload.
+    local workspace extractor fixture producer observed status elapsed start end
+    workspace="$(new_workspace s8_boundary)"
+    extractor="${workspace}/vtu_extractor.sh"
+    ab_extract_vtu_extractor > "$extractor"
+    bash -n "$extractor" ||
+        _fail "S8: the extracted production extractor must parse"
+    assert_contains "$(cat "$extractor")" "vtu_header_point_data_names() {" \
+        "S8: the production extractor is extracted from the workflow"
+
+    # A producer that publishes the complete header and the marker into a stream
+    # that it keeps open, then holds the payload back. A named pipe is used, so
+    # the reader cannot reach end of file early: an extractor that waits for the
+    # appended payload blocks, and a correct extractor completes at the marker.
+    fixture="${workspace}/delayed.vtu"
+    mkfifo "$fixture" || _fail "S8: the scenario needs a named pipe"
+    (
+        printf '<?xml version="1.0"?>\n<VTKFile><UnstructuredGrid><Piece>'
+        printf '<PointData><DataArray Name="U"/><DataArray Name="p"/></PointData>'
+        printf '<CellData><DataArray Name="S8_CELL_MUST_NOT_APPEAR"/></CellData>'
+        printf '</Piece></UnstructuredGrid>\n  <AppendedData encoding="raw">\n'
+        sleep 30
+        printf '_S8_PAYLOAD_MUST_NOT_APPEAR\n  </AppendedData></VTKFile>\n'
+    ) > "$fixture" &
+    producer=$!
+
+    start="$(date +%s)"
+    observed="$(timeout 10 bash -c 'source "$1"; vtu_header_point_data_names "$2"' _ \
+        "$extractor" "$fixture")" && status=0 || status=$?
+    end="$(date +%s)"
+    elapsed=$(( end - start ))
+
+    kill "$producer" 2>/dev/null || true
+    wait "$producer" 2>/dev/null || true
+
+    assert_status 0 "$status" \
+        "S8: the extractor completes while the payload is still withheld"
+    assert_eq "U p" "$observed" \
+        "S8: the extractor reads the complete header before the marker"
+    assert_not_contains "$observed" "S8_CELL_MUST_NOT_APPEAR" \
+        "S8: a same-line CellData element contributes no name"
+    assert_not_contains "$observed" "S8_PAYLOAD_MUST_NOT_APPEAR" \
+        "S8: no appended-payload byte reaches the output"
+    if (( elapsed >= 10 )); then
+        _fail "S8: the extractor must not wait for the appended payload" \
+            "elapsed seconds: ${elapsed}"
+    fi
+
+    # A complete header larger than any fixed limit still yields its names.
+    local large="${workspace}/large.vtu"
+    {
+        printf '<VTKFile><Piece>\n<FieldData>\n'
+        awk 'BEGIN { for (i = 0; i < 900; i++) printf "  pad %05d %s\n", i, \
+             "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }'
+        printf '</FieldData>\n<PointData><DataArray Name="U"/><DataArray Name="p"/></PointData>'
+        printf '<CellData><DataArray Name="S8_LATE_CELL"/></CellData>\n</Piece>\n'
+        printf '  <AppendedData encoding="raw">\n_S8_LATE_PAYLOAD\n  </AppendedData></VTKFile>\n'
+    } > "$large"
+    local large_offset
+    large_offset="$(grep -abo '<PointData' "$large" | head -n 1 | cut -d: -f1)"
+    if (( large_offset <= 65536 )); then
+        _fail "S8: the large-header fixture must declare PointData beyond 65536 bytes" \
+            "observed offset: ${large_offset}"
+    fi
+    observed="$(bash -c 'source "$1"; vtu_header_point_data_names "$2"' _ "$extractor" "$large")"
+    assert_eq "U p" "$observed" \
+        "S8: a PointData declaration beyond 65536 bytes is still read"
+    assert_not_contains "$observed" "S8_LATE_CELL" \
+        "S8: the large-header CellData element contributes no name"
+    assert_not_contains "$observed" "S8_LATE_PAYLOAD" \
+        "S8: the large-header payload contributes no name"
 }
 
 s9_upload_step_includes_hidden_files() {
