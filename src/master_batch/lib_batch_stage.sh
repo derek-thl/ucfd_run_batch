@@ -375,7 +375,9 @@ batch_stage_mpi_validate_oversubscribe() {
 # reads no prior array content, and depends on no prior vector.
 #
 # The status is 1 when the rank count is not a decimal integer with a value of
-# one or more, and 1 when the normalized policy is neither off nor on. The
+# one or more, and 1 when the normalized policy is neither off nor on. The rank
+# count is tested as a decimal string, so no value is read as octal and no
+# arithmetic diagnostic can reach standard error. The
 # initial normalized value unvalidated therefore gives status 1, and the array
 # stays unchanged. Each call site guards the status, so a stale vector cannot
 # reach mpirun.
@@ -384,8 +386,13 @@ batch_stage_mpi_validate_oversubscribe() {
 batch_stage_mpi_launcher() {
     local __batch_stage_mpi_launcher_ranks="${1-}"
 
-    [[ "$__batch_stage_mpi_launcher_ranks" =~ ^[0-9]+$ ]] || return 1
-    (( __batch_stage_mpi_launcher_ranks >= 1 )) || return 1
+    # The rank count is validated as a decimal string, never by arithmetic
+    # evaluation. Bash reads a leading-zero operand as octal, so an arithmetic
+    # test rejects the valid decimal value 08 and writes a diagnostic. The
+    # pattern below accepts one or more decimal digits with a value of one or
+    # more, including a leading-zero form, and it rejects 0, an empty value, and
+    # every non-digit value. The helper keeps the accepted text unchanged.
+    [[ "$__batch_stage_mpi_launcher_ranks" =~ ^0*[1-9][0-9]*$ ]] || return 1
 
     case "${2-}" in
         off)

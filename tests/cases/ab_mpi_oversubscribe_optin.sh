@@ -464,9 +464,13 @@ t14_launcher_rejects_unvalidated() {
 }
 
 t15_launcher_rejects_bad_rank_count() {
-    local workspace out value
-    for value in 0 abc; do
-        workspace="$(new_workspace "t15_${value}")"
+    local workspace out value label
+
+    # A rejected rank count gives status 1, leaves the array unchanged, and
+    # writes nothing.
+    for value in 0 00 abc 1.5 -1 "+8"; do
+        label="${value//[^0-9a-zA-Z]/x}"
+        workspace="$(new_workspace "t15_reject_${label}")"
         out="$(ab_launcher_probe "$workspace" sentinel "$value" on)"
 
         assert_contains "$out" "status=1" \
@@ -478,6 +482,33 @@ t15_launcher_rejects_bad_rank_count() {
         assert_eq "" "$(cat "${workspace}/stderr.txt")" \
             "T15: the library writes no standard-error output for '${value}'"
     done
+
+    # A leading-zero decimal rank count is valid. Bash reads a leading-zero
+    # operand as octal, so an arithmetic test would reject 08 and would write a
+    # diagnostic. The launcher validates a decimal string instead, and it keeps
+    # the accepted rank-count text unchanged in the vector.
+    workspace="$(new_workspace t15_accept_08)"
+    out="$(ab_launcher_probe "$workspace" none 08 off)"
+
+    assert_contains "$out" "status=0" \
+        "T15: the launcher accepts the decimal rank count 08"
+    assert_contains "$out" "element=mpirun" \
+        "T15: the rank count 08 writes a launcher vector"
+    assert_eq "$(printf 'status=0\narray=SET\nelement=mpirun\nelement=-np\nelement=08')" \
+        "$out" \
+        "T15: the rank count 08 gives the exact vector mpirun -np 08"
+    assert_eq "" "$(cat "${workspace}/stderr.txt")" \
+        "T15: the rank count 08 writes no standard-error output"
+
+    # The same rule holds with the on policy and with a longer leading-zero run.
+    workspace="$(new_workspace t15_accept_007_on)"
+    out="$(ab_launcher_probe "$workspace" none 007 on)"
+
+    assert_eq "$(printf 'status=0\narray=SET\nelement=mpirun\nelement=--oversubscribe\nelement=-np\nelement=007')" \
+        "$out" \
+        "T15: the rank count 007 keeps its exact text with the on policy"
+    assert_eq "" "$(cat "${workspace}/stderr.txt")" \
+        "T15: the rank count 007 writes no standard-error output"
 }
 
 # ---- workflow static-check helpers -----------------------------------------

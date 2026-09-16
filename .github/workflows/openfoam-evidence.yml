@@ -560,14 +560,13 @@ jobs:
           # Change 7. The bounded VTU point-data manifest.
           #
           # The array names come from the file header only. A foamToVTK VTU file is a
-          # VTK XML file whose binary payload starts at <AppendedData. The extraction
-          # reads a bounded prefix and stops at that marker, so it never reads a
-          # payload byte and never copies a VTU file into the artifact.
+          # VTK XML file whose binary payload starts at <AppendedData. The scan stops
+          # at that marker, so it reads no payload byte, it copies no payload byte,
+          # and it needs no header size limit.
           #
           # The byte count and the SHA-256 describe the complete source file, and the
           # checksum streams that file. A checksum is file identity evidence. It is
           # not scientific validation.
-          VTU_HEADER_BOUND_BYTES=65536
 
           vtu_expected_fields() {
               case "${1##*/}" in
@@ -579,20 +578,26 @@ jobs:
           }
 
           vtu_header_point_data_names() {
-              head -c "$VTU_HEADER_BOUND_BYTES" -- "$1" 2>/dev/null |
-                  sed -e '/<AppendedData/q' |
-                  awk '
-                      /<PointData/ { inside = 1 }
-                      inside {
-                          line = $0
-                          while (match(line, /Name="[^"]*"/)) {
-                              printf "%s ", substr(line, RSTART + 6, RLENGTH - 7)
-                              line = substr(line, RSTART + RLENGTH)
-                          }
+              # The record separator is the tag opening character, so each record
+              # holds one XML tag and the scan never depends on line structure. A
+              # PointData element and a CellData element that share one line stay
+              # separate records, so a CellData name cannot reach the output. The
+              # scan ends at the AppendedData record, so the complete header is
+              # processed and no payload byte is read.
+              awk 'BEGIN { RS = "<"; ORS = "" }
+                  /^AppendedData[ \/>]/ { exit }
+                  /^PointData[ \/>]/ { inside = 1; next }
+                  /^\/PointData[ >]/ { inside = 0; next }
+                  inside && /Name="/ {
+                      record = $0
+                      while (match(record, /Name="[^"]*"/)) {
+                          printf "%s%s", (count++ ? " " : ""), \
+                              substr(record, RSTART + 6, RLENGTH - 7)
+                          record = substr(record, RSTART + RLENGTH)
                       }
-                      /<\/PointData>/ { inside = 0 }
-                  ' 2>/dev/null |
-                  sed -e 's/[[:space:]]*$//' || true
+                  }
+                  END { printf "\n" }
+              ' < "$1" 2>/dev/null || true
           }
 
           vtk_dir_count=0
@@ -605,7 +610,6 @@ jobs:
             echo "== VTU point-data manifest =="
             echo "EXPECTED_FIELD_SOURCE=run_post_processing_cases.sh FLOW_ZERO_FIELDS, FLOW_RESULT_FIELDS, TRD_FIELDS"
             echo "SCALAR_FIELD=${SCALAR_FIELD:-T}"
-            echo "VTU_HEADER_BOUND_BYTES=${VTU_HEADER_BOUND_BYTES}"
             echo "VTK_DIRECTORY_COUNT=${vtk_dir_count}"
             vtu_count=0
             while IFS= read -r vtu_file; do
