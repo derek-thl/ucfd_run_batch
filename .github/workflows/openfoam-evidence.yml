@@ -30,7 +30,6 @@ jobs:
     env:
       OPENFOAM_PACKAGE: openfoam2506-default
       OPENFOAM_BASHRC: /usr/lib/openfoam/openfoam2506/etc/bashrc
-      EVIDENCE_DIR: ${{ github.workspace }}/evidence
 
     steps:
       # ---------------------------------------------------------------------
@@ -40,6 +39,11 @@ jobs:
       - name: Start the evidence clock
         run: |
           start="$(date +%s)"
+          # The runner context is not available in job-level env, and the
+          # evidence directory must stay outside the checkout, so this step
+          # derives it from RUNNER_TEMP and publishes it. This step writes no
+          # repository file and no evidence file, so the order is safe.
+          echo "EVIDENCE_DIR=${RUNNER_TEMP}/evidence" >> "$GITHUB_ENV"
           echo "EVIDENCE_CLOCK_START=${start}" >> "$GITHUB_ENV"
           echo "CAPTURE_DEADLINE=$(( start + 6300 ))" >> "$GITHUB_ENV"
           echo "CAPTURE_START_GUARD_SECONDS=60" >> "$GITHUB_ENV"
@@ -368,6 +372,12 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Run the Orchestrator
         if: always() && env.PREPARE_RESULT == 'SUCCEEDED'
+        env:
+          # The opt-in of specification Section 9.2. The runner has four cores
+          # and the committed Case default is NP="8", so the mesh Stage needs
+          # the explicit oversubscription policy. The value stays on this one
+          # step, so no other step and no other phase inherits it.
+          BATCH_STAGE_MPI_OVERSUBSCRIBE: "1"
         run: |
           set -euo pipefail
           source "$LIB"
@@ -474,19 +484,66 @@ jobs:
             if [[ -d "$batch_dir" ]]; then find "$batch_dir" -maxdepth 4 | sort; else echo "ABSENT"; fi
           } > "${EVIDENCE_DIR}/batch-workspace-tree.txt"
 
+          # The corrected selective capture. Each selected file keeps its path
+          # relative to the Batch Workspace, so a reviewer can see which Stage and
+          # which Case produced it. The selection stays explicit: no VTU file, no
+          # checkout copy, and no unfiltered Batch Workspace copy is collected.
+          #
+          # copy_relative <source-file> <destination-root>
+          copy_relative() {
+              local source_file="$1" destination_root="$2" relative target
+              relative="${source_file#"${batch_dir}/"}"
+              target="${destination_root}/${relative}"
+              mkdir -p -- "$(dirname -- "$target")" 2>/dev/null || return 0
+              cp -- "$source_file" "$target" 2>/dev/null || true
+          }
+
+          # collect_selected <destination-root> <find-expression>...
+          collect_selected() {
+              local destination_root="$1"
+              shift
+              local selected
+              while IFS= read -r selected; do
+                  [[ -n "$selected" ]] || continue
+                  copy_relative "$selected" "$destination_root"
+              done < <(find "$batch_dir" "$@" -type f 2>/dev/null || true)
+          }
+
           mkdir -p "${EVIDENCE_DIR}/summaries" "${EVIDENCE_DIR}/stage-logs"
           if [[ -d "$batch_dir" ]]; then
-              find "$batch_dir" -maxdepth 1 -name '*_summary.csv' -type f \
-                   -exec cp -t "${EVIDENCE_DIR}/summaries" -- {} + 2>/dev/null || true
-              find "$batch_dir" -name 'log.*' -type f \
-                   -exec cp -t "${EVIDENCE_DIR}/stage-logs" -- {} + 2>/dev/null || true
-              find "$batch_dir" -name 'FAILED_*' -type f \
-                   -exec cp -t "${EVIDENCE_DIR}/stage-logs" -- {} + 2>/dev/null || true
+              # Each Stage summary is a root-relative file, so its relative path is
+              # its file name and the destination stays the same as before.
+              collect_selected "${EVIDENCE_DIR}/summaries" \
+                  -maxdepth 1 -name '*_summary.csv'
+
+              # Fault 1. The five Failure Artifact names begin with a dot, so the
+              # earlier FAILED_* pattern matched none of them.
+              collect_selected "${EVIDENCE_DIR}/stage-logs" -maxdepth 1 \
+                  \( -name '.setup_cases_failed' \
+                  -o -name '.run_mesh_cases_failed' \
+                  -o -name '.run_flow_cases_failed' \
+                  -o -name '.run_transport_cases_failed' \
+                  -o -name '.run_post_processing_cases_failed' \)
+
+              # The Case-level OpenFOAM command logs.
+              collect_selected "${EVIDENCE_DIR}/stage-logs" -name 'log.*'
+
+              # Fault 2. Every per-Case Stage log directory, and the post-processing
+              # conversion logs under <case>/vtk/logs.
+              collect_selected "${EVIDENCE_DIR}/stage-logs" \
+                  \( -path '*/_setup_logs/*' \
+                  -o -path '*/_mesh_logs/*' \
+                  -o -path '*/_flow_logs/*' \
+                  -o -path '*/_transport_logs/*' \
+                  -o -path '*/vtk/logs/*' \) -name '*.log'
           fi
 
-          # Stage results from the summary files, when the summaries exist.
+          # Stage results from the summary files, when the summaries exist. The
+          # summaries keep their Batch Workspace-relative path, and each Stage
+          # summary is a root-relative file, so stage-summary-lines.txt keeps its
+          # existing payload.
           stage_from_summary() {
-              local file="$1"
+              local file="${EVIDENCE_DIR}/summaries/$1"
               if [[ -f "$file" ]]; then
                   tail -n +2 -- "$file" | head -n 1 || true
               else
@@ -494,11 +551,123 @@ jobs:
               fi
           }
           {
-            echo "setup:  $(stage_from_summary "${EVIDENCE_DIR}/summaries/setup_cases_summary.csv")"
-            echo "mesh:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_mesh_cases_summary.csv")"
-            echo "flow:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_flow_cases_summary.csv")"
-            echo "post:   $(stage_from_summary "${EVIDENCE_DIR}/summaries/run_post_processing_cases_summary.csv")"
+            echo "setup:  $(stage_from_summary setup_cases_summary.csv)"
+            echo "mesh:   $(stage_from_summary run_mesh_cases_summary.csv)"
+            echo "flow:   $(stage_from_summary run_flow_cases_summary.csv)"
+            echo "post:   $(stage_from_summary run_post_processing_cases_summary.csv)"
           } > "${EVIDENCE_DIR}/stage-summary-lines.txt"
+
+          # Change 7. The bounded VTU point-data manifest.
+          #
+          # The array names come from the file header only. A foamToVTK VTU file is a
+          # VTK XML file whose binary payload starts at <AppendedData. The extraction
+          # input ends exactly at the first byte of that marker, so the parser never
+          # receives an appended-payload byte and needs no header size limit.
+          #
+          # The byte count and the SHA-256 describe the complete source file, and the
+          # checksum streams that file. A checksum is file identity evidence. It is
+          # not scientific validation.
+
+          vtu_expected_fields() {
+              case "${1##*/}" in
+                  flow_0.vtu) echo "U p wallDistance" ;;
+                  flow_latest_*.vtu) echo "U p" ;;
+                  trd_*.vtu) echo "${SCALAR_FIELD:-T}" ;;
+                  *) echo "UNKNOWN" ;;
+              esac
+          }
+
+          vtu_header_point_data_names() {
+              # One streaming pass that stops at the appended-payload marker.
+              #
+              # Each dd call issues one read, so it returns the bytes that are
+              # available instead of waiting for a full block. The loop ends as soon
+              # as the marker appears, and the text is then cut at the marker, so the
+              # parser input holds no appended-payload byte and the extraction never
+              # waits for payload that a producer has not released.
+              #
+              # Two earlier forms were wrong. A 65536-byte limit dropped a valid
+              # PointData declaration past that byte. Making the awk record separator
+              # the tag opening character ended the marker record only at the next
+              # such byte, so the parser could wait for, and hold, the complete
+              # payload.
+              #
+              # The scan is scoped to each PointData element, so a CellData element
+              # that shares one line with a PointData end tag contributes no name.
+              # The regular expressions use the string form, so no separator needs
+              # escaping.
+              local vtu_chunk vtu_header=""
+              exec 3< "$1" || return 0
+              while :; do
+                  vtu_chunk="$(dd bs=512 count=1 status=none <&3)"
+                  [[ -n "$vtu_chunk" ]] || break
+                  vtu_header="${vtu_header}${vtu_chunk}"
+                  case "$vtu_header" in *'<AppendedData'*) break ;; esac
+              done
+              exec 3<&-
+              printf '%s' "${vtu_header%%<AppendedData*}" |
+                  awk 'BEGIN { ORS = "" }
+                      { header = header $0 "\n" }
+                      END {
+                          while (match(header, "<PointData[ />]")) {
+                              header = substr(header, RSTART)
+                              closing = match(header, "</PointData[ >]")
+                              if (closing == 0) {
+                                  segment = header
+                                  header = ""
+                              } else {
+                                  segment = substr(header, 1, closing - 1)
+                                  header = substr(header, closing + 1)
+                              }
+                              while (match(segment, "Name=\"[^\"]*\"")) {
+                                  printf "%s%s", (count++ ? " " : ""), \
+                                      substr(segment, RSTART + 6, RLENGTH - 7)
+                                  segment = substr(segment, RSTART + RLENGTH)
+                              }
+                          }
+                          printf "\n"
+                      }' 2>/dev/null || true
+          }
+
+          vtk_dir_count=0
+          if [[ -d "$batch_dir" ]]; then
+              vtk_dir_count="$(find "$batch_dir" -type d -name vtk 2>/dev/null |
+                               wc -l | tr -d ' ')"
+          fi
+
+          {
+            echo "== VTU point-data manifest =="
+            echo "EXPECTED_FIELD_SOURCE=run_post_processing_cases.sh FLOW_ZERO_FIELDS, FLOW_RESULT_FIELDS, TRD_FIELDS"
+            echo "SCALAR_FIELD=${SCALAR_FIELD:-T}"
+            echo "VTK_DIRECTORY_COUNT=${vtk_dir_count}"
+            vtu_count=0
+            while IFS= read -r vtu_file; do
+                [[ -n "$vtu_file" ]] || continue
+                vtu_count=$(( vtu_count + 1 ))
+                echo
+                echo "VTU_PATH=${vtu_file#"${batch_dir}/"}"
+                echo "VTU_BYTES=$(wc -c < "$vtu_file" 2>/dev/null | tr -d ' ')"
+                echo "VTU_SHA256=$(sha256sum -- "$vtu_file" 2>/dev/null | cut -d' ' -f1)"
+                echo "VTU_EXPECTED_FIELDS=$(vtu_expected_fields "$vtu_file")"
+                echo "VTU_OBSERVED_FIELDS=$(vtu_header_point_data_names "$vtu_file")"
+            done < <(find "$batch_dir" -path '*/vtk/*' -name '*.vtu' -type f \
+                         2>/dev/null | sort || true)
+            echo
+            echo "VTU_FILE_COUNT=${vtu_count}"
+            if (( vtu_count == 0 )); then
+                echo "VTU_EVIDENCE=UNAVAILABLE"
+                if [[ ! -d "$batch_dir" ]]; then
+                    echo "VTU_REASON=The Batch Workspace does not exist, so the post-processing Stage produced no VTU file."
+                elif (( vtk_dir_count == 0 )); then
+                    echo "VTU_REASON=No Case holds a vtk directory, so the post-processing Stage wrote no VTU file."
+                else
+                    echo "VTU_REASON=A vtk directory exists and holds no .vtu file."
+                fi
+            else
+                echo "VTU_EVIDENCE=PRESENT"
+            fi
+          } > "${EVIDENCE_DIR}/vtu-point-data.txt"
+          cat "${EVIDENCE_DIR}/vtu-point-data.txt"
 
           {
             echo "CHECKOUT_RESULT=${CHECKOUT_RESULT:-NOT_ATTEMPTED}"
@@ -536,6 +705,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openfoam-v2506-evidence
-          path: evidence/
-          if-no-files-found: warn
+          # Only the selected evidence of the capture step. The directory holds
+          # no checkout copy, no unfiltered Batch Workspace, and no VTU file.
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          # The five Failure Artifact names begin with a dot. The action default
+          # is false, so a copied dot-prefixed file would not reach the artifact
+          # without this input.
+          include-hidden-files: true
           retention-days: 90

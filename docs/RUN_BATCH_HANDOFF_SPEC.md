@@ -93,13 +93,15 @@ The selected Stage Runner MUST resolve the library from the physical directory t
 
 The central-first Stage Runner resolution rule applies to the complete deployment unit. A central Stage Runner MUST use the central co-located library. A batch-local Stage Runner MUST use the batch-local co-located library. A Stage Runner MUST NOT fall back to a library from the other location.
 
-The library MUST publish `BATCH_STAGE_LIBRARY_API_VERSION`. Each new Stage Runner that uses the library MUST contain the literal declaration `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1`. Before the Stage Runner sources the library, the Stage Runner MUST remove inherited values of both API-version variables and set the required value from its literal declaration. The Stage Runner MUST verify that the library value equals the required value.
+The library MUST publish `BATCH_STAGE_LIBRARY_API_VERSION`. Each new Stage Runner that uses the library MUST contain the literal declaration `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2`. Before the Stage Runner sources the library, the Stage Runner MUST remove inherited values of both API-version variables and set the required value from its literal declaration. The Stage Runner MUST verify that the library value equals the required value.
 
 The library MUST have no source-time file, process, network, or console side effect. Source time MAY assign library variables and define functions only.
 
-The library MUST use the `batch_stage_` namespace for shared helper functions. The library MAY own common mutual-exclusion mechanics, atomic append mechanics, job-pool primitives, CSV field tokenization and index lookup, and progress primitives.
+The library MUST use the `batch_stage_` namespace for shared helper functions. The library MAY own common mutual-exclusion mechanics, atomic append mechanics, job-pool primitives, CSV field tokenization and index lookup, progress primitives, and the value validation and launcher-argument-vector construction of the cross-Stage MPI launcher oversubscription policy of Section 9.2.
 
 Each Stage Runner MUST continue to own its CLI, environment controls, Stage-specific commands, required CSV columns, header text, row composition, artifact paths, summary schema, Failure Artifact schema, operator-visible messages, final status interpretation, markers, and restart behavior.
+
+"Environment controls" in the rule above means the Stage-specific environment controls of Section 3.2. A cross-Stage environment control of Section 9 is not a Stage-specific control. For the cross-Stage MPI launcher oversubscription policy of Section 9.2 only, the library MAY own the validation of the value and the construction of the launcher argument vector. Each Stage Runner that launches MPI MUST still own its CLI, its help text, the position of its validation call, the position of each launcher call, every Stage-specific command and argument, every operator-visible message, and every status interpretation. The library MUST NOT own a Stage Runner CLI option, help text, invocation position, Stage-specific command, operator-visible message, or status interpretation.
 
 The shared implementation MUST preserve each Stage Runner's current status propagation. The shared implementation MUST NOT normalize different lock-release, failure-record, child-status, or progress-output behavior.
 
@@ -509,6 +511,7 @@ The following top-level environment variables MUST remain supported:
 | `RUN_BATCH_OUTPUT_DIR` | Same purpose as `--output-dir`. |
 | `RUN_BATCH_OVERWRITE=1` | Same purpose as `--overwrite`. |
 | `SCALAR_FIELD` | Default scalar field unless overridden by `--scalar-field`. |
+| `BATCH_STAGE_MPI_OVERSUBSCRIBE` | Cross-Stage MPI launcher oversubscription policy of Section 9.2. The process environment carries the value to each Stage Runner. The Orchestrator MUST NOT parse the value and MUST NOT forward it as an argument. |
 
 CLI values take effect after environment defaults are loaded.
 
@@ -594,7 +597,7 @@ The central `master_batch` copy is authoritative when available.
 
 The selected Stage Runner path and its co-located `lib_batch_stage.sh` are one resolution result. The Orchestrator MUST resolve the physical Stage Runner target and MUST use the library from that physical target directory. The Orchestrator MUST NOT select a Stage Runner from one location and a library from another location.
 
-A selected Stage Runner declares its library requirement with the literal line `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1`. The Orchestrator MUST require and validate a compatible co-located library only when the selected Stage Runner contains this declaration. A selected Stage Runner without this declaration MUST run unchanged.
+A selected Stage Runner declares its library requirement with the literal line `readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2`. The Orchestrator MUST require and validate a compatible co-located library only when the selected Stage Runner contains this declaration. A selected Stage Runner without this declaration MUST run unchanged.
 
 A central Stage Runner with the declaration MUST use its central co-located library. A batch-local Stage Runner with the declaration MUST use its batch-local co-located library. A missing or incompatible co-located library MUST fail structural preflight. The Orchestrator MUST NOT fall back to the other location after it selects a Stage Runner.
 
@@ -696,6 +699,44 @@ An optional post-processing Stage without a resolvable Stage Runner stays skippe
 The exported environment contract of this section stays unchanged. The Orchestrator keeps three Batch Workspace channels by design: the current working directory, the explicit `-O` argument, and the exported `BATCH_DIR`.
 
 Direct Stage Runner invocation stays unchanged. `-O` and `--output-dir` support, the existing default output directory, the validation, and the path resolution of each Stage Runner stay unchanged.
+
+### 9.2 MPI launcher oversubscription control
+
+The environment variable `BATCH_STAGE_MPI_OVERSUBSCRIBE` selects the MPI launcher oversubscription policy.
+
+| Value | Policy |
+|---|---|
+| unset | Off. |
+| empty | Off. |
+| `0` | Off. |
+| `1` | On. |
+| any other value | Fatal configuration error. |
+
+When the policy is off, the MPI launcher argument vector MUST be:
+
+```text
+mpirun -np <rank-count> <command> <command arguments>
+```
+
+When the policy is on, the MPI launcher argument vector MUST be:
+
+```text
+mpirun --oversubscribe -np <rank-count> <command> <command arguments>
+```
+
+`--oversubscribe` MUST occur exactly once. It MUST occur directly after `mpirun`. `-np` and its value MUST stay adjacent. The control MUST change no other argument.
+
+The control MUST apply to every MPI launch of the mesh Stage Runner, the flow Stage Runner, and the transport Stage Runner. The post-processing Stage Runner and the setup Stage Runner launch no MPI command and MUST ignore the control.
+
+The control MUST NOT change `NP`. The control MUST NOT change `numberOfSubdomains` in `system/decomposeParDict`. The control MUST NOT read the CPU count of the machine. The control MUST NOT reduce or increase a rank count.
+
+**Ownership.** This control is a cross-Stage environment control of this section. It is not a Stage-specific environment control of Section 3.2. The shared Stage library MUST own two duties only: the validation of the value, and the construction of the launcher argument vector. Each Stage Runner that launches MPI MUST obtain its launcher argument vector from the shared Stage library, and MUST NOT hold a private copy of the policy logic. Each Stage Runner that launches MPI MUST keep its own CLI, its own help text, the position of its validation call, the position of each launcher call, every Stage-specific command and argument, every operator-visible message, and every status interpretation. The shared Stage library MUST NOT parse a CLI option, MUST NOT print a help text, MUST NOT write an operator-visible diagnostic, and MUST NOT interpret the status of an OpenFOAM command.
+
+**Validation order.** A Stage Runner that launches MPI MUST parse its arguments before it validates this control. `-h` and `--help` MUST print the help text and MUST return status `0`, even when the value of the control is invalid. For an execution request, the Stage Runner MUST validate the value exactly one time for each Stage Runner process. The validation MUST occur after argument parsing, and before global validation creates a Stage summary, a Failure Artifact, a log directory, a state directory, or a Case artifact, and before any OpenFOAM command. An invalid value MUST make the Stage Runner exit with status `1` and MUST write a diagnostic that names the variable and the rejected value.
+
+**One normalized state.** A Stage Runner that launches MPI MUST hold one normalized policy state for its process. The validation MUST set that state exactly one time. The launcher construction MUST consume the normalized state, and MUST NOT read or validate `BATCH_STAGE_MPI_OVERSUBSCRIBE` again.
+
+The Orchestrator MUST NOT parse the control and MUST NOT forward it as an argument. The process environment carries the control to each Stage Runner. Direct Stage Runner invocation MUST honor the control in the same way as Orchestrator invocation.
 
 ## 10. Stage job-count precedence
 
@@ -1029,6 +1070,7 @@ Environment:
 FORCE_MESH=1
 PROGRESS_INTERVAL=5
 PROGRESS_MAX_ACTIVE=8
+BATCH_STAGE_MPI_OVERSUBSCRIBE=1
 ```
 
 Default parallel case count is `2`.
@@ -1135,6 +1177,7 @@ Environment:
 FORCE_FLOW=1
 CLEAN_PROCESSORS=0|1
 RECONSTRUCT_MODE=latest|all|none
+BATCH_STAGE_MPI_OVERSUBSCRIBE=1
 ```
 
 Defaults:
@@ -1272,6 +1315,7 @@ RECONSTRUCT_MODE=latest|all|custom|none
 TRANSPORT_SAVE_TIMES=<list>
 PROGRESS_INTERVAL=5
 SCALAR_FIELD=T
+BATCH_STAGE_MPI_OVERSUBSCRIBE=1
 ```
 
 Defaults:
@@ -2214,7 +2258,7 @@ Use the Orchestrator CLI and direct Stage Runner CLIs.
 Expected:
 
 - every new Stage Runner uses only `lib_batch_stage.sh` beside its physical target;
-- the required library API version is `1`;
+- the required library API version is `2`;
 - a declared central Stage Runner does not use a batch-local library;
 - a declared batch-local Stage Runner does not use a central library;
 - a symbolic-link Stage Runner uses the library beside the physical target;
@@ -2324,6 +2368,20 @@ Expected:
 
 - no recorded `foamToVTK` argument vector contains `-no-point-data`, and each recorded argument vector keeps `-time`, `-no-boundary`, and `-fields`, with the flow zero-time selection `(U p wallDistance)`, the flow result selection `(U p)`, and the transport selection `($SCALAR_FIELD)`;
 - a completion marker without the VTU point-data policy rebuilds the case one time and writes a current marker, a following run with an unchanged source reports `skipped` and runs no conversion, and `FORCE_POST=1` still rebuilds a current case.
+
+### AB. MPI launcher oversubscription opt-in
+
+Use the mesh, flow, and transport Stage Runner CLIs.
+
+Expected:
+
+- with `BATCH_STAGE_MPI_OVERSUBSCRIBE` unset, empty, or `0`, every recorded `mpirun` argument vector equals the vector of the base behavior and contains no `--oversubscribe`;
+- with the value `1`, every recorded `mpirun` argument vector contains `--oversubscribe` exactly one time, directly after the launcher and directly before `-np`;
+- with the value `1`, both transport MPI launches contain `--oversubscribe` in that exact position;
+- with an invalid value and an execution request, the Stage Runner exits with status `1`, writes a diagnostic that names the variable and the value, records no OpenFOAM command, and creates no summary file and no Failure Artifact;
+- with an invalid value and `-h` or `--help`, each MPI Stage Runner prints its help text, returns status `0`, writes no invalid-policy diagnostic, records no OpenFOAM command, and creates no summary file and no Failure Artifact;
+- the control changes `numberOfSubdomains` in no Case;
+- the post-processing Stage result does not change.
 
 ## 24. Multi-agent GitHub handoff rules
 

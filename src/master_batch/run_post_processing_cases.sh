@@ -24,7 +24,7 @@ export LC_ALL=C
 # target. The check runs before argument parsing, artifact initialization, Case
 # work, and any OpenFOAM command.
 unset BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION BATCH_STAGE_LIBRARY_API_VERSION
-readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=1
+readonly BATCH_STAGE_LIBRARY_REQUIRED_API_VERSION=2
 BATCH_STAGE_LIBRARY="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib_batch_stage.sh"
 
 batch_stage_library_reject() {
