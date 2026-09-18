@@ -18,6 +18,7 @@ summary="${workspace}/run_post_processing_cases_summary.csv"
 make_flow_case "$flow_dir" 2
 make_flow_result "$flow_dir" 3000
 make_transport_case "$trd_dir" 2 T 300
+make_flow_mesh "$trd_dir"
 mkdir -p "${trd_dir}/300"
 printf 'FoamFile { object T; }\n' > "${trd_dir}/300/T"
 

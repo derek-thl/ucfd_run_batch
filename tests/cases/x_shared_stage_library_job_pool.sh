@@ -490,6 +490,7 @@ for index in 0 1 2 3; do
     make_flow_case "${workspace}/case_${index}/flow" 2
     make_flow_result "${workspace}/case_${index}/flow" 3000
     make_transport_case "${workspace}/case_${index}/trd" 2 T 300
+    make_flow_mesh "${workspace}/case_${index}/trd"
 done
 new_control post_pool
 post_bin="${workspace}/_control_bin"

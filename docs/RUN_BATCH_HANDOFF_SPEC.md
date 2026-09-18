@@ -1480,6 +1480,8 @@ run_post_processing_cases.sh
 
 Convert selected reconstructed OpenFOAM flow and transport results into per-case VTU files.
 
+Flow output is required for every requested case. Transport output is conditional on transport readiness. A transport subcase is ready only when the directory `case_<Case>/trd/constant/polyMesh` exists. An absent `trd/` directory and a `trd/` directory without `constant/polyMesh` are both not ready.
+
 Expected layout:
 
 ```text
@@ -1487,8 +1489,8 @@ case_<Case>/vtk/
 ├── flow_0.vtu
 ├── flow_latest_<time>.vtu
 ├── flow_latest_time.txt
-├── trd_0.vtu
-├── trd_<time>.vtu
+├── trd_0.vtu                  (only when transport is ready)
+├── trd_<time>.vtu             (only when transport is ready)
 ├── ...
 ├── post_processing.complete
 └── logs/
@@ -1548,12 +1550,14 @@ flow_latest_<time>.vtu       fields: U p
 flow_latest_time.txt
 ```
 
-Transport outputs:
+Transport outputs, only when `trd/constant/polyMesh` exists:
 
 ```text
 trd_0.vtu                    field: SCALAR_FIELD
 trd_<each reconstructed nonzero time>.vtu
 ```
+
+When `trd/constant/polyMesh` does not exist, the runner MUST run no transport conversion and MUST create no transport output. The skip is not a case failure. When `trd/constant/polyMesh` exists, transport conversion is required, and missing transport time or field input remains a conversion failure.
 
 ### 18.4 Incremental/idempotent post-processing
 
@@ -1569,6 +1573,7 @@ The marker content is a source-result signature. The signature MUST include at l
 
 ```text
 latest flow time
+transport readiness          transport_ready=0|1
 list of transport times
 SCALAR_FIELD
 flow zero-time field selection
@@ -1576,7 +1581,11 @@ flow result field selection
 VTU point-data policy
 ```
 
-A completion marker that does not record the VTU point-data policy is not current. The post stage MUST rebuild that case.
+The signature MUST record `transport_ready` before the list of transport times. `transport_ready=1` means that `trd/constant/polyMesh` exists. `transport_ready=0` means that `trd/` is absent or has no `constant/polyMesh`. When `transport_ready=0`, the signature MUST record an empty list of transport times and MUST NOT require a transport directory. When `transport_ready=1`, the signature keeps the current list of transport times.
+
+A completion marker that does not record the VTU point-data policy is not current. A completion marker that does not record `transport_ready` is not current. The post stage MUST rebuild that case one time.
+
+The expected VTU outputs are readiness-aware. `flow_0.vtu` and `flow_latest_<time>.vtu` are always expected. `trd_0.vtu` and every `trd_<time>.vtu` are expected only when `transport_ready=1`.
 
 If all of these are true:
 
@@ -1589,7 +1598,11 @@ then the case MUST be skipped as current.
 
 If the source signature changes, an expected output is missing, or `FORCE_POST=1`, the post stage MUST rebuild that case.
 
+A readiness change from `0` to `1` changes the signature. The next run MUST rebuild the case and MUST create all required transport VTU files. A readiness change from `1` to `0` changes the signature. The next run MUST rebuild the flow output, MUST run no transport conversion, MUST remove every stale transport VTU file, and MUST write the flow-only completion result of Section 18.5.
+
 For a rebuild, the prior `vtk/` directory is removed first to prevent stale outputs.
+
+`FORCE_POST=1` rebuilds a current case. The rebuild calls only flow conversion when `transport_ready=0`. The rebuild keeps the flow-and-transport conversion when `transport_ready=1`.
 
 ### 18.5 Post artifacts
 
@@ -1599,6 +1612,23 @@ run_post_processing_cases_summary.csv
 case_<Case>/vtk/logs/
 case_<Case>/vtk/post_processing.complete
 ```
+
+The summary keeps its four columns `case_id,case_dir,status,message`. The status and the message report the transport readiness result:
+
+| Result | Status | Exact message |
+|---|---|---|
+| Rebuilt case, transport ready | `completed` | `flow and transport VTU files created` |
+| Rebuilt case, transport not ready | `completed` | `flow VTU files created; transport conversion skipped because the transport subcase is not prepared` |
+| Current case, transport ready | `skipped` | `source results unchanged; existing VTU outputs reused` |
+| Current case, transport not ready | `skipped` | `flow VTU files reused; transport conversion skipped because the transport subcase is not prepared` |
+
+A rebuilt case with unprepared transport MUST write a console diagnostic that contains this exact substring:
+
+```text
+transport conversion skipped because the transport subcase is not prepared
+```
+
+The unprepared-transport skip is a successful flow-only result. It MUST NOT add a Failure Artifact entry, and it MUST NOT make the stage return non-zero. An absent flow subcase, a missing flow time, a failed flow conversion, and a prepared transport subcase with missing or invalid transport input remain case failures. Each of these keeps the current `failed` summary row, the Failure Artifact entry, and the non-zero stage result.
 
 If any case fails, post-processing MUST return non-zero at stage completion.
 
@@ -2383,6 +2413,24 @@ Expected:
 - the control changes `numberOfSubdomains` in no Case;
 - the post-processing Stage result does not change.
 
+### AC. Flow-only post-processing readiness
+
+Use the post-processing Stage Runner CLI.
+
+Expected:
+
+- an absent `trd/` directory gives stage status `0`, two flow conversions, `flow_0.vtu`, `flow_latest_<time>.vtu`, and `flow_latest_time.txt`, no transport VTU file, no Failure Artifact entry, `transport_ready=0` before `transport_times=` in the completion marker, the exact `completed` message `flow VTU files created; transport conversion skipped because the transport subcase is not prepared`, and the console substring `transport conversion skipped because the transport subcase is not prepared`;
+- a present `trd/` directory without `constant/polyMesh` gives the same successful flow-only result;
+- a second unchanged flow-only run gives status `0`, summary status `skipped`, the exact message `flow VTU files reused; transport conversion skipped because the transport subcase is not prepared`, zero `foamToVTK` calls, and an unchanged completion marker;
+- `FORCE_POST=1` on the current flow-only case gives status `0`, summary status `completed`, exactly the two required flow conversions, no transport conversion, and `transport_ready=0`;
+- adding `trd/constant/polyMesh` to the transport subcase changes the signature to `transport_ready=1`, and the next run creates the required flow and transport VTU files with the message `flow and transport VTU files created`;
+- a second unchanged prepared run gives summary status `skipped`, zero conversions, and the message `source results unchanged; existing VTU outputs reused`;
+- removing `trd/constant/polyMesh` after a prepared successful run changes readiness from `1` to `0`, and the next run rebuilds, runs flow conversion only, removes every stale `trd_*.vtu` file, records `transport_ready=0`, and writes the exact flow-only `completed` message;
+- a prepared transport subcase without `trd/0` fails after the two flow conversions, with a `failed` summary row, a Failure Artifact that names the case, and a non-zero stage status;
+- a completion marker without `transport_ready` rebuilds the case one time and writes a current marker, and a following unchanged run reports `skipped`;
+- every recorded flow and transport `foamToVTK` argument vector keeps `-time`, `-no-boundary`, and `-fields`, and no vector contains `-no-point-data`;
+- the field lists stay exact: `(U p wallDistance)` for flow time 0, `(U p)` for the flow result time, and `($SCALAR_FIELD)` for each transport time only when transport is ready.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:
@@ -2503,7 +2551,7 @@ A replacement is compatible when all of the following are true:
 - flow supports fresh/continue and guarantees wallDistance;
 - transport makes fresh/continue decision before data synchronization;
 - continuation does not replace the mesh/state used by existing transport fields;
-- post-processing reuses current outputs and rebuilds stale outputs;
+- post-processing reuses current outputs and rebuilds stale outputs for flow-only cases and for prepared-transport cases, and transport readiness is part of the completion signature;
 - failures are logged and propagated according to the baseline contract;
 - the consolidated end-of-run report shows each attempted batch, each selected stage, and each failed Case, and it changes no exit status;
 - the advisory selected-Stage command preflight names each missing selected-Stage command before stage 1, and it changes no exit status;
