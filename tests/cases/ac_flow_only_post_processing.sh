@@ -378,3 +378,143 @@ assert_eq 2 "$(argv_fields_count '(C)')" \
     "observation 11: each transport conversion follows the SCALAR_FIELD value"
 assert_eq 0 "$(argv_count_with -no-point-data)" \
     "observation 11: the SCALAR_FIELD run also writes point data"
+
+# ---- observation 12: the transport mesh disappears during a prepared run ----
+#
+# SC-1-R2-1 regression (PR #84 review 5249798882). One captured readiness value
+# must govern the conversion set, the completion signature, the expected-output
+# decision, and the summary of one Case run. A test-local foamToVTK control
+# removes trd/constant/polyMesh during the final transport conversion, after
+# the Stage Runner captured readiness 1. The marker must record the captured
+# value, so the next run detects the readiness change, rebuilds flow-only, and
+# removes the stale transport VTU files.
+
+# write_mesh_control <bin_dir> <remove|create> <trd_dir> <event_log>
+# The control resolves the fake foamToVTK before the control directory enters
+# PATH, changes the transport mesh one time during one Case run, records the
+# event, and then delegates the exact argument vector with the exact delegated
+# status.
+#   remove: removes trd/constant/polyMesh during the transport time-300 call.
+#   create: creates trd/constant/polyMesh during the flow time-3000 call.
+write_mesh_control() {
+    local bin_dir="$1" mode="$2" target_trd="$3" event_log="$4"
+    local real_command
+    real_command="$(command -v foamToVTK)"
+    assert_eq "${FAKE_BIN_DIR}/foamToVTK" "$real_command" \
+        "the mesh control delegates to the fake foamToVTK"
+    mkdir -p "$bin_dir"
+    : > "$event_log"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real_command=%q\n' "$real_command"
+        printf 'mode=%q\n' "$mode"
+        printf 'target_trd=%q\n' "$target_trd"
+        printf 'event_log=%q\n' "$event_log"
+        cat <<'CONTROL'
+time_value=""
+previous=""
+for arg in "$@"; do
+    [[ "$previous" == "-time" ]] && time_value="$arg"
+    previous="$arg"
+done
+if [[ "$mode" == "remove" && "${PWD##*/}" == "trd" && "$time_value" == "300" ]]; then
+    rm -rf -- "${target_trd}/constant/polyMesh"
+    printf 'remove %s\n' "$time_value" >> "$event_log"
+fi
+if [[ "$mode" == "create" && "${PWD##*/}" == "flow" && "$time_value" == "3000" ]]; then
+    mkdir -p -- "${target_trd}/constant/polyMesh"
+    for name in points boundary faces owner neighbour; do
+        printf 'FoamFile { object %s; }\n' "$name" > "${target_trd}/constant/polyMesh/${name}"
+    done
+    printf 'create %s\n' "$time_value" >> "$event_log"
+fi
+exec "$real_command" "$@"
+CONTROL
+    } > "${bin_dir}/foamToVTK"
+    chmod +x "${bin_dir}/foamToVTK"
+}
+
+new_post_workspace mesh_removed_during_run
+make_transport_case "$trd_dir" 2 T 300
+make_flow_mesh "$trd_dir"
+mkdir -p "${trd_dir}/300"
+printf 'FoamFile { object T; }\n' > "${trd_dir}/300/T"
+
+control_bin="${workspace}/_control_bin"
+control_log="${workspace}/_control_events"
+write_mesh_control "$control_bin" remove "$trd_dir" "$control_log"
+
+saved_path="$PATH"
+PATH="${control_bin}:${PATH}"
+assert_eq "${control_bin}/foamToVTK" "$(command -v foamToVTK)" \
+    "observation 12: the control resolves before the fake foamToVTK"
+reset_fake_records
+out="$(run_post FORCE_POST=0)" && status=0 || status=$?
+PATH="$saved_path"
+
+assert_status 0 "$status" "observation 12: the prepared run returns status 0: $out"
+assert_eq 1 "$(grep -c . "$control_log")" \
+    "observation 12: the control removed the transport mesh exactly one time"
+assert_dir_missing "${trd_dir}/constant/polyMesh" \
+    "observation 12: the transport mesh is absent after the run"
+assert_eq 4 "$(fake_call_count foamToVTK)" \
+    "observation 12: the run converted the four times of the captured readiness"
+assert_file_exists "${vtk_dir}/trd_0.vtu" "observation 12: trd_0.vtu was written"
+assert_file_exists "${vtk_dir}/trd_300.vtu" "observation 12: trd_300.vtu was written"
+assert_summary_bytes completed "$COMPLETED_PREPARED" "observation 12 prepared run"
+assert_eq 1 "$(signature_value transport_ready)" \
+    "observation 12: the marker records the captured readiness 1"
+assert_eq "0,300" "$(signature_value transport_times)" \
+    "observation 12: the marker records the transport-time list of the captured readiness"
+
+# The next run captures readiness 0. The signature differs, so the run rebuilds
+# flow-only and removes the stale transport VTU files.
+reset_fake_records
+out="$(run_post FORCE_POST=0)" && status=0 || status=$?
+assert_flow_only_completed "observation 12 next run" "$status" "$out"
+assert_file_missing "${vtk_dir}/trd_0.vtu" \
+    "observation 12: the stale trd_0.vtu is removed by the next run"
+assert_file_missing "${vtk_dir}/trd_300.vtu" \
+    "observation 12: the stale trd_300.vtu is removed by the next run"
+
+# ---- observation 13: the transport mesh appears during a flow-only run ------
+#
+# SC-1-R2-1 regression, other direction. The control creates
+# trd/constant/polyMesh during the flow time-3000 conversion, after the Stage
+# Runner captured readiness 0. The marker and the summary must record the
+# captured value, and the next run must rebuild with transport conversion.
+
+new_post_workspace mesh_created_during_run
+make_transport_case "$trd_dir" 2 T 300
+mkdir -p "${trd_dir}/300"
+printf 'FoamFile { object T; }\n' > "${trd_dir}/300/T"
+assert_dir_missing "${trd_dir}/constant/polyMesh" \
+    "observation 13: the transport subcase starts unprepared"
+
+control_bin="${workspace}/_control_bin"
+control_log="${workspace}/_control_events"
+write_mesh_control "$control_bin" create "$trd_dir" "$control_log"
+
+saved_path="$PATH"
+PATH="${control_bin}:${PATH}"
+reset_fake_records
+out="$(run_post FORCE_POST=0)" && status=0 || status=$?
+PATH="$saved_path"
+
+assert_eq 1 "$(grep -c . "$control_log")" \
+    "observation 13: the control created the transport mesh exactly one time"
+assert_dir_exists "${trd_dir}/constant/polyMesh" \
+    "observation 13: the transport mesh is present after the run"
+assert_flow_only_completed "observation 13 flow-only run" "$status" "$out"
+
+# The next run captures readiness 1 and rebuilds with transport conversion.
+reset_fake_records
+out="$(run_post FORCE_POST=0)" && status=0 || status=$?
+assert_status 0 "$status" "observation 13: the next run returns status 0: $out"
+assert_summary_bytes completed "$COMPLETED_PREPARED" "observation 13 next run"
+assert_eq 4 "$(fake_call_count foamToVTK)" \
+    "observation 13: the next run converts the four required times"
+assert_file_exists "${vtk_dir}/trd_0.vtu" "observation 13: the next run writes trd_0.vtu"
+assert_file_exists "${vtk_dir}/trd_300.vtu" "observation 13: the next run writes trd_300.vtu"
+assert_eq 1 "$(signature_value transport_ready)" \
+    "observation 13: the next run records transport_ready=1"

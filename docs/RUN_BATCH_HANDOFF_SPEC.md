@@ -1583,6 +1583,8 @@ VTU point-data policy
 
 The signature MUST record `transport_ready` before the list of transport times. `transport_ready=1` means that `trd/constant/polyMesh` exists. `transport_ready=0` means that `trd/` is absent or has no `constant/polyMesh`. When `transport_ready=0`, the signature MUST record an empty list of transport times and MUST NOT require a transport directory. When `transport_ready=1`, the signature keeps the current list of transport times.
 
+The runner MUST capture transport readiness one time for each case run, before the current-signature check. The captured value MUST govern the conversion set, the completion-signature content, the expected-output decision, and the summary status and message of that run. The runner MUST NOT read `trd/constant/polyMesh` again inside the same case run. A readiness change during a case run therefore does not change the marker of that run. The next run captures the new value, detects the changed signature, rebuilds the case, and removes every stale transport VTU file.
+
 A completion marker that does not record the VTU point-data policy is not current. A completion marker that does not record `transport_ready` is not current. The post stage MUST rebuild that case one time.
 
 The expected VTU outputs are readiness-aware. `flow_0.vtu` and `flow_latest_<time>.vtu` are always expected. `trd_0.vtu` and every `trd_<time>.vtu` are expected only when `transport_ready=1`.
@@ -2429,7 +2431,9 @@ Expected:
 - a prepared transport subcase without `trd/0` fails after the two flow conversions, with a `failed` summary row, a Failure Artifact that names the case, and a non-zero stage status;
 - a completion marker without `transport_ready` rebuilds the case one time and writes a current marker, and a following unchanged run reports `skipped`;
 - every recorded flow and transport `foamToVTK` argument vector keeps `-time`, `-no-boundary`, and `-fields`, and no vector contains `-no-point-data`;
-- the field lists stay exact: `(U p wallDistance)` for flow time 0, `(U p)` for the flow result time, and `($SCALAR_FIELD)` for each transport time only when transport is ready.
+- the field lists stay exact: `(U p wallDistance)` for flow time 0, `(U p)` for the flow result time, and `($SCALAR_FIELD)` for each transport time only when transport is ready;
+- a transport mesh that disappears during a prepared case run, after the runner captured readiness `1`, leaves a marker with `transport_ready=1`, the transport-time list, and the prepared `completed` message; the next run captures readiness `0`, rebuilds flow-only, and removes the stale `trd_*.vtu` files;
+- a transport mesh that appears during a flow-only case run, after the runner captured readiness `0`, leaves a marker with `transport_ready=0` and the flow-only `completed` message; the next run captures readiness `1` and rebuilds with transport conversion.
 
 ## 24. Multi-agent GitHub handoff rules
 

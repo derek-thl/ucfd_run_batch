@@ -508,15 +508,16 @@ transport_ready() {
 }
 
 post_outputs_complete() {
-    local flow_dir="$1" transport_dir="$2" vtk_dir="$3"
+    local flow_dir="$1" transport_dir="$2" vtk_dir="$3" transport_ready_flag="$4"
     local flow_latest flow_tag t tag
     [[ -f "$vtk_dir/flow_0.vtu" ]] || return 1
     flow_latest="$(latest_time "$flow_dir")"
     flow_tag="$(safe_filename "$flow_latest")"
     [[ -f "$vtk_dir/flow_latest_${flow_tag}.vtu" ]] || return 1
     # v4 Section 18.4: transport VTU outputs are expected only when the
-    # transport subcase is prepared. A flow-only Case is complete here.
-    transport_ready "$transport_dir" || return 0
+    # readiness captured for this Case run is 1. A flow-only Case is
+    # complete here. The helper reads no readiness of its own (SC-1-R2-1).
+    ((transport_ready_flag == 1)) || return 0
     [[ -f "$vtk_dir/trd_0.vtu" ]] || return 1
     while IFS= read -r t; do
         [[ -n "$t" && "$t" != "0" ]] || continue
@@ -529,19 +530,21 @@ post_outputs_complete() {
 build_post_signature() {
     local flow_dir="$1"
     local transport_dir="$2"
-    local flow_latest transport_ready_flag=0 transport_times=""
+    local transport_ready_flag="$3"
+    local flow_latest transport_times=""
 
     [[ -d "$flow_dir" ]] || return 1
     flow_latest="$(latest_time "$flow_dir")"
 
     # v4 Section 18.4: the signature records transport readiness before the
-    # transport-time list. An unprepared transport subcase records an empty
-    # list and needs no transport directory. A readiness change in either
-    # direction changes the signature, so the next run rebuilds the Case. A
-    # marker without the transport_ready line comes from a pre-readiness
-    # runner and is stale.
-    if transport_ready "$transport_dir"; then
-        transport_ready_flag=1
+    # transport-time list. The caller supplies the readiness value that it
+    # captured one time for this Case run, so the marker, the conversion
+    # set, the expected-output decision, and the summary agree (SC-1-R2-1).
+    # An unprepared transport subcase records an empty list and needs no
+    # transport directory. A readiness change in either direction changes
+    # the signature, so the next run rebuilds the Case. A marker without the
+    # transport_ready line comes from a pre-readiness runner and is stale.
+    if ((transport_ready_flag == 1)); then
         transport_times="$(list_times "$transport_dir" | paste -sd, -)"
     fi
 
@@ -583,17 +586,19 @@ process_case() {
         return 1
     fi
 
-    # v4 Section 18.4: readiness is decided one time for this Case run. The
-    # decision selects the conversion set and the summary message.
+    # v4 Section 18.4: readiness is captured one time for this Case run. The
+    # captured value governs the conversion set, the completion signature,
+    # the expected-output decision, and the summary message. No later read
+    # of trd/constant/polyMesh happens inside this run (SC-1-R2-1).
     if transport_ready "$transport_dir"; then
         transport_ready_now=1
     fi
 
     if [[ "$FORCE_POST" != "1" && -f "$marker" ]]; then
-        current_signature="$(build_post_signature "$flow_dir" "$transport_dir" || true)"
+        current_signature="$(build_post_signature "$flow_dir" "$transport_dir" "$transport_ready_now" || true)"
         stored_signature="$(cat "$marker" 2>/dev/null || true)"
         if [[ -n "$current_signature" && "$current_signature" == "$stored_signature" ]] &&
-           post_outputs_complete "$flow_dir" "$transport_dir" "$vtk_dir"; then
+           post_outputs_complete "$flow_dir" "$transport_dir" "$vtk_dir" "$transport_ready_now"; then
             if ((transport_ready_now == 1)); then
                 append_summary "$case_id" "$case_dir" "skipped" "source results unchanged; existing VTU outputs reused"
             else
@@ -637,7 +642,7 @@ process_case() {
         return 1
     fi
 
-    current_signature="$(build_post_signature "$flow_dir" "$transport_dir")"
+    current_signature="$(build_post_signature "$flow_dir" "$transport_dir" "$transport_ready_now")"
     printf '%s\n' "$current_signature" > "$marker"
 
     if ((transport_ready_now == 1)); then

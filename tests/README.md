@@ -90,6 +90,16 @@ vector is an independent literal from the specification. The scenario reads
 the completion marker only as a file that the public CLI writes, and it calls
 no private production helper.
 
+Two observations prove that one captured readiness value governs one Case run
+(PR #84 review finding SC-1-R2-1). A test-local `foamToVTK` control in the
+isolated workspace resolves the fake `foamToVTK` before the control directory
+enters `PATH`, removes or creates `trd/constant/polyMesh` exactly one time
+during one conversion call, records the event, and delegates the exact
+argument vector. The marker and the summary of that run must record the
+captured value, and the next run must detect the changed signature, rebuild,
+and remove every stale transport VTU file. The scenario restores the earlier
+`PATH` after each controlled run.
+
 The `make_transport_case` helper creates no `constant/polyMesh`, so a fixture
 that it creates is an unprepared transport subcase. Scenarios O, AA, W, and X
 keep their prepared-transport assertions, so each of their prepared-transport
