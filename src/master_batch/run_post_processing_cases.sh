@@ -6,9 +6,9 @@
 #     vtk/
 #       flow_0.vtu
 #       flow_latest_1000.vtu
-#       trd_0.vtu
-#       trd_100.vtu
-#       trd_200.vtu
+#       trd_0.vtu        (transport files exist only when the transport
+#       trd_100.vtu       subcase is prepared: trd/constant/polyMesh exists;
+#       trd_200.vtu       an unprepared subcase gives a flow-only result)
 #       ...
 #       logs/
 
@@ -151,8 +151,8 @@ Environment:
 Output:
   case_#/vtk/flow_0.vtu
   case_#/vtk/flow_latest_<time>.vtu
-  case_#/vtk/trd_0.vtu
-  case_#/vtk/trd_<time>.vtu
+  case_#/vtk/trd_0.vtu       (only when case_#/trd/constant/polyMesh exists)
+  case_#/vtk/trd_<time>.vtu  (only when case_#/trd/constant/polyMesh exists)
 USAGE
 }
 
@@ -497,13 +497,28 @@ append_summary() {
     batch_stage_lock_release "$lock"
 }
 
+# transport_ready <transport_dir> - status 0 when the transport subcase is
+# prepared. v4 Section 18.4: transport conversion and transport VTU outputs
+# are required only for a prepared transport subcase. The subcase is
+# prepared only when constant/polyMesh exists. An absent trd/ directory and
+# a trd/ directory without a mesh are both not prepared.
+transport_ready() {
+    local transport_dir="$1"
+    [[ -d "$transport_dir/constant/polyMesh" ]]
+}
+
 post_outputs_complete() {
-    local flow_dir="$1" transport_dir="$2" vtk_dir="$3"
+    local flow_dir="$1" transport_dir="$2" vtk_dir="$3" transport_ready_flag="$4"
     local flow_latest flow_tag t tag
-    [[ -f "$vtk_dir/flow_0.vtu" && -f "$vtk_dir/trd_0.vtu" ]] || return 1
+    [[ -f "$vtk_dir/flow_0.vtu" ]] || return 1
     flow_latest="$(latest_time "$flow_dir")"
     flow_tag="$(safe_filename "$flow_latest")"
     [[ -f "$vtk_dir/flow_latest_${flow_tag}.vtu" ]] || return 1
+    # v4 Section 18.4: transport VTU outputs are expected only when the
+    # readiness captured for this Case run is 1. A flow-only Case is
+    # complete here. The helper reads no readiness of its own (SC-1-R2-1).
+    ((transport_ready_flag == 1)) || return 0
+    [[ -f "$vtk_dir/trd_0.vtu" ]] || return 1
     while IFS= read -r t; do
         [[ -n "$t" && "$t" != "0" ]] || continue
         tag="$(safe_filename "$t")"
@@ -515,13 +530,26 @@ post_outputs_complete() {
 build_post_signature() {
     local flow_dir="$1"
     local transport_dir="$2"
-    local flow_latest transport_times
+    local transport_ready_flag="$3"
+    local flow_latest transport_times=""
 
-    [[ -d "$flow_dir" && -d "$transport_dir" ]] || return 1
+    [[ -d "$flow_dir" ]] || return 1
     flow_latest="$(latest_time "$flow_dir")"
-    transport_times="$(list_times "$transport_dir" | paste -sd, -)"
+
+    # v4 Section 18.4: the signature records transport readiness before the
+    # transport-time list. The caller supplies the readiness value that it
+    # captured one time for this Case run, so the marker, the conversion
+    # set, the expected-output decision, and the summary agree (SC-1-R2-1).
+    # An unprepared transport subcase records an empty list and needs no
+    # transport directory. A readiness change in either direction changes
+    # the signature, so the next run rebuilds the Case. A marker without the
+    # transport_ready line comes from a pre-readiness runner and is stale.
+    if ((transport_ready_flag == 1)); then
+        transport_times="$(list_times "$transport_dir" | paste -sd, -)"
+    fi
 
     printf 'flow_latest=%s\n' "$flow_latest"
+    printf 'transport_ready=%s\n' "$transport_ready_flag"
     printf 'transport_times=%s\n' "$transport_times"
     printf 'scalar_field=%s\n' "$SCALAR_FIELD"
     printf 'flow_zero_fields=%s\n' "$FLOW_ZERO_FIELDS"
@@ -541,6 +569,7 @@ process_case() {
     local log_dir="$vtk_dir/logs"
     local marker="$vtk_dir/post_processing.complete"
     local current_signature="" stored_signature=""
+    local transport_ready_now=0
 
     info "Processing $case_id"
 
@@ -557,12 +586,24 @@ process_case() {
         return 1
     fi
 
+    # v4 Section 18.4: readiness is captured one time for this Case run. The
+    # captured value governs the conversion set, the completion signature,
+    # the expected-output decision, and the summary message. No later read
+    # of trd/constant/polyMesh happens inside this run (SC-1-R2-1).
+    if transport_ready "$transport_dir"; then
+        transport_ready_now=1
+    fi
+
     if [[ "$FORCE_POST" != "1" && -f "$marker" ]]; then
-        current_signature="$(build_post_signature "$flow_dir" "$transport_dir" || true)"
+        current_signature="$(build_post_signature "$flow_dir" "$transport_dir" "$transport_ready_now" || true)"
         stored_signature="$(cat "$marker" 2>/dev/null || true)"
         if [[ -n "$current_signature" && "$current_signature" == "$stored_signature" ]] &&
-           post_outputs_complete "$flow_dir" "$transport_dir" "$vtk_dir"; then
-            append_summary "$case_id" "$case_dir" "skipped" "source results unchanged; existing VTU outputs reused"
+           post_outputs_complete "$flow_dir" "$transport_dir" "$vtk_dir" "$transport_ready_now"; then
+            if ((transport_ready_now == 1)); then
+                append_summary "$case_id" "$case_dir" "skipped" "source results unchanged; existing VTU outputs reused"
+            else
+                append_summary "$case_id" "$case_dir" "skipped" "flow VTU files reused; transport conversion skipped because the transport subcase is not prepared"
+            fi
             info "Skip $case_id: post-processing outputs are current. Set FORCE_POST=1 to rebuild."
             return 0
         fi
@@ -579,11 +620,17 @@ process_case() {
             "$vtk_dir" \
             "$log_dir"
 
-        convert_transport_case \
-            "$case_id" \
-            "$transport_dir" \
-            "$vtk_dir" \
-            "$log_dir"
+        if ((transport_ready_now == 1)); then
+            convert_transport_case \
+                "$case_id" \
+                "$transport_dir" \
+                "$vtk_dir" \
+                "$log_dir"
+        else
+            # v4 Section 18.5: an unprepared transport subcase is not a Case
+            # failure. Flow conversion is complete, and the skip is explicit.
+            info "$case_id: transport conversion skipped because the transport subcase is not prepared: $transport_dir"
+        fi
     ); then
         append_summary \
             "$case_id" \
@@ -595,14 +642,22 @@ process_case() {
         return 1
     fi
 
-    current_signature="$(build_post_signature "$flow_dir" "$transport_dir")"
+    current_signature="$(build_post_signature "$flow_dir" "$transport_dir" "$transport_ready_now")"
     printf '%s\n' "$current_signature" > "$marker"
 
-    append_summary \
-        "$case_id" \
-        "$case_dir" \
-        "completed" \
-        "flow and transport VTU files created"
+    if ((transport_ready_now == 1)); then
+        append_summary \
+            "$case_id" \
+            "$case_dir" \
+            "completed" \
+            "flow and transport VTU files created"
+    else
+        append_summary \
+            "$case_id" \
+            "$case_dir" \
+            "completed" \
+            "flow VTU files created; transport conversion skipped because the transport subcase is not prepared"
+    fi
 
     info "Finished $case_id: $vtk_dir"
 }

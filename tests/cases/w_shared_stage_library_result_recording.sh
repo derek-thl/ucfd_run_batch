@@ -175,6 +175,7 @@ make_csv "${workspace}/output_batch_1.csv" 0
 make_flow_case "${workspace}/case_0/flow" 2
 make_flow_result "${workspace}/case_0/flow" 3000
 make_transport_case "${workspace}/case_0/trd" 2 T 300
+make_flow_mesh "${workspace}/case_0/trd"
 
 out="$(cd "$workspace" && timeout "$STAGE_TIMEOUT" bash "$POST_SCRIPT" \
         -i output_batch_1.csv -O . -j 1 2>&1)" && status=0 || status=$?

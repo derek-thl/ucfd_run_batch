@@ -74,9 +74,38 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.Z | Shared Stage progress primitives | `cases/z_shared_stage_library_progress.sh` |
 | 23.AA | VTU point-data output | `cases/aa_post_point_data_output.sh` |
 | 23.AB | MPI launcher oversubscription opt-in | `cases/ab_mpi_oversubscribe_optin.sh` |
+| 23.AC | Flow-only post-processing readiness | `cases/ac_flow_only_post_processing.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.AC proves the transport-readiness rule of Specification Section 18
+through the direct post-processing Stage Runner CLI. One Batch Workspace moves
+through the readiness states in order: present `trd/` without
+`constant/polyMesh`, reuse, forced rebuild, readiness `0` to `1`, prepared
+reuse, and readiness `1` to `0`. Separate workspaces hold the absent `trd/`,
+the prepared failure without `trd/0`, and the legacy marker without
+`transport_ready`. Every expected message, signature line, file, and argument
+vector is an independent literal from the specification. The scenario reads
+the completion marker only as a file that the public CLI writes, and it calls
+no private production helper.
+
+Two observations prove that one captured readiness value governs one Case run
+(PR #84 review finding SC-1-R2-1). A test-local `foamToVTK` control in the
+isolated workspace resolves the fake `foamToVTK` before the control directory
+enters `PATH`, removes or creates `trd/constant/polyMesh` exactly one time
+during one conversion call, records the event, and delegates the exact
+argument vector. The marker and the summary of that run must record the
+captured value, and the next run must detect the changed signature, rebuild,
+and remove every stale transport VTU file. The scenario restores the earlier
+`PATH` after each controlled run.
+
+The `make_transport_case` helper creates no `constant/polyMesh`, so a fixture
+that it creates is an unprepared transport subcase. Scenarios O, AA, W, and X
+keep their prepared-transport assertions, so each of their prepared-transport
+fixtures adds `make_flow_mesh` on the transport subcase (Issue #83). Every
+other fixture that omits a transport mesh stays unprepared, and its status-only
+or equivalence observations stay valid with flow-only output.
 
 Section 23.V characterizes the Stage Runner mutual-exclusion behavior. The
 assertions pass before and after the I-G1 extraction, because I-G1 moves only
