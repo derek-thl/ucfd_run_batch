@@ -16,8 +16,10 @@ on:
       - 'src/master_batch/run_post_processing_cases.sh'
       - 'tests/**'
       - '.github/workflows/batch-contract.yml'
+      - '.github/workflows/openfoam-evidence.yml'
       - '.github/scripts/check-shellcheck-baseline.sh'
       - '.github/shellcheck-baseline.gcc'
+      - '.openfoam-version'
   pull_request:
     paths:
       - 'src/run_batch.sh'
@@ -29,8 +31,10 @@ on:
       - 'src/master_batch/run_post_processing_cases.sh'
       - 'tests/**'
       - '.github/workflows/batch-contract.yml'
+      - '.github/workflows/openfoam-evidence.yml'
       - '.github/scripts/check-shellcheck-baseline.sh'
       - '.github/shellcheck-baseline.gcc'
+      - '.openfoam-version'
   workflow_dispatch:
 
 permissions:

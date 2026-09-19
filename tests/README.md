@@ -75,9 +75,36 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.AA | VTU point-data output | `cases/aa_post_point_data_output.sh` |
 | 23.AB | MPI launcher oversubscription opt-in | `cases/ab_mpi_oversubscribe_optin.sh` |
 | 23.AC | Flow-only post-processing readiness | `cases/ac_flow_only_post_processing.sh` |
+| 23.AD | OpenFOAM version baseline and evidence-workflow contract | `cases/ad_openfoam_version_contract.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.AD proves the OpenFOAM baseline contract of Issue #82. The
+committed `.openfoam-version` file is the single active target, and the manual
+evidence workflow derives the package name and the environment file path from
+it. The scenario installs no OpenFOAM package and dispatches no workflow.
+
+Most observations read the committed baseline file, the two workflow files,
+the specification, and the Scenario map as text. Four observations are
+stronger than a text check: the scenario extracts the shell body of the
+baseline-resolution step and of the environment-record step, proves that each
+extracted body parses, and then executes it in an isolated workspace against a
+controlled fixture. The baseline fixtures cover the exact target, an absent
+file, a multi-line file, a different target, and a missing line ending. The
+environment fixtures are a local file that exports the exact version, a
+different version, an empty version, and an absent file. Each run asserts the
+published `GITHUB_ENV` values, so the derivation and the fail-closed behavior
+are proved by execution.
+
+Each executed body must publish only `KEY=VALUE` lines. A multi-line value
+would corrupt the environment file, so every rejected fixture also proves that
+its recorded reason stays one line.
+
+The environment-record step publishes `OPENFOAM_VERSION` and never
+`WM_PROJECT_VERSION`. A later step would inherit a published
+`WM_PROJECT_VERSION` and could then pass its own revalidation without a loaded
+OpenFOAM environment, so the scenario asserts that absence.
 
 Section 23.AC proves the transport-readiness rule of Specification Section 18
 through the direct post-processing Stage Runner CLI. One Batch Workspace moves
