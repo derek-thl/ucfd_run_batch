@@ -106,6 +106,20 @@ The environment-record step publishes `OPENFOAM_VERSION` and never
 `WM_PROJECT_VERSION` and could then pass its own revalidation without a loaded
 OpenFOAM environment, so the scenario asserts that absence.
 
+The baseline guard rejects a missing file and an unreadable file. A regular
+file has no unreadable state for the root identity, so a behavioral execution
+of that branch cannot be identity-independent. The unreadable-baseline
+observation therefore has four parts. Two parts need no identity: they assert
+that the extracted guard holds the unreadable-file condition, and they prove
+that this assertion is load-bearing by rejecting a mutated body that lost the
+condition. Two parts are behavioral: they execute the step body against a
+mode-000 fixture and require the exact unreadable-file reason, and they execute
+the mutated body against the same fixture and require a different reason,
+because that body reaches the byte comparison instead of the guard. The
+scenario decides whether the behavioral parts can run by one real read attempt
+on the fixture, never by an identity number, and it reports an explicit skip
+for a root identity.
+
 Section 23.AC proves the transport-readiness rule of Specification Section 18
 through the direct post-processing Stage Runner CLI. One Batch Workspace moves
 through the readiness states in order: present `trd/` without

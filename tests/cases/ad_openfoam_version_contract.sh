@@ -118,9 +118,10 @@ ad_install_step_name() {
 # step.status in the workspace. The body runs with no OpenFOAM installation and
 # dispatches no workflow.
 ad_run_baseline_step() {
-    local mode="$1" workspace="$2" body status=0
+    local mode="$1" workspace="$2" body="${3:-}" status=0
     mkdir -p -- "$workspace"
-    body="$(ad_step_run_body "Resolve the OpenFOAM baseline")"
+    [[ -n "$body" ]] ||
+        body="$(ad_step_run_body "Resolve the OpenFOAM baseline")"
     [[ -n "$body" ]] ||
         _fail "the baseline-resolution step body is not extractable from the workflow"
     printf '%s\n' "$body" > "${workspace}/step_body.sh"
@@ -133,6 +134,9 @@ ad_run_baseline_step() {
         multiline)  printf 'v2512\nv2512\n' > "${workspace}/.openfoam-version" ;;
         mismatch)   printf 'v2506\n'        > "${workspace}/.openfoam-version" ;;
         no_newline) printf 'v2512'          > "${workspace}/.openfoam-version" ;;
+        unreadable)
+            printf 'v2512\n' > "${workspace}/.openfoam-version"
+            chmod 000 -- "${workspace}/.openfoam-version" ;;
         *) _fail "unknown baseline fixture mode: ${mode}" ;;
     esac
     : > "${workspace}/github_env"
@@ -533,6 +537,101 @@ o14_scenario_map_is_one_to_one() {
         "observation 14: the README map names the Scenario AD file"
 }
 
+# ---- observation 15 ---------------------------------------------------------
+#
+# M1-R3 requires the baseline guard to reject a missing OR unreadable file.
+# Observation 7 covers the missing file through the `! -f` condition. This
+# observation covers the unreadable file, and it proves that the coverage
+# detects the loss of the `! -r` condition.
+#
+# A regular file has no unreadable state for the root identity, so a behavioral
+# execution of that branch cannot be identity-independent. This observation
+# therefore has two identity-independent parts and two behavioral parts. The
+# identity-independent parts always run and fail if the workflow loses the
+# unreadable-file condition. The behavioral parts run when the current identity
+# really cannot read a mode-000 file, which the scenario decides by one real
+# read attempt and never by an identity number.
+
+# ad_guard_requires_readable <body> - status 0 when the extracted baseline guard
+# rejects a file that exists and denies read permission.
+ad_guard_requires_readable() {
+    [[ "$1" == *'! -r "$baseline_file"'* ]]
+}
+
+o15_unreadable_baseline_fails_closed() {
+    local body mutated needle workspace fixture mutant_reason
+
+    body="$(ad_step_run_body "Resolve the OpenFOAM baseline")"
+    assert_ne "" "$body" \
+        "observation 15: the baseline-resolution step body is extractable"
+
+    # Part 1, identity-independent. The guard requires a readable file.
+    ad_guard_requires_readable "$body" ||
+        _fail "observation 15: the baseline guard must reject an unreadable file"
+
+    # Part 2, identity-independent. The check above is load-bearing. A body
+    # without the unreadable-file condition must not satisfy it, so this
+    # observation fails if the workflow loses that behavior.
+    needle=' || ! -r "$baseline_file"'
+    mutated="${body//"$needle"/}"
+    assert_ne "$body" "$mutated" \
+        "observation 15: the mutation removes the unreadable-file condition"
+    if ad_guard_requires_readable "$mutated"; then
+        _fail "observation 15: the guard check must reject a body that lost the unreadable-file condition"
+    fi
+
+    workspace="$(new_workspace unreadable)"
+    ad_run_baseline_step unreadable "$workspace"
+    fixture="${workspace}/.openfoam-version"
+
+    assert_file_exists "$fixture" \
+        "observation 15: the fixture exists as a regular file"
+
+    if [[ -r "$fixture" ]]; then
+        # The root identity reads a mode-000 file, so this branch cannot be
+        # executed here. Parts 1 and 2 already cover it without an identity.
+        printf 'SKIP: the unreadable-baseline execution needs an identity that cannot read a mode-000 file (EUID=%s).\n' \
+            "$EUID"
+        return 0
+    fi
+
+    # Part 3, behavioral. The workflow guard rejects the unreadable baseline.
+    assert_eq 0 "$(cat "${workspace}/step.status")" \
+        "observation 15: the step ends with a recorded result, not an unhandled error"
+    assert_eq "INFRASTRUCTURE_FAILURE" "$(ad_env_value "$workspace" BASELINE_RESULT)" \
+        "observation 15: the step records the baseline infrastructure failure"
+    assert_eq "INFRASTRUCTURE_FAILURE" "$(ad_env_value "$workspace" OVERALL_RESULT)" \
+        "observation 15: the step records the overall infrastructure failure"
+    assert_eq "false" "$(ad_env_value "$workspace" ORCHESTRATOR_STARTED)" \
+        "observation 15: the step prevents the Orchestrator"
+    assert_eq "the baseline file .openfoam-version is missing or unreadable" \
+        "$(ad_env_value "$workspace" BASELINE_REASON)" \
+        "observation 15: the step records the exact unreadable-file reason"
+    assert_eq 1 "$(grep -c '^BASELINE_REASON=' "${workspace}/github_env")" \
+        "observation 15: the recorded reason stays one line"
+    assert_eq 0 "$(ad_env_malformed_lines "$workspace")" \
+        "observation 15: every published line is one KEY=VALUE pair"
+    assert_eq "" "$(ad_env_value "$workspace" OPENFOAM_PACKAGE)" \
+        "observation 15: the step derives no package from an unreadable baseline"
+    assert_eq "" "$(ad_env_value "$workspace" OPENFOAM_BASHRC)" \
+        "observation 15: the step derives no environment file path from an unreadable baseline"
+    assert_eq "" "$(ad_env_value "$workspace" OPENFOAM_BASELINE)" \
+        "observation 15: the step publishes no baseline value"
+
+    # Part 4, behavioral. The same fixture under a body that lost the
+    # unreadable-file condition reaches the byte comparison instead, so it
+    # records a different reason. The exact-reason assertion above therefore
+    # fails when the workflow loses that behavior.
+    workspace="$(new_workspace unreadable_mutant)"
+    ad_run_baseline_step unreadable "$workspace" "$mutated"
+    mutant_reason="$(ad_env_value "$workspace" BASELINE_REASON)"
+    assert_ne "the baseline file .openfoam-version is missing or unreadable" \
+        "$mutant_reason" \
+        "observation 15: a body without the unreadable-file condition records a different reason"
+    assert_ne "" "$mutant_reason" \
+        "observation 15: the mutated body still records a reason"
+}
+
 # ---- observation registry ---------------------------------------------------
 
 AD_OBSERVATIONS=(
@@ -550,6 +649,7 @@ AD_OBSERVATIONS=(
     o11_workflow_manual_and_not_required
     o12_preserved_accepted_behavior
     o14_scenario_map_is_one_to_one
+    o15_unreadable_baseline_fails_closed
 )
 
 # One observation runs in this process when the caller names it. The scenario
