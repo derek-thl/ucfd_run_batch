@@ -2,7 +2,7 @@ name: openfoam-evidence
 
 # Manual real-OpenFOAM evidence run for the A4-1a evidence Item.
 #
-# This workflow runs OpenCFD OpenFOAM v2506 through the Orchestrator for one
+# This workflow runs OpenCFD OpenFOAM v2512 through the Orchestrator for one
 # DOE Batch CSV row and one Case, with the Stages setup, mesh, flow, and
 # post-processing. The transport Stage never runs.
 #
@@ -21,15 +21,20 @@ permissions:
 
 jobs:
   evidence:
-    name: OpenFOAM v2506 four-Stage evidence
+    name: OpenFOAM v2512 four-Stage evidence
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     defaults:
       run:
         shell: bash
     env:
-      OPENFOAM_PACKAGE: openfoam2506-default
-      OPENFOAM_BASHRC: /usr/lib/openfoam/openfoam2506/etc/bashrc
+      # No OpenFOAM target is hard-coded here. The committed
+      # .openfoam-version file is the single active target, and the
+      # baseline step publishes the derived values through GITHUB_ENV for
+      # every later step. These placeholders only give an explicit value
+      # to a step that runs before or without a resolved baseline.
+      OPENFOAM_PACKAGE: UNAVAILABLE
+      OPENFOAM_BASHRC: UNAVAILABLE
 
     steps:
       # ---------------------------------------------------------------------
@@ -51,6 +56,8 @@ jobs:
             echo "CHECKOUT_RESULT=NOT_ATTEMPTED"
             echo "INSTALL_RESULT=NOT_ATTEMPTED"
             echo "PREPARE_RESULT=NOT_ATTEMPTED"
+            echo "BASELINE_RESULT=NOT_ATTEMPTED"
+            echo "OPENFOAM_BASELINE=UNAVAILABLE"
             echo "ORCHESTRATOR_STARTED=false"
             echo "OVERALL_RESULT=NOT_ATTEMPTED"
             echo "STAGE_SETUP=NOT_ATTEMPTED"
@@ -180,10 +187,69 @@ jobs:
           fi
 
       # ---------------------------------------------------------------------
-      # 4. Installation. OpenFOAM v2506 from the official openfoam.com method.
+      # 4. The OpenFOAM baseline. The committed .openfoam-version file is the
+      #    single active target of this workflow. This step runs after
+      #    checkout, validates the exact target, and derives the package name
+      #    and the environment file path from the validated value. A missing,
+      #    unreadable, multi-line, or different baseline records an
+      #    infrastructure failure and stops the run before installation,
+      #    preparation, and the Orchestrator.
       # ---------------------------------------------------------------------
-      - name: Install OpenFOAM v2506
+      - name: Resolve the OpenFOAM baseline
         if: always() && env.CHECKOUT_RESULT == 'SUCCEEDED'
+        run: |
+          set -euo pipefail
+          baseline_file="${GITHUB_WORKSPACE}/.openfoam-version"
+          expected="v2512"
+
+          # Every rejected baseline records the same four values, so no later
+          # phase can start and the reason stays one environment-file line.
+          baseline_fail() {
+              {
+                echo "BASELINE_RESULT=INFRASTRUCTURE_FAILURE"
+                echo "BASELINE_REASON=$1"
+                echo "ORCHESTRATOR_STARTED=false"
+                echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
+              } >> "$GITHUB_ENV"
+              echo "baseline phase: INFRASTRUCTURE_FAILURE, $1" >&2
+              exit 0
+          }
+
+          if [[ ! -f "$baseline_file" || ! -r "$baseline_file" ]]; then
+              baseline_fail "the baseline file .openfoam-version is missing or unreadable"
+          fi
+
+          # One literal X keeps the final newline byte significant, so this
+          # one comparison rejects a missing line ending, a trailing byte, a
+          # second line, and a different target.
+          raw="$(cat -- "$baseline_file"; printf X)"
+          if [[ "$raw" != "${expected}"$'\n'"X" ]]; then
+              observed="$(printf '%s' "${raw%X}" | tr '\n' ' ' | cut -c1-120)"
+              baseline_fail "the baseline must hold the exact bytes '${expected}' and one line ending; observed '${observed}'"
+          fi
+
+          # The release token, the package name, and the environment file path
+          # all come from the validated baseline value.
+          baseline="${raw%$'\n'X}"
+          release="${baseline#v}"
+          {
+            echo "OPENFOAM_BASELINE=${baseline}"
+            echo "OPENFOAM_RELEASE=${release}"
+            echo "OPENFOAM_PACKAGE=openfoam${release}-default"
+            echo "OPENFOAM_BASHRC=/usr/lib/openfoam/openfoam${release}/etc/bashrc"
+            echo "BASELINE_RESULT=SUCCEEDED"
+          } >> "$GITHUB_ENV"
+          echo "baseline        : ${baseline}"
+          echo "release token   : ${release}"
+          echo "package         : openfoam${release}-default"
+          echo "environment file: /usr/lib/openfoam/openfoam${release}/etc/bashrc"
+
+      # ---------------------------------------------------------------------
+      # 5. Installation. The derived package from the official openfoam.com
+      #    method. The step starts only after a resolved baseline.
+      # ---------------------------------------------------------------------
+      - name: Install OpenFOAM v2512
+        if: always() && env.CHECKOUT_RESULT == 'SUCCEEDED' && env.BASELINE_RESULT == 'SUCCEEDED'
         run: |
           set -euo pipefail
           source "$LIB"
@@ -257,29 +323,58 @@ jobs:
           source_status=$?
           set -eu
 
+          # The gate requires the exact validated baseline. A non-empty but
+          # different version is a rejected environment, so the run can never
+          # produce evidence under an unintended OpenFOAM release.
           version="${WM_PROJECT_VERSION:-}"
-          if (( source_status != 0 )) || [[ -z "$version" ]]; then
+          if (( source_status != 0 )) || [[ "$version" != "$OPENFOAM_BASELINE" ]]; then
               {
                 echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
-                echo "INSTALL_REASON=OpenFOAM environment did not load from ${OPENFOAM_BASHRC}: source status ${source_status}, WM_PROJECT_VERSION '${version}'"
+                echo "INSTALL_REASON=the loaded OpenFOAM environment is not the exact baseline from ${OPENFOAM_BASHRC}: source status ${source_status}, expected WM_PROJECT_VERSION '${OPENFOAM_BASELINE}', observed '${version}'"
                 echo "ORCHESTRATOR_STARTED=false"
                 echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
               } >> "$GITHUB_ENV"
-              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}, version '${version}'" >&2
+              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}, expected '${OPENFOAM_BASELINE}', observed '${version}'" >&2
               exit 0
           fi
 
+          # The environment identity. Every value comes from the installed
+          # system. The package version comes from the package database. A
+          # value that cannot be obtained becomes the explicit UNAVAILABLE
+          # token. No value is invented.
+          package_version="$(dpkg-query -W -f='${Version}' "$OPENFOAM_PACKAGE" 2>/dev/null || true)"
+          [[ -n "$package_version" ]] || package_version="UNAVAILABLE"
+          os_identity="$( ( . /etc/os-release && printf '%s' "${PRETTY_NAME:-}" ) 2>/dev/null || true )"
+          [[ -n "$os_identity" ]] || os_identity="UNAVAILABLE"
+          architecture="$(uname -m 2>/dev/null || true)"
+          [[ -n "$architecture" ]] || architecture="UNAVAILABLE"
+          gcc_version="$(gcc -dumpfullversion 2>/dev/null || true)"
+          [[ -n "$gcc_version" ]] || gcc_version="UNAVAILABLE"
+          wm_options="${WM_OPTIONS:-}"
+          [[ -n "$wm_options" ]] || wm_options="UNAVAILABLE"
+
           {
+            echo "OPENFOAM_BASELINE=${OPENFOAM_BASELINE}"
+            echo "OPENFOAM_PACKAGE=${OPENFOAM_PACKAGE}"
+            echo "OPENFOAM_PACKAGE_VERSION=${package_version}"
+            echo "OPENFOAM_BASHRC=${OPENFOAM_BASHRC}"
             echo "WM_PROJECT_VERSION=${version}"
+            echo "WM_OPTIONS=${wm_options}"
+            echo "OS_IDENTITY=${os_identity}"
+            echo "ARCHITECTURE=${architecture}"
+            echo "GCC_VERSION=${gcc_version}"
             echo "simpleFoam: $(command -v simpleFoam || echo UNAVAILABLE)"
             echo "snappyHexMesh: $(command -v snappyHexMesh || echo UNAVAILABLE)"
             echo "surfaceTransformPoints: $(command -v surfaceTransformPoints || echo UNAVAILABLE)"
             echo "foamToVTK: $(command -v foamToVTK || echo UNAVAILABLE)"
           } | tee "${EVIDENCE_DIR}/openfoam-version.txt"
+          # Only the accepted version reaches GITHUB_ENV. WM_PROJECT_VERSION
+          # stays unpublished, because an inherited value would let a later
+          # step pass its revalidation without a loaded environment.
           echo "OPENFOAM_VERSION=${version}" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------------
-      # 5. Preparation. The repository already holds the base Case template
+      # 6. Preparation. The repository already holds the base Case template
       #    src/master_batch/simpleFoam_files and the DOE Batch CSV
       #    src/output_batch_1.csv. The contract needs one Case, so the job
       #    builds a one-row DOE Batch CSV from the committed header and one
@@ -368,7 +463,7 @@ jobs:
           cat "${EVIDENCE_DIR}/prepare.log" || true
 
       # ---------------------------------------------------------------------
-      # 6. The bounded Orchestrator. Four Stages, one Case, -j 1, no tuning.
+      # 7. The bounded Orchestrator. Four Stages, one Case, -j 1, no tuning.
       # ---------------------------------------------------------------------
       - name: Run the Orchestrator
         if: always() && env.PREPARE_RESULT == 'SUCCEEDED'
@@ -402,14 +497,17 @@ jobs:
           source_status=$?
           set -eu
 
-          if (( source_status != 0 )) || [[ -z "${WM_PROJECT_VERSION:-}" ]]; then
+          # The Orchestrator revalidates the exact baseline after it sources
+          # the environment file. A non-empty but different version stops the
+          # run before the Orchestrator starts.
+          if (( source_status != 0 )) || [[ "${WM_PROJECT_VERSION:-}" != "$OPENFOAM_BASELINE" ]]; then
               {
                 echo "INSTALL_RESULT=INFRASTRUCTURE_FAILURE"
-                echo "INSTALL_REASON=OpenFOAM environment did not load from ${OPENFOAM_BASHRC}: source status ${source_status}, WM_PROJECT_VERSION '${WM_PROJECT_VERSION:-}'"
+                echo "INSTALL_REASON=the loaded OpenFOAM environment is not the exact baseline from ${OPENFOAM_BASHRC}: source status ${source_status}, expected WM_PROJECT_VERSION '${OPENFOAM_BASELINE}', observed '${WM_PROJECT_VERSION:-}'"
                 echo "ORCHESTRATOR_STARTED=false"
                 echo "OVERALL_RESULT=INFRASTRUCTURE_FAILURE"
               } >> "$GITHUB_ENV"
-              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}" >&2
+              echo "environment: INFRASTRUCTURE_FAILURE, source status ${source_status}, expected '${OPENFOAM_BASELINE}', observed '${WM_PROJECT_VERSION:-}'" >&2
               exit 0
           fi
 
@@ -444,7 +542,7 @@ jobs:
           fi
 
       # ---------------------------------------------------------------------
-      # 7. The capture sequence. This step is the next step after the bounded
+      # 8. The capture sequence. This step is the next step after the bounded
       #    execution and records CAPTURE_START before any parsing.
       # ---------------------------------------------------------------------
       - name: Capture the evidence
@@ -677,6 +775,10 @@ jobs:
             echo "TIMEOUT_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS:-NOT_RECORDED}"
             echo "OVERALL_RESULT=${OVERALL_RESULT:-NOT_ATTEMPTED}"
             echo "OPENFOAM_VERSION=${OPENFOAM_VERSION:-UNAVAILABLE}"
+            echo "BASELINE_RESULT=${BASELINE_RESULT:-NOT_ATTEMPTED}"
+            echo "OPENFOAM_BASELINE=${OPENFOAM_BASELINE:-UNAVAILABLE}"
+            echo "OPENFOAM_PACKAGE=${OPENFOAM_PACKAGE:-UNAVAILABLE}"
+            echo "OPENFOAM_BASHRC=${OPENFOAM_BASHRC:-UNAVAILABLE}"
           } > "${EVIDENCE_DIR}/phase-results.txt"
           cat "${EVIDENCE_DIR}/phase-results.txt"
 
@@ -685,10 +787,12 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "## OpenFOAM v2506 evidence run"
+            echo "## OpenFOAM v2512 evidence run"
             echo
             echo "| Field | Value |"
             echo "|---|---|"
+            echo "| OpenFOAM baseline | \`${OPENFOAM_BASELINE:-UNAVAILABLE}\` |"
+            echo "| Baseline phase | \`${BASELINE_RESULT:-NOT_ATTEMPTED}\` |"
             echo "| OpenFOAM version | \`${OPENFOAM_VERSION:-UNAVAILABLE}\` |"
             echo "| Checkout phase | \`${CHECKOUT_RESULT:-NOT_ATTEMPTED}\` |"
             echo "| Installation phase | \`${INSTALL_RESULT:-NOT_ATTEMPTED}\` |"
@@ -704,7 +808,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openfoam-v2506-evidence
+          name: openfoam-v2512-evidence
           # Only the selected evidence of the capture step. The directory holds
           # no checkout copy, no unfiltered Batch Workspace, and no VTU file.
           path: ${{ runner.temp }}/evidence
