@@ -2435,6 +2435,27 @@ Expected:
 - a transport mesh that disappears during a prepared case run, after the runner captured readiness `1`, leaves a marker with `transport_ready=1`, the transport-time list, and the prepared `completed` message; the next run captures readiness `0`, rebuilds flow-only, and removes the stale `trd_*.vtu` files;
 - a transport mesh that appears during a flow-only case run, after the runner captured readiness `0`, leaves a marker with `transport_ready=0` and the flow-only `completed` message; the next run captures readiness `1` and rebuilds with transport conversion.
 
+### AD. OpenFOAM version baseline and evidence-workflow contract
+
+Inspect the committed OpenFOAM baseline file, the manual evidence workflow, the `batch-contract` workflow, and the Scenario index. Execute the extracted baseline-resolution and environment-record step bodies against controlled fixtures. Install no OpenFOAM package and dispatch no workflow.
+
+Expected:
+
+- `.openfoam-version` exists and holds the exact bytes `v2512` and one line ending;
+- the evidence workflow reads `.openfoam-version` after checkout and before installation, and only after a successful checkout;
+- the workflow derives the release token, the package `openfoam2512-default`, and the environment file path `/usr/lib/openfoam/openfoam2512/etc/bashrc` from the validated baseline, and publishes them through `GITHUB_ENV`;
+- the workflow keeps no active `v2506` package, environment file path, job label, step label, summary label, or artifact label;
+- the environment-record step requires source status `0` and exact `WM_PROJECT_VERSION=v2512`, and accepts no merely non-empty version;
+- the Orchestrator step revalidates exact `WM_PROJECT_VERSION=v2512` after it sources the environment file;
+- a missing, unreadable, multi-line, or different baseline records `BASELINE_RESULT=INFRASTRUCTURE_FAILURE`, `OVERALL_RESULT=INFRASTRUCTURE_FAILURE`, `ORCHESTRATOR_STARTED=false`, and one exact single-line reason, derives no package and no environment file path, and prevents installation, preparation, and the Orchestrator;
+- an empty or different loaded version records `INSTALL_RESULT=INFRASTRUCTURE_FAILURE`, `OVERALL_RESULT=INFRASTRUCTURE_FAILURE`, `ORCHESTRATOR_STARTED=false`, and one exact reason, writes no environment identity record, and prevents preparation and the Orchestrator;
+- the environment identity record holds `OPENFOAM_BASELINE`, `OPENFOAM_PACKAGE`, `OPENFOAM_PACKAGE_VERSION`, `OPENFOAM_BASHRC`, `WM_PROJECT_VERSION`, `WM_OPTIONS`, the `simpleFoam`, `snappyHexMesh`, `surfaceTransformPoints`, and `foamToVTK` paths, `OS_IDENTITY`, `ARCHITECTURE`, and `GCC_VERSION`, each with a value or the explicit `UNAVAILABLE` token;
+- the version-bearing job label, installation-step label, summary heading, and artifact name say `v2512`;
+- the workflow starts only through `workflow_dispatch`, needs no input, and is never a required check;
+- the workflow preserves `contents: read`, job id `evidence`, runner `ubuntu-24.04`, the 120-minute job timeout, the four-Stage selection without transport, `-j 1`, the existing Case 7 selection, the MPI oversubscription opt-in, the runner-temporary upload path, the error guard, the hidden-file capture, and the 90-day retention;
+- both `batch-contract` event path filters include `.openfoam-version` and `.github/workflows/openfoam-evidence.yml`, and keep their existing paths;
+- the specification index, the `tests/README.md` map, and `tests/cases/` hold the same 30 Scenario entries.
+
 ## 24. Multi-agent GitHub handoff rules
 
 When an AI agent changes these scripts, its GitHub handoff SHOULD include:

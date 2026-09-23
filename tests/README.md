@@ -75,9 +75,50 @@ The public script CLI is the only test seam. No test calls a private function.
 | 23.AA | VTU point-data output | `cases/aa_post_point_data_output.sh` |
 | 23.AB | MPI launcher oversubscription opt-in | `cases/ab_mpi_oversubscribe_optin.sh` |
 | 23.AC | Flow-only post-processing readiness | `cases/ac_flow_only_post_processing.sh` |
+| 23.AD | OpenFOAM version baseline and evidence-workflow contract | `cases/ad_openfoam_version_contract.sh` |
 
 Section 23.D creates a non-empty reuse workspace before the stage-order
 preflight, because that scenario does not select setup.
+
+Section 23.AD proves the OpenFOAM baseline contract of Issue #82. The
+committed `.openfoam-version` file is the single active target, and the manual
+evidence workflow derives the package name and the environment file path from
+it. The scenario installs no OpenFOAM package and dispatches no workflow.
+
+Most observations read the committed baseline file, the two workflow files,
+the specification, and the Scenario map as text. Four observations are
+stronger than a text check: the scenario extracts the shell body of the
+baseline-resolution step and of the environment-record step, proves that each
+extracted body parses, and then executes it in an isolated workspace against a
+controlled fixture. The baseline fixtures cover the exact target, an absent
+file, a multi-line file, a different target, and a missing line ending. The
+environment fixtures are a local file that exports the exact version, a
+different version, an empty version, and an absent file. Each run asserts the
+published `GITHUB_ENV` values, so the derivation and the fail-closed behavior
+are proved by execution.
+
+Each executed body must publish only `KEY=VALUE` lines. A multi-line value
+would corrupt the environment file, so every rejected fixture also proves that
+its recorded reason stays one line.
+
+The environment-record step publishes `OPENFOAM_VERSION` and never
+`WM_PROJECT_VERSION`. A later step would inherit a published
+`WM_PROJECT_VERSION` and could then pass its own revalidation without a loaded
+OpenFOAM environment, so the scenario asserts that absence.
+
+The baseline guard rejects a missing file and an unreadable file. A regular
+file has no unreadable state for the root identity, so a behavioral execution
+of that branch cannot be identity-independent. The unreadable-baseline
+observation therefore has four parts. Two parts need no identity: they assert
+that the extracted guard holds the unreadable-file condition, and they prove
+that this assertion is load-bearing by rejecting a mutated body that lost the
+condition. Two parts are behavioral: they execute the step body against a
+mode-000 fixture and require the exact unreadable-file reason, and they execute
+the mutated body against the same fixture and require a different reason,
+because that body reaches the byte comparison instead of the guard. The
+scenario decides whether the behavioral parts can run by one real read attempt
+on the fixture, never by an identity number, and it reports an explicit skip
+for a root identity.
 
 Section 23.AC proves the transport-readiness rule of Specification Section 18
 through the direct post-processing Stage Runner CLI. One Batch Workspace moves
