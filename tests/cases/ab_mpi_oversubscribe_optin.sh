@@ -14,6 +14,14 @@
 # workflow starts only through workflow_dispatch, so the corrected evidence
 # capture needs a static check.
 #
+# Checks S10 to S15 execute code extracted from that workflow (Issue #87). S10
+# runs the production VTU reader on a finite ASCII VTU file without an
+# <AppendedData> marker under a 5-second limit. S11 to S14 run the capture step
+# body with a controlled deadline, a synthetic Batch Workspace, and fake
+# commands that block, so the work limit, the early phase results, and the
+# capture result are observable without OpenFOAM and without a dispatch. S15
+# checks that the summary and the upload steps stay eligible.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -708,6 +716,394 @@ s9_upload_step_includes_hidden_files() {
         "S9: the upload step includes the dot-prefixed Failure Artifacts"
 }
 
+# ab_vtu_fields <extractor> <file> [<seconds>] - run the extracted production
+# reader on one file under a timeout. Prints the names, then status=<status>.
+ab_vtu_fields() {
+    local extractor="$1" file="$2" seconds="${3:-10}" observed status
+    observed="$(timeout "$seconds" bash -c 'source "$1"; vtu_header_point_data_names "$2"' _ \
+        "$extractor" "$file")" && status=0 || status=$?
+    printf '%s\nstatus=%s\n' "$observed" "$status"
+}
+
+# ab_ascii_vtu <file> <data-lines> - a finite ASCII VTU file without an
+# <AppendedData> marker. PointData holds U and p, and a same-line CellData
+# element follows it. Each data line has 64 bytes.
+ab_ascii_vtu() {
+    local file="$1" lines="$2"
+    {
+        printf '<?xml version="1.0"?>\n<VTKFile type="UnstructuredGrid">\n'
+        printf '<UnstructuredGrid><Piece NumberOfPoints="1" NumberOfCells="1">\n'
+        printf '<PointData Vectors="U" Scalars="p">\n'
+        printf '<DataArray type="Float32" Name="U" NumberOfComponents="3" format="ascii">\n'
+        awk -v n="$lines" 'BEGIN { for (i = 0; i < n; i++)
+            printf "%015d %015d %015d %015d\n", i, i, i, i }'
+        printf '</DataArray>\n<DataArray type="Float32" Name="p" format="ascii">\n'
+        awk -v n="$lines" 'BEGIN { for (i = 0; i < n; i++)
+            printf "%015d %015d %015d %015d\n", i, i, i, i }'
+        printf '</DataArray>\n</PointData><CellData><DataArray Name="S10_CELL"/></CellData>\n'
+        printf '</Piece></UnstructuredGrid>\n</VTKFile>\n'
+    } > "$file"
+}
+
+s10_vtu_reader_reads_a_large_no_marker_file() {
+    local workspace extractor fixture bytes result
+    workspace="$(new_workspace s10_no_marker)"
+    extractor="${workspace}/vtu_extractor.sh"
+    ab_extract_vtu_extractor > "$extractor"
+    bash -n "$extractor" ||
+        _fail "S10: the extracted production extractor must parse"
+
+    # At least 512 KiB, with no <AppendedData> marker. The reader must read the
+    # complete finite file in one linear pass under the same 5-second limit.
+    fixture="${workspace}/ascii.vtu"
+    ab_ascii_vtu "$fixture" 4200
+    bytes="$(wc -c < "$fixture" | tr -d ' ')"
+    if (( bytes < 524288 )); then
+        _fail "S10: the no-marker fixture must hold at least 512 KiB" "bytes: ${bytes}"
+    fi
+    if grep -q 'AppendedData' "$fixture"; then
+        _fail "S10: the no-marker fixture must not hold an <AppendedData> marker"
+    fi
+
+    result="$(ab_vtu_fields "$extractor" "$fixture" 5)"
+    assert_eq "$(printf 'U p\nstatus=0')" "$result" \
+        "S10: a ${bytes}-byte ASCII VTU file without <AppendedData> gives U p within 5 seconds"
+    assert_not_contains "$result" "S10_CELL" \
+        "S10: the same-line CellData element contributes no name"
+
+    # A failed or incomplete parse is not a valid empty result.
+    printf '<VTKFile><Piece><PointData></PointData></Piece>\n</VTKFile>\n' \
+        > "${workspace}/empty.vtu"
+    assert_eq "$(printf '\nstatus=0')" "$(ab_vtu_fields "$extractor" "${workspace}/empty.vtu")" \
+        "S10: an empty PointData element is a complete parse with no name"
+    printf '<VTKFile><Piece><PointData><DataArray Name="U"/>\n' > "${workspace}/truncated.vtu"
+    assert_eq "$(printf '\nstatus=2')" "$(ab_vtu_fields "$extractor" "${workspace}/truncated.vtu")" \
+        "S10: an unclosed PointData element is an incomplete parse with no name"
+    assert_eq "$(printf '\nstatus=1')" "$(ab_vtu_fields "$extractor" "${workspace}/absent.vtu")" \
+        "S10: a missing file is a read failure with no name"
+}
+
+# ---- S11 to S15: the bounded capture step -----------------------------------
+
+# ab_step_run_body <step-name> - the dedented shell body of one workflow step.
+# The body is the block under `run: |`, which this workflow indents by ten
+# spaces. The extraction ends at the first line that leaves that body.
+ab_step_run_body() {
+    awk -v want="      - name: $1" '
+        $0 == want { found = 1; next }
+        found && /^      - name: / { exit }
+        found && !inside && /^        run: \|[[:space:]]*$/ { inside = 1; next }
+        inside {
+            if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+            if ($0 !~ /^          /) { exit }
+            print substr($0, 11)
+        }
+    ' "$WORKFLOW"
+}
+
+# ab_capture_fixture <workspace> - a Batch Workspace with Stage evidence, one VTU
+# file, the production bounded-runner library, and a fake-command directory.
+ab_capture_fixture() {
+    local workspace="$1" batch
+    mkdir -p "${workspace}/runner_temp" "${workspace}/tmp" "${workspace}/fakebin"
+    : > "${workspace}/github_env"
+    : > "${workspace}/fake_pids"
+
+    batch="${workspace}/checkout/src/batch_9"
+    mkdir -p "${batch}/case_7/vtk" "${batch}/_flow_logs"
+    printf 'case,status\ncase_7,OK\n' > "${batch}/setup_cases_summary.csv"
+    printf 'case,status\ncase_7,FAILED\n' > "${batch}/run_flow_cases_summary.csv"
+    printf 'case_7\n' > "${batch}/.run_flow_cases_failed"
+    printf 'flow log\n' > "${batch}/_flow_logs/case_7.log"
+    printf 'solver log\n' > "${batch}/case_7/log.simpleFoam"
+    {
+        printf '<VTKFile><Piece><PointData><DataArray Name="U"/><DataArray Name="p"/>'
+        printf '</PointData></Piece>\n<AppendedData encoding="raw">_payload\n'
+        printf '</AppendedData></VTKFile>\n'
+    } > "${batch}/case_7/vtk/flow_latest_100.vtu"
+
+    ab_step_run_body "Create the bounded-runner library" > "${workspace}/lib_step.sh"
+    ab_step_run_body "Capture the evidence" > "${workspace}/capture_step.sh"
+    ab_step_run_body "Write the job summary" > "${workspace}/summary_step.sh"
+    bash -n "${workspace}/capture_step.sh" ||
+        _fail "S11: the extracted capture step must parse"
+    RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/lib_step.sh" > /dev/null ||
+        _fail "S11: the production bounded-runner library step must succeed"
+}
+
+# ab_fake_hang <workspace> <command> <argument-pattern> - a fake command that
+# records its process ID and blocks when one argument matches the pattern, and
+# that runs the real command otherwise.
+ab_fake_hang() {
+    local workspace="$1" name="$2" pattern="$3" real
+    real="$(command -v "$name")"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    case "$argument" in\n'
+        printf '        %s)\n' "$pattern"
+        printf '            printf "%%s\\n" "$$" >> %q\n' "${workspace}/fake_pids"
+        printf '            [[ -f "${EVIDENCE_DIR}/phase-results.txt" ]] &&\n'
+        printf '                printf "present\\n" >> %q\n' "${workspace}/phase_results_at_block"
+        printf '            exec sleep 300 ;;\n'
+        printf '    esac\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$real"
+    } > "${workspace}/fakebin/${name}"
+    chmod +x "${workspace}/fakebin/${name}"
+}
+
+# ab_run_capture <workspace> <deadline> - run the extracted capture step with a
+# controlled deadline and a known product failure. Prints status=<status> and
+# elapsed=<seconds>.
+ab_run_capture() {
+    local workspace="$1" deadline="$2" start status
+    start="$(date +%s)"
+    env PATH="${workspace}/fakebin:${PATH}" \
+        TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" \
+        EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_ENV="${workspace}/github_env" \
+        GITHUB_WORKSPACE="${workspace}/checkout" \
+        LIB="${workspace}/runner_temp/evidence_lib.sh" \
+        CAPTURE_DEADLINE="$deadline" \
+        EVIDENCE_CLOCK_START="$(( deadline - 6300 ))" \
+        CAPTURE_START_GUARD_SECONDS=60 \
+        PREPARE_RESULT=SUCCEEDED ORCHESTRATOR_STARTED=true \
+        OVERALL_RESULT=FAILED_EXIT_1 \
+        bash "${workspace}/capture_step.sh" > "${workspace}/capture_step.out" 2>&1 \
+        && status=0 || status=$?
+    printf 'status=%s\nelapsed=%s\n' "$status" "$(( $(date +%s) - start ))"
+}
+
+# ab_env_last <workspace> <key> - the last GITHUB_ENV value of one key.
+ab_env_last() {
+    awk -v key="$2" 'index($0, key "=") == 1 { value = substr($0, length(key) + 2) }
+                     END { print value }' "${1}/github_env"
+}
+
+# ab_run_summary <workspace> - run the extracted summary step with the capture
+# result that the capture step published. Prints the job summary.
+ab_run_summary() {
+    local workspace="$1"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" \
+        CAPTURE_RESULT="$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        CAPTURE_REASON="$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        OVERALL_RESULT=FAILED_EXIT_1 \
+        bash "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
+        _fail "the extracted summary step must succeed"
+    cat "${workspace}/step_summary"
+}
+
+# ab_assert_fakes_stopped <workspace> <label> - no blocked fake command runs.
+ab_assert_fakes_stopped() {
+    local workspace="$1" label="$2" pid
+    [[ -s "${workspace}/fake_pids" ]] ||
+        _fail "${label}: the blocking fake command must run"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "${label}: the capture step must stop the blocked process ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+}
+
+# ab_assert_kept_evidence <workspace> <label> - the early and the Stage evidence.
+ab_assert_kept_evidence() {
+    local evidence="${1}/runner_temp/evidence" label="$2"
+    assert_file_exists "${evidence}/phase-results.txt" \
+        "${label}: phase-results.txt exists"
+    if [[ -s "${1}/fake_pids" ]]; then
+        assert_eq "present" "$(cat "${1}/phase_results_at_block" 2>/dev/null)" \
+            "${label}: phase-results.txt exists before the blocked capture operation"
+    fi
+    assert_contains "$(cat "${evidence}/phase-results.txt")" "OVERALL_RESULT=FAILED_EXIT_1" \
+        "${label}: the product result stays FAILED_EXIT_1"
+    assert_not_contains "$(cat "${evidence}/phase-results.txt")" "CAPTURE_RESULT" \
+        "${label}: the capture result does not replace a phase result"
+}
+
+s11_capture_completes_under_the_480_second_cap() {
+    local workspace run evidence start
+    workspace="$(new_workspace s11_complete)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+
+    # A far deadline, so the 480-second work cap is the earlier limit.
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S11: the capture step ends with status 0"
+    start="$(awk -F= '$1 == "CAPTURE_START" { print $2; exit }' "${evidence}/capture-clock.txt")"
+    assert_contains "$(cat "${evidence}/capture-clock.txt")" \
+        "CAPTURE_WORK_END=$(( start + 480 ))" \
+        "S11: the work limit is 480 seconds after capture start"
+    assert_contains "$(cat "${evidence}/capture-clock.txt")" \
+        "CAPTURE_WORK_LIMIT_SOURCE=CAPTURE_WORK_CAP" \
+        "S11: the 480-second cap is the recorded limit source"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S11: GITHUB_ENV records a complete capture"
+    assert_contains "$(cat "${evidence}/capture-result.txt")" "CAPTURE_RESULT=COMPLETE" \
+        "S11: capture-result.txt records a complete capture"
+    ab_assert_kept_evidence "$workspace" "S11"
+    assert_file_exists "${evidence}/summaries/run_flow_cases_summary.csv" \
+        "S11: the flow Stage summary is kept"
+    assert_file_exists "${evidence}/stage-logs/.run_flow_cases_failed" \
+        "S11: the flow Failure Artifact is kept"
+    assert_file_exists "${evidence}/stage-logs/case_7/log.simpleFoam" \
+        "S11: the Case log is kept"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_OBSERVED_FIELDS=U p" \
+        "S11: the manifest records the observed fields"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S11: the manifest records present VTU evidence"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" \
+        "VTU_SHA256=$(sha256sum -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_100.vtu" | cut -d' ' -f1)" \
+        "S11: the manifest keeps the source VTU checksum"
+    if find "$evidence" -name '*.vtu' | grep -q .; then
+        _fail "S11: the evidence directory must hold no VTU file"
+    fi
+}
+
+s12_capture_operation_stops_before_the_deadline_reserve() {
+    local workspace run evidence deadline elapsed summary
+    workspace="$(new_workspace s12_operation_timeout)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    # The checksum of the VTU file blocks.
+    ab_fake_hang "$workspace" sha256sum '*flow_latest_100.vtu'
+
+    # The deadline leaves 16 seconds of work before the 180-second reserve, so
+    # the deadline reserve is the earlier limit.
+    deadline="$(( $(date +%s) + 180 + 16 ))"
+    run="$(ab_run_capture "$workspace" "$deadline")"
+
+    assert_contains "$run" "status=0" "S12: the capture step ends with status 0"
+    elapsed="$(printf '%s\n' "$run" | awk -F= '$1 == "elapsed" { print $2 }')"
+    if (( elapsed > 16 )); then
+        _fail "S12: the capture step must end at the work limit" "elapsed: ${elapsed}"
+    fi
+    assert_contains "$(cat "${evidence}/capture-clock.txt")" \
+        "CAPTURE_WORK_END=$(( deadline - 180 ))" \
+        "S12: the work limit is 180 seconds before the deadline"
+    assert_contains "$(cat "${evidence}/capture-clock.txt")" \
+        "CAPTURE_WORK_LIMIT_SOURCE=CAPTURE_DEADLINE_RESERVE" \
+        "S12: the deadline reserve is the recorded limit source"
+    ab_assert_fakes_stopped "$workspace" "S12"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S12: GITHUB_ENV records an incomplete capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        "VTU checksum case_7/vtk/flow_latest_100.vtu: exceeded the capture work limit" \
+        "S12: the capture reason names the stopped operation"
+    ab_assert_kept_evidence "$workspace" "S12"
+    assert_file_exists "${evidence}/summaries/run_flow_cases_summary.csv" \
+        "S12: the flow Stage summary is kept"
+    assert_file_exists "${evidence}/stage-logs/.run_flow_cases_failed" \
+        "S12: the flow Failure Artifact is kept"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_SHA256=UNAVAILABLE" \
+        "S12: the stopped checksum is UNAVAILABLE"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PARTIAL" \
+        "S12: the manifest does not report present VTU evidence"
+    assert_not_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S12: the manifest reports no complete VTU evidence"
+
+    summary="$(ab_run_summary "$workspace")"
+    assert_contains "$summary" '| Capture result | `INCOMPLETE` |' \
+        "S12: the job summary shows the capture result"
+    assert_contains "$summary" "exceeded the capture work limit" \
+        "S12: the job summary shows the capture reason"
+    assert_contains "$summary" '| Overall result | `FAILED_EXIT_1` |' \
+        "S12: the job summary keeps the product result"
+}
+
+s13_capture_work_stops_at_the_outer_limit() {
+    local workspace run evidence elapsed
+    workspace="$(new_workspace s13_outer_timeout)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    # A copy that no operation bound covers blocks, so only the outer limit
+    # can stop the capture work.
+    printf 'blocked log\n' > "${workspace}/checkout/src/batch_9/case_7/log.HANG"
+    ab_fake_hang "$workspace" cp '*log.HANG'
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 180 + 16 ))")"
+
+    assert_contains "$run" "status=0" "S13: the capture step ends with status 0"
+    elapsed="$(printf '%s\n' "$run" | awk -F= '$1 == "elapsed" { print $2 }')"
+    if (( elapsed > 16 )); then
+        _fail "S13: the capture step must end at the work limit" "elapsed: ${elapsed}"
+    fi
+    ab_assert_fakes_stopped "$workspace" "S13"
+    assert_eq "TIMED_OUT" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S13: GITHUB_ENV records a timed-out capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" "stopped at the work limit" \
+        "S13: the capture reason names the work limit"
+    ab_assert_kept_evidence "$workspace" "S13"
+    assert_file_exists "${evidence}/summaries/run_flow_cases_summary.csv" \
+        "S13: the Stage summary copied before the block is kept"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=UNAVAILABLE" \
+        "S13: the missing VTU evidence is UNAVAILABLE"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" \
+        "VTU_REASON=the capture did not complete: TIMED_OUT" \
+        "S13: the VTU reason names the capture result"
+    assert_contains "$(cat "${evidence}/stage-summary-lines.txt")" "UNAVAILABLE: TIMED_OUT" \
+        "S13: the missing Stage summary lines are UNAVAILABLE"
+}
+
+s14_capture_without_budget_skips_the_optional_work() {
+    local workspace run evidence deadline label
+    for deadline in "$(( $(date +%s) + 100 ))" 0; do
+        label="S14 deadline ${deadline}"
+        workspace="$(new_workspace "s14_no_budget_${deadline}")"
+        ab_capture_fixture "$workspace"
+        evidence="${workspace}/runner_temp/evidence"
+
+        run="$(ab_run_capture "$workspace" "$deadline")"
+
+        assert_contains "$run" "status=0" "${label}: the capture step ends with status 0"
+        assert_eq "SKIPPED_NO_BUDGET" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+            "${label}: GITHUB_ENV records a skipped capture"
+        assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" "no capture work budget" \
+            "${label}: the capture reason names the missing budget"
+        ab_assert_kept_evidence "$workspace" "$label"
+        assert_file_missing "${evidence}/summaries/run_flow_cases_summary.csv" \
+            "${label}: no optional copy runs without a budget"
+        assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=UNAVAILABLE" \
+            "${label}: the missing VTU evidence is UNAVAILABLE"
+        assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "SKIPPED_NO_BUDGET" \
+            "${label}: the VTU reason names the skipped capture"
+    done
+}
+
+s15_capture_failure_keeps_summary_and_upload_eligible() {
+    local capture summary upload
+    capture="$(ab_workflow_step_block "Capture the evidence")"
+    summary="$(ab_workflow_step_block "Write the job summary")"
+    upload="$(ab_workflow_step_block "Upload the evidence artifacts")"
+    assert_contains "$capture" "        if: always()" "S15: the capture step always runs"
+    assert_contains "$capture" "        timeout-minutes: 10" \
+        "S15: the capture step has the 10-minute final guard"
+    assert_contains "$summary" "        if: always()" "S15: the summary step always runs"
+    assert_contains "$upload" "        if: always()" "S15: the upload step always runs"
+    assert_contains "$summary" 'CAPTURE_RESULT' "S15: the summary shows the capture result"
+    assert_contains "$summary" 'CAPTURE_REASON' "S15: the summary shows the capture reason"
+    # The step publishes NOT_COMPLETED before any capture work, so a step that
+    # the final guard stops still reports an incomplete capture.
+    assert_contains "$capture" 'CAPTURE_RESULT=NOT_COMPLETED' \
+        "S15: the capture step publishes NOT_COMPLETED first"
+    assert_eq "$(ab_step_names_after "Capture the evidence")" \
+        "$(printf 'Write the job summary\nUpload the evidence artifacts')" \
+        "S15: the summary and the upload steps follow the capture step"
+}
+
+# ab_step_names_after <step-name> - the names of the steps after one step.
+ab_step_names_after() {
+    awk -v want="      - name: $1" '
+        $0 == want { found = 1; next }
+        found && /^      - name: / { print substr($0, 15) }
+    ' "$WORKFLOW"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -735,6 +1131,12 @@ AB_OBSERVATIONS=(
     s7_capture_step_names_every_log_directory
     s8_capture_step_writes_the_vtu_manifest
     s9_upload_step_includes_hidden_files
+    s10_vtu_reader_reads_a_large_no_marker_file
+    s11_capture_completes_under_the_480_second_cap
+    s12_capture_operation_stops_before_the_deadline_reserve
+    s13_capture_work_stops_at_the_outer_limit
+    s14_capture_without_budget_skips_the_optional_work
+    s15_capture_failure_keeps_summary_and_upload_eligible
 )
 
 # One observation runs in this process when the caller names it. The scenario

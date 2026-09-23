@@ -544,15 +544,45 @@ jobs:
       # ---------------------------------------------------------------------
       # 8. The capture sequence. This step is the next step after the bounded
       #    execution and records CAPTURE_START before any parsing.
+      #
+      #    The step writes phase-results.txt first. The optional capture work
+      #    then runs under one work limit: 480 seconds from capture start, and
+      #    never later than 180 seconds before CAPTURE_DEADLINE. The earlier
+      #    limit wins. A capture error, a timeout, or a missing budget gives a
+      #    CAPTURE_RESULT and a CAPTURE_REASON, and the step then ends with
+      #    status 0, so the summary and the upload steps still run. The step
+      #    timeout is only a final guard.
       # ---------------------------------------------------------------------
       - name: Capture the evidence
         if: always()
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           capture_start="$(date +%s)"
           echo "CAPTURE_START=${capture_start}" >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           deadline="${CAPTURE_DEADLINE:-0}"
+          [[ "$deadline" =~ ^[0-9]+$ ]] || deadline=0
+
+          # A step that does not reach its end keeps this result. The summary
+          # step then reports it.
+          capture_result_file="${EVIDENCE_DIR}/capture-result.txt"
+          {
+            echo "CAPTURE_RESULT=NOT_COMPLETED"
+            echo "CAPTURE_REASON=the capture step did not reach its end"
+          } | tee "$capture_result_file" >> "$GITHUB_ENV"
+
+          # The capture work limit. The earlier limit wins.
+          work_cap_seconds=480
+          deadline_reserve_seconds=180
+          work_end=$(( capture_start + work_cap_seconds ))
+          work_limit_source=CAPTURE_WORK_CAP
+          if (( deadline - deadline_reserve_seconds < work_end )); then
+              work_end=$(( deadline - deadline_reserve_seconds ))
+              work_limit_source=CAPTURE_DEADLINE_RESERVE
+          fi
+          work_budget=$(( work_end - capture_start ))
+
           echo "CAPTURE_START=${capture_start}" | tee "${EVIDENCE_DIR}/capture-clock.txt"
           {
             echo "EVIDENCE_CLOCK_START=${EVIDENCE_CLOCK_START:-UNAVAILABLE}"
@@ -560,11 +590,214 @@ jobs:
             echo "CAPTURE_START_GUARD_SECONDS=${CAPTURE_START_GUARD_SECONDS:-UNAVAILABLE}"
             echo "CAPTURE_START_WITHIN_DEADLINE=$([[ "$capture_start" -le "$deadline" ]] \
                  && echo true || echo false)"
+            echo "CAPTURE_WORK_CAP_SECONDS=${work_cap_seconds}"
+            echo "CAPTURE_DEADLINE_RESERVE_SECONDS=${deadline_reserve_seconds}"
+            echo "CAPTURE_WORK_END=${work_end}"
+            echo "CAPTURE_WORK_LIMIT_SOURCE=${work_limit_source}"
+            echo "CAPTURE_WORK_BUDGET_SECONDS=${work_budget}"
           } >> "${EVIDENCE_DIR}/capture-clock.txt"
 
-          # Every extraction below is guarded, so a non-match or a missing
-          # file never ends the step. The only grep in this workflow is the
-          # anchored classifier match, which runs inside an if condition.
+          # The phase results come first, before any file-tree scan, copy, VTU
+          # parse, or checksum. OVERALL_RESULT is the product result. The
+          # capture result is in capture-result.txt and never replaces it.
+          {
+            echo "CHECKOUT_RESULT=${CHECKOUT_RESULT:-NOT_ATTEMPTED}"
+            echo "INSTALL_RESULT=${INSTALL_RESULT:-NOT_ATTEMPTED}"
+            echo "PREPARE_RESULT=${PREPARE_RESULT:-NOT_ATTEMPTED}"
+            echo "ORCHESTRATOR_STARTED=${ORCHESTRATOR_STARTED:-false}"
+            echo "TIMEOUT_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS:-NOT_RECORDED}"
+            echo "OVERALL_RESULT=${OVERALL_RESULT:-NOT_ATTEMPTED}"
+            echo "OPENFOAM_VERSION=${OPENFOAM_VERSION:-UNAVAILABLE}"
+            echo "BASELINE_RESULT=${BASELINE_RESULT:-NOT_ATTEMPTED}"
+            echo "OPENFOAM_BASELINE=${OPENFOAM_BASELINE:-UNAVAILABLE}"
+            echo "OPENFOAM_PACKAGE=${OPENFOAM_PACKAGE:-UNAVAILABLE}"
+            echo "OPENFOAM_BASHRC=${OPENFOAM_BASHRC:-UNAVAILABLE}"
+          } > "${EVIDENCE_DIR}/phase-results.txt"
+          cat "${EVIDENCE_DIR}/phase-results.txt"
+
+          # The optional capture work. It is a script file, so run_bounded can
+          # stop it and every descendant at the work limit.
+          CAPTURE_WORK_SCRIPT="${RUNNER_TEMP:-${EVIDENCE_DIR%/*}}/capture_work.sh"
+          cat > "$CAPTURE_WORK_SCRIPT" <<'CAPTURE_WORK'
+          set -euo pipefail
+          notes_file="${EVIDENCE_DIR}/capture-work-notes.txt"
+
+          # capture_note <text> - record one incomplete capture item.
+          capture_note() {
+              printf '%s\n' "$1" >> "$notes_file"
+          }
+
+          # bounded <label> <command> [args...] - run one blocking operation
+          # under the time that is left before the capture work limit, less a
+          # margin. The operation ends before the outer limit, and timeout
+          # stops the process group of the operation.
+          bounded() {
+              local label="$1" left status
+              shift
+              left=$(( CAPTURE_WORK_END - 10 - $(date +%s) ))
+              (( left > 120 )) && left=120
+              if (( left <= 0 )); then
+                  capture_note "${label}: no capture work time was left"
+                  return 124
+              fi
+              timeout --kill-after=2s "${left}s" "$@" && status=0 || status=$?
+              if (( status == 124 || status == 137 )); then
+                  capture_note "${label}: exceeded the capture work limit"
+              fi
+              return "$status"
+          }
+
+          # Change 7. The bounded VTU point-data manifest.
+          #
+          # The array names come from the file header only. A foamToVTK VTU file
+          # with appended data is a VTK XML file whose binary payload starts at
+          # <AppendedData. The parser input ends exactly at the first byte of that
+          # marker, so the parser never receives an appended-payload byte and needs
+          # no header size limit. A finite ASCII VTU file has no marker, so its
+          # complete file is the parser input.
+          #
+          # The byte count and the SHA-256 describe the complete source file, and the
+          # checksum streams that file. A checksum is file identity evidence. It is
+          # not scientific validation.
+
+          vtu_expected_fields() {
+              case "${1##*/}" in
+                  flow_0.vtu) echo "U p wallDistance" ;;
+                  flow_latest_*.vtu) echo "U p" ;;
+                  trd_*.vtu) echo "${SCALAR_FIELD:-T}" ;;
+                  *) echo "UNKNOWN" ;;
+              esac
+          }
+
+          vtu_header_point_data_names() {
+              # One linear streaming pass that stops at the appended-payload marker.
+              #
+              # Each dd call issues one read, so it returns the bytes that are
+              # available instead of waiting for a full block. Each chunk goes to a
+              # file, and only the new chunk and the last 12 bytes before it are
+              # searched for the marker, so the work for each chunk is constant. The
+              # loop ends as soon as the marker appears, and the text is then cut at
+              # the marker, so the parser input holds no appended-payload byte and
+              # the extraction never waits for payload that a producer has not
+              # released. Without a marker, the loop ends at end of file.
+              #
+              # Three earlier forms were wrong. A 65536-byte limit dropped a valid
+              # PointData declaration past that byte. Making the awk record separator
+              # the tag opening character ended the marker record only at the next
+              # such byte, so the parser could wait for, and hold, the complete
+              # payload. Appending each chunk to one shell string and searching the
+              # complete string again after each chunk made a file without a marker
+              # take time that grows with the square of its size.
+              #
+              # The reader keeps one temporary disk copy of the bytes that it read,
+              # and removes it before it returns. The parser reads that copy one
+              # line at a time and keeps no copy of it in memory. The scan is scoped to each PointData element, so a CellData element that
+              # shares one line with a PointData end tag contributes no name. The
+              # regular expressions use the string form, so no separator needs
+              # escaping.
+              #
+              # Status 0: a complete parse. The output is the names, and an empty
+              # line is a valid empty PointData result. Status 1: the file cannot be
+              # read. Status 2: the header is incomplete, so no name is reported.
+              local source_file="$1" work_dir marker_found=0 read_failed=0
+              local marker_offset parse_input
+              [[ -e "$source_file" && -r "$source_file" && ! -d "$source_file" ]] || return 1
+              work_dir="$(mktemp -d "${TMPDIR:-/tmp}/vtu-header.XXXXXX")" || return 1
+              : > "${work_dir}/header"
+              : > "${work_dir}/tail"
+              if ! exec 3< "$source_file"; then
+                  rm -rf -- "$work_dir"
+                  return 1
+              fi
+              while :; do
+                  if ! dd bs=65536 count=1 status=none <&3 > "${work_dir}/chunk" 2>/dev/null; then
+                      read_failed=1
+                      break
+                  fi
+                  [[ -s "${work_dir}/chunk" ]] || break
+                  cat -- "${work_dir}/chunk" >> "${work_dir}/header"
+                  cat -- "${work_dir}/tail" "${work_dir}/chunk" > "${work_dir}/window"
+                  if LC_ALL=C grep -aqF '<AppendedData' -- "${work_dir}/window"; then
+                      marker_found=1
+                      break
+                  fi
+                  tail -c 12 -- "${work_dir}/window" > "${work_dir}/tail"
+              done
+              exec 3<&-
+              if (( read_failed )); then
+                  rm -rf -- "$work_dir"
+                  return 1
+              fi
+
+              parse_input="${work_dir}/header"
+              if (( marker_found )); then
+                  marker_offset="$(LC_ALL=C grep -abo -m 1 -F '<AppendedData' -- \
+                                   "${work_dir}/header" | head -n 1 | cut -d: -f1 || true)"
+                  if [[ ! "$marker_offset" =~ ^[0-9]+$ ]]; then
+                      rm -rf -- "$work_dir"
+                      return 2
+                  fi
+                  head -c "$marker_offset" -- "${work_dir}/header" > "${work_dir}/parse"
+                  parse_input="${work_dir}/parse"
+              fi
+
+              local parse_status=0
+              LC_ALL=C awk -v require_end="$(( 1 - marker_found ))" '
+                  BEGIN { state = 0; count = 0; names = ""; saw_end = 0 }
+                  {
+                      if (index($0, "</VTKFile")) saw_end = 1
+                      # A line end counts as a space, so a tag name at a line end
+                      # still ends at a separator.
+                      line = $0 " "
+                      while (line != "") {
+                          if (state == 0) {
+                              if (!match(line, "<PointData[ />]")) break
+                              line = substr(line, RSTART + 10)
+                              state = 1
+                          } else if (state == 1) {
+                              # The rest of the PointData start tag.
+                              if (!match(line, ">")) break
+                              if (RSTART > 1 && substr(line, RSTART - 1, 1) == "/") {
+                                  state = 0
+                              } else {
+                                  state = 2
+                              }
+                              line = substr(line, RSTART + 1)
+                          } else {
+                              close_at = match(line, "</PointData[ >]") ? RSTART : 0
+                              if (match(line, "Name=\"[^\"]*\"") &&
+                                  (close_at == 0 || RSTART < close_at)) {
+                                  names = names (count++ ? " " : "") \
+                                      substr(line, RSTART + 6, RLENGTH - 7)
+                                  line = substr(line, RSTART + RLENGTH)
+                              } else if (close_at) {
+                                  state = 0
+                                  line = substr(line, close_at + 11)
+                              } else {
+                                  break
+                              }
+                          }
+                      }
+                  }
+                  END {
+                      if (state != 0 || (require_end && !saw_end)) exit 2
+                      print names
+                  }' "$parse_input" 2>/dev/null || parse_status=$?
+              rm -rf -- "$work_dir"
+              case "$parse_status" in
+                  0) return 0 ;;
+                  2) return 2 ;;
+                  *) return 1 ;;
+              esac
+          }
+
+          # The capture script calls itself for one VTU parse, so the parse runs
+          # as one bounded process.
+          if [[ "${1:-}" == "--vtu-fields" ]]; then
+              vtu_header_point_data_names "$2"
+              exit $?
+          fi
+
           for name in orchestrator.log orchestrator-timeout.log install.log prepare.log; do
               [[ -f "${EVIDENCE_DIR}/${name}" ]] || echo "UNAVAILABLE" > "${EVIDENCE_DIR}/${name}"
           done
@@ -577,10 +810,6 @@ jobs:
 
           workspace_root="${GITHUB_WORKSPACE}/src"
           batch_dir="${workspace_root}/batch_9"
-          {
-            echo "== Batch Workspace tree =="
-            if [[ -d "$batch_dir" ]]; then find "$batch_dir" -maxdepth 4 | sort; else echo "ABSENT"; fi
-          } > "${EVIDENCE_DIR}/batch-workspace-tree.txt"
 
           # The corrected selective capture. Each selected file keeps its path
           # relative to the Batch Workspace, so a reviewer can see which Stage and
@@ -604,9 +833,12 @@ jobs:
               while IFS= read -r selected; do
                   [[ -n "$selected" ]] || continue
                   copy_relative "$selected" "$destination_root"
-              done < <(find "$batch_dir" "$@" -type f 2>/dev/null || true)
+              done < <(bounded "Stage evidence search" \
+                           find "$batch_dir" "$@" -type f 2>/dev/null || true)
           }
 
+          # The Stage evidence comes before the tree and the VTU manifest, so a
+          # later timeout keeps it.
           mkdir -p "${EVIDENCE_DIR}/summaries" "${EVIDENCE_DIR}/stage-logs"
           if [[ -d "$batch_dir" ]]; then
               # Each Stage summary is a root-relative file, so its relative path is
@@ -655,101 +887,90 @@ jobs:
             echo "post:   $(stage_from_summary run_post_processing_cases_summary.csv)"
           } > "${EVIDENCE_DIR}/stage-summary-lines.txt"
 
-          # Change 7. The bounded VTU point-data manifest.
-          #
-          # The array names come from the file header only. A foamToVTK VTU file is a
-          # VTK XML file whose binary payload starts at <AppendedData. The extraction
-          # input ends exactly at the first byte of that marker, so the parser never
-          # receives an appended-payload byte and needs no header size limit.
-          #
-          # The byte count and the SHA-256 describe the complete source file, and the
-          # checksum streams that file. A checksum is file identity evidence. It is
-          # not scientific validation.
-
-          vtu_expected_fields() {
-              case "${1##*/}" in
-                  flow_0.vtu) echo "U p wallDistance" ;;
-                  flow_latest_*.vtu) echo "U p" ;;
-                  trd_*.vtu) echo "${SCALAR_FIELD:-T}" ;;
-                  *) echo "UNKNOWN" ;;
-              esac
-          }
-
-          vtu_header_point_data_names() {
-              # One streaming pass that stops at the appended-payload marker.
-              #
-              # Each dd call issues one read, so it returns the bytes that are
-              # available instead of waiting for a full block. The loop ends as soon
-              # as the marker appears, and the text is then cut at the marker, so the
-              # parser input holds no appended-payload byte and the extraction never
-              # waits for payload that a producer has not released.
-              #
-              # Two earlier forms were wrong. A 65536-byte limit dropped a valid
-              # PointData declaration past that byte. Making the awk record separator
-              # the tag opening character ended the marker record only at the next
-              # such byte, so the parser could wait for, and hold, the complete
-              # payload.
-              #
-              # The scan is scoped to each PointData element, so a CellData element
-              # that shares one line with a PointData end tag contributes no name.
-              # The regular expressions use the string form, so no separator needs
-              # escaping.
-              local vtu_chunk vtu_header=""
-              exec 3< "$1" || return 0
-              while :; do
-                  vtu_chunk="$(dd bs=512 count=1 status=none <&3)"
-                  [[ -n "$vtu_chunk" ]] || break
-                  vtu_header="${vtu_header}${vtu_chunk}"
-                  case "$vtu_header" in *'<AppendedData'*) break ;; esac
-              done
-              exec 3<&-
-              printf '%s' "${vtu_header%%<AppendedData*}" |
-                  awk 'BEGIN { ORS = "" }
-                      { header = header $0 "\n" }
-                      END {
-                          while (match(header, "<PointData[ />]")) {
-                              header = substr(header, RSTART)
-                              closing = match(header, "</PointData[ >]")
-                              if (closing == 0) {
-                                  segment = header
-                                  header = ""
-                              } else {
-                                  segment = substr(header, 1, closing - 1)
-                                  header = substr(header, closing + 1)
-                              }
-                              while (match(segment, "Name=\"[^\"]*\"")) {
-                                  printf "%s%s", (count++ ? " " : ""), \
-                                      substr(segment, RSTART + 6, RLENGTH - 7)
-                                  segment = substr(segment, RSTART + RLENGTH)
-                              }
-                          }
-                          printf "\n"
-                      }' 2>/dev/null || true
-          }
+          {
+            echo "== Batch Workspace tree =="
+            if [[ -d "$batch_dir" ]]; then
+                bounded "Batch Workspace tree" find "$batch_dir" -maxdepth 4 | sort || true
+            else
+                echo "ABSENT"
+            fi
+          } > "${EVIDENCE_DIR}/batch-workspace-tree.txt"
 
           vtk_dir_count=0
           if [[ -d "$batch_dir" ]]; then
-              vtk_dir_count="$(find "$batch_dir" -type d -name vtk 2>/dev/null |
-                               wc -l | tr -d ' ')"
+              vtk_dir_count="$(bounded "vtk directory search" \
+                               find "$batch_dir" -type d -name vtk 2>/dev/null |
+                               wc -l | tr -d ' ' || true)"
           fi
 
+          # Each manifest line is written when it is known, so a later timeout
+          # keeps the lines of the files that came before it.
+          vtu_manifest="${EVIDENCE_DIR}/vtu-point-data.txt"
           {
             echo "== VTU point-data manifest =="
             echo "EXPECTED_FIELD_SOURCE=run_post_processing_cases.sh FLOW_ZERO_FIELDS, FLOW_RESULT_FIELDS, TRD_FIELDS"
             echo "SCALAR_FIELD=${SCALAR_FIELD:-T}"
             echo "VTK_DIRECTORY_COUNT=${vtk_dir_count}"
-            vtu_count=0
-            while IFS= read -r vtu_file; do
-                [[ -n "$vtu_file" ]] || continue
-                vtu_count=$(( vtu_count + 1 ))
+          } > "$vtu_manifest"
+          vtu_count=0
+          vtu_unavailable=0
+          vtu_list="${EVIDENCE_DIR%/*}/vtu-file-list.txt"
+          : > "$vtu_list"
+          if [[ -d "$batch_dir" ]]; then
+              bounded "VTU file search" \
+                  find "$batch_dir" -path '*/vtk/*' -name '*.vtu' -type f 2>/dev/null |
+                  sort > "$vtu_list" || true
+          fi
+          while IFS= read -r vtu_file; do
+              [[ -n "$vtu_file" ]] || continue
+              vtu_count=$(( vtu_count + 1 ))
+              vtu_path="${vtu_file#"${batch_dir}/"}"
+              {
                 echo
-                echo "VTU_PATH=${vtu_file#"${batch_dir}/"}"
-                echo "VTU_BYTES=$(wc -c < "$vtu_file" 2>/dev/null | tr -d ' ')"
-                echo "VTU_SHA256=$(sha256sum -- "$vtu_file" 2>/dev/null | cut -d' ' -f1)"
-                echo "VTU_EXPECTED_FIELDS=$(vtu_expected_fields "$vtu_file")"
-                echo "VTU_OBSERVED_FIELDS=$(vtu_header_point_data_names "$vtu_file")"
-            done < <(find "$batch_dir" -path '*/vtk/*' -name '*.vtu' -type f \
-                         2>/dev/null | sort || true)
+                echo "VTU_PATH=${vtu_path}"
+              } >> "$vtu_manifest"
+
+              if observed="$(bounded "VTU byte count ${vtu_path}" wc -c -- "$vtu_file")"; then
+                  echo "VTU_BYTES=${observed%% *}" >> "$vtu_manifest"
+              else
+                  echo "VTU_BYTES=UNAVAILABLE" >> "$vtu_manifest"
+                  vtu_unavailable=$(( vtu_unavailable + 1 ))
+              fi
+              if observed="$(bounded "VTU checksum ${vtu_path}" sha256sum -- "$vtu_file")"; then
+                  echo "VTU_SHA256=${observed%% *}" >> "$vtu_manifest"
+              else
+                  {
+                    echo "VTU_SHA256=UNAVAILABLE"
+                    echo "VTU_SHA256_REASON=the checksum did not complete within the capture work limit"
+                  } >> "$vtu_manifest"
+                  vtu_unavailable=$(( vtu_unavailable + 1 ))
+              fi
+              echo "VTU_EXPECTED_FIELDS=$(vtu_expected_fields "$vtu_file")" >> "$vtu_manifest"
+
+              parse_status=0
+              observed="$(bounded "VTU PointData parse ${vtu_path}" \
+                          bash "$0" --vtu-fields "$vtu_file")" || parse_status=$?
+              case "$parse_status" in
+                  0)
+                      echo "VTU_OBSERVED_FIELDS=${observed}" >> "$vtu_manifest"
+                      ;;
+                  *)
+                      case "$parse_status" in
+                          1) reason="the VTU file cannot be read" ;;
+                          2) reason="the VTU header is incomplete" ;;
+                          124|137) reason="the PointData parse did not complete within the capture work limit" ;;
+                          *) reason="the PointData parse ended with status ${parse_status}" ;;
+                      esac
+                      {
+                        echo "VTU_OBSERVED_FIELDS=UNAVAILABLE"
+                        echo "VTU_OBSERVED_FIELDS_REASON=${reason}"
+                      } >> "$vtu_manifest"
+                      vtu_unavailable=$(( vtu_unavailable + 1 ))
+                      ;;
+              esac
+          done < "$vtu_list"
+
+          {
             echo
             echo "VTU_FILE_COUNT=${vtu_count}"
             if (( vtu_count == 0 )); then
@@ -761,26 +982,104 @@ jobs:
                 else
                     echo "VTU_REASON=A vtk directory exists and holds no .vtu file."
                 fi
+            elif (( vtu_unavailable > 0 )); then
+                echo "VTU_EVIDENCE=PARTIAL"
+                echo "VTU_REASON=${vtu_unavailable} VTU field values are UNAVAILABLE."
             else
                 echo "VTU_EVIDENCE=PRESENT"
             fi
-          } > "${EVIDENCE_DIR}/vtu-point-data.txt"
-          cat "${EVIDENCE_DIR}/vtu-point-data.txt"
+          } >> "$vtu_manifest"
 
-          {
-            echo "CHECKOUT_RESULT=${CHECKOUT_RESULT:-NOT_ATTEMPTED}"
-            echo "INSTALL_RESULT=${INSTALL_RESULT:-NOT_ATTEMPTED}"
-            echo "PREPARE_RESULT=${PREPARE_RESULT:-NOT_ATTEMPTED}"
-            echo "ORCHESTRATOR_STARTED=${ORCHESTRATOR_STARTED:-false}"
-            echo "TIMEOUT_WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS:-NOT_RECORDED}"
-            echo "OVERALL_RESULT=${OVERALL_RESULT:-NOT_ATTEMPTED}"
-            echo "OPENFOAM_VERSION=${OPENFOAM_VERSION:-UNAVAILABLE}"
-            echo "BASELINE_RESULT=${BASELINE_RESULT:-NOT_ATTEMPTED}"
-            echo "OPENFOAM_BASELINE=${OPENFOAM_BASELINE:-UNAVAILABLE}"
-            echo "OPENFOAM_PACKAGE=${OPENFOAM_PACKAGE:-UNAVAILABLE}"
-            echo "OPENFOAM_BASHRC=${OPENFOAM_BASHRC:-UNAVAILABLE}"
-          } > "${EVIDENCE_DIR}/phase-results.txt"
-          cat "${EVIDENCE_DIR}/phase-results.txt"
+          # An incomplete item gives status 4, so the step never reports a
+          # complete capture after a skipped or stopped operation.
+          if [[ -s "$notes_file" ]]; then
+              exit 4
+          fi
+          exit 0
+          CAPTURE_WORK
+          bash -n "$CAPTURE_WORK_SCRIPT"
+
+          # capture_finish <result> <reason> - publish the capture result.
+          capture_finish() {
+              local result="$1" reason="$2"
+              reason="$(printf '%s' "$reason" | tr '\r\n' '  ')"
+              {
+                echo "CAPTURE_RESULT=${result}"
+                echo "CAPTURE_REASON=${reason}"
+              } > "$capture_result_file"
+              cat "$capture_result_file" >> "$GITHUB_ENV"
+              cat "$capture_result_file"
+          }
+
+          # capture_fill_unavailable <file> <line> - keep a missing evidence
+          # file explicit after an incomplete capture.
+          capture_fill_unavailable() {
+              [[ -s "$1" ]] || printf '%s\n' "$2" > "$1"
+          }
+
+          grace=5
+          available=$(( work_budget - grace ))
+          if (( available <= 0 )); then
+              capture_result=SKIPPED_NO_BUDGET
+              capture_reason="no capture work budget: the work limit ${work_end} is ${work_budget} seconds after capture start ${capture_start}; the optional capture did not run"
+          elif [[ ! -f "${LIB:-}" ]]; then
+              capture_result=FAILED
+              capture_reason="the bounded-runner library is not available, so the optional capture did not run"
+          else
+              # shellcheck disable=SC1090
+              source "$LIB"
+              export EVIDENCE_DIR GITHUB_WORKSPACE
+              export CAPTURE_WORK_END="$work_end"
+              : > "${EVIDENCE_DIR}/capture-work-notes.txt"
+              run_bounded "${EVIDENCE_DIR}/capture_work_status.txt" \
+                          "${EVIDENCE_DIR}/capture-work-timeout.log" \
+                          "$grace" "$available" \
+                  bash "$CAPTURE_WORK_SCRIPT"
+              work_result="$(classify_result "${EVIDENCE_DIR}/capture_work_status.txt" \
+                                             "${EVIDENCE_DIR}/capture-work-timeout.log")"
+              first_note="$(head -n 1 -- "${EVIDENCE_DIR}/capture-work-notes.txt" 2>/dev/null || true)"
+              case "$work_result" in
+                  SUCCEEDED)
+                      capture_result=COMPLETE
+                      capture_reason="all capture work completed within ${work_budget} seconds"
+                      ;;
+                  FAILED_EXIT_4)
+                      capture_result=INCOMPLETE
+                      capture_reason="${first_note:-a capture item did not complete}"
+                      ;;
+                  BUDGET_EXCEEDED)
+                      capture_result=TIMED_OUT
+                      capture_reason="the capture work was stopped at the work limit of ${available} seconds (${work_limit_source})"
+                      ;;
+                  FAILED_EXIT_*)
+                      capture_result=FAILED
+                      capture_reason="the capture work ended with status ${work_result#FAILED_EXIT_}${first_note:+; ${first_note}}"
+                      ;;
+                  *)
+                      capture_result=FAILED
+                      capture_reason="the capture work recorded no status"
+                      ;;
+              esac
+          fi
+
+          if [[ "$capture_result" != COMPLETE ]]; then
+              capture_fill_unavailable "${EVIDENCE_DIR}/stage-summary-lines.txt" \
+                  "UNAVAILABLE: ${capture_result}: ${capture_reason}"
+              capture_fill_unavailable "${EVIDENCE_DIR}/batch-workspace-tree.txt" \
+                  "UNAVAILABLE: ${capture_result}: ${capture_reason}"
+              vtu_manifest="${EVIDENCE_DIR}/vtu-point-data.txt"
+              if ! grep -q '^VTU_EVIDENCE=' "$vtu_manifest" 2>/dev/null; then
+                  {
+                    echo
+                    echo "VTU_EVIDENCE=UNAVAILABLE"
+                    echo "VTU_REASON=the capture did not complete: ${capture_result}: ${capture_reason}"
+                  } >> "$vtu_manifest"
+              fi
+          fi
+          if [[ -f "${EVIDENCE_DIR}/vtu-point-data.txt" ]]; then
+              cat "${EVIDENCE_DIR}/vtu-point-data.txt"
+          fi
+          capture_finish "$capture_result" "$capture_reason"
 
       - name: Write the job summary
         if: always()
@@ -802,6 +1101,8 @@ jobs:
             echo "| Overall result | \`${OVERALL_RESULT:-NOT_ATTEMPTED}\` |"
             echo "| Capture start | \`${CAPTURE_START:-UNAVAILABLE}\` |"
             echo "| Capture deadline | \`${CAPTURE_DEADLINE:-UNAVAILABLE}\` |"
+            echo "| Capture result | \`${CAPTURE_RESULT:-NOT_ATTEMPTED}\` |"
+            echo "| Capture reason | ${CAPTURE_REASON:-UNAVAILABLE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the evidence artifacts
