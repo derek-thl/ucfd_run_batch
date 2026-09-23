@@ -14,13 +14,15 @@
 # workflow starts only through workflow_dispatch, so the corrected evidence
 # capture needs a static check.
 #
-# Checks S10 to S15 execute code extracted from that workflow (Issue #87). S10
+# Checks S10 to S17 execute code extracted from that workflow (Issue #87). S10
 # runs the production VTU reader on a finite ASCII VTU file without an
 # <AppendedData> marker under a 5-second limit. S11 to S14 run the capture step
 # body with a controlled deadline, a synthetic Batch Workspace, and fake
 # commands that block, so the work limit, the early phase results, and the
 # capture result are observable without OpenFOAM and without a dispatch. S15
-# checks that the summary and the upload steps stay eligible.
+# checks that the summary and the upload steps stay eligible. S16 and S17 prove
+# that a VTU parse failure and a failed Stage evidence search or copy give an
+# incomplete capture (PR #88 review 5289074428).
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -854,6 +856,24 @@ ab_fake_hang() {
     chmod +x "${workspace}/fakebin/${name}"
 }
 
+# ab_fake_fail <workspace> <command> <argument-pattern> - a fake command that
+# ends with status 1 and writes nothing when one argument matches the pattern,
+# and that runs the real command otherwise.
+ab_fake_fail() {
+    local workspace="$1" name="$2" pattern="$3" real
+    real="$(command -v "$name")"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    case "$argument" in\n'
+        printf '        %s) exit 1 ;;\n' "$pattern"
+        printf '    esac\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$real"
+    } > "${workspace}/fakebin/${name}"
+    chmod +x "${workspace}/fakebin/${name}"
+}
+
 # ab_run_capture <workspace> <deadline> - run the extracted capture step with a
 # controlled deadline and a known product failure. Prints status=<status> and
 # elapsed=<seconds>.
@@ -1075,6 +1095,90 @@ s14_capture_without_budget_skips_the_optional_work() {
     done
 }
 
+# PR #88 review 5289074428, finding 1. A VTU parse failure is a capture error,
+# so the aggregate capture result must not be COMPLETE.
+s16_vtu_parse_failure_is_an_incomplete_capture() {
+    local workspace run evidence manifest
+    workspace="$(new_workspace s16_parse_failure)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    # A finite VTU file without a marker whose PointData element never closes.
+    printf '<VTKFile><Piece><PointData><DataArray Name="U"/>\n' \
+        > "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_200.vtu"
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S16: the capture step ends with status 0"
+    manifest="$(cat "${evidence}/vtu-point-data.txt")"
+    assert_contains "$manifest" "VTU_OBSERVED_FIELDS=U p" \
+        "S16: the readable VTU file keeps its observed fields"
+    assert_contains "$manifest" "VTU_OBSERVED_FIELDS_REASON=the VTU header is incomplete" \
+        "S16: the manifest records the parse failure reason"
+    assert_contains "$manifest" "VTU_EVIDENCE=PARTIAL" \
+        "S16: the manifest does not report present VTU evidence"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S16: a VTU parse failure gives an incomplete capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        "VTU PointData parse case_7/vtk/flow_latest_200.vtu: the VTU header is incomplete" \
+        "S16: the capture reason names the failed parse"
+    assert_contains "$(cat "${evidence}/capture-result.txt")" "CAPTURE_RESULT=INCOMPLETE" \
+        "S16: capture-result.txt records an incomplete capture"
+    ab_assert_kept_evidence "$workspace" "S16"
+}
+
+# PR #88 review 5289074428, finding 2. A failed Stage evidence search or copy
+# is a capture error. The files already captured stay in the evidence.
+s17_stage_evidence_failure_is_an_incomplete_capture() {
+    local workspace run evidence reason
+
+    # A failed copy of one Case log.
+    workspace="$(new_workspace s17_copy_failure)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    printf 'unreadable log\n' > "${workspace}/checkout/src/batch_9/case_7/log.FAILCOPY"
+    ab_fake_fail "$workspace" cp '*log.FAILCOPY'
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S17 copy: the capture step ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S17 copy: a failed Stage evidence copy gives an incomplete capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        "Stage evidence copy case_7/log.FAILCOPY: the copy failed" \
+        "S17 copy: the capture reason names the failed copy"
+    assert_file_missing "${evidence}/stage-logs/case_7/log.FAILCOPY" \
+        "S17 copy: the failed copy is absent"
+    assert_file_exists "${evidence}/stage-logs/case_7/log.simpleFoam" \
+        "S17 copy: the other Case log is kept"
+    assert_file_exists "${evidence}/summaries/run_flow_cases_summary.csv" \
+        "S17 copy: the Stage summary is kept"
+    assert_file_exists "${evidence}/stage-logs/.run_flow_cases_failed" \
+        "S17 copy: the Failure Artifact is kept"
+    ab_assert_kept_evidence "$workspace" "S17 copy"
+
+    # A failed search for the Stage summaries.
+    workspace="$(new_workspace s17_search_failure)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    ab_fake_fail "$workspace" find '\*_summary.csv'
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S17 search: the capture step ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S17 search: a failed Stage evidence search gives an incomplete capture"
+    reason="$(ab_env_last "$workspace" CAPTURE_REASON)"
+    assert_contains "$reason" "Stage evidence search: ended with status 1" \
+        "S17 search: the capture reason names the failed search"
+    assert_file_missing "${evidence}/summaries/run_flow_cases_summary.csv" \
+        "S17 search: the failed search copies no Stage summary"
+    assert_file_exists "${evidence}/stage-logs/.run_flow_cases_failed" \
+        "S17 search: the Failure Artifact from a later search is kept"
+    assert_file_exists "${evidence}/stage-logs/case_7/log.simpleFoam" \
+        "S17 search: the Case log from a later search is kept"
+    ab_assert_kept_evidence "$workspace" "S17 search"
+}
+
 s15_capture_failure_keeps_summary_and_upload_eligible() {
     local capture summary upload
     capture="$(ab_workflow_step_block "Capture the evidence")"
@@ -1137,6 +1241,8 @@ AB_OBSERVATIONS=(
     s13_capture_work_stops_at_the_outer_limit
     s14_capture_without_budget_skips_the_optional_work
     s15_capture_failure_keeps_summary_and_upload_eligible
+    s16_vtu_parse_failure_is_an_incomplete_capture
+    s17_stage_evidence_failure_is_an_incomplete_capture
 )
 
 # One observation runs in this process when the caller names it. The scenario

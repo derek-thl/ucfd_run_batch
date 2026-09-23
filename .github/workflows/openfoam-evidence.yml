@@ -630,10 +630,22 @@ jobs:
           # bounded <label> <command> [args...] - run one blocking operation
           # under the time that is left before the capture work limit, less a
           # margin. The operation ends before the outer limit, and timeout
-          # stops the process group of the operation.
+          # stops the process group of the operation. A timeout or any other
+          # non-zero status is a capture error, so it gives a note.
           bounded() {
-              local label="$1" left status
-              shift
+              _bounded 1 "$@"
+          }
+
+          # bounded_timeout_note <label> <command> [args...] - bounded, but a
+          # non-zero status other than a timeout gives no note, because the
+          # caller records a more exact reason for it.
+          bounded_timeout_note() {
+              _bounded 0 "$@"
+          }
+
+          _bounded() {
+              local note_failure="$1" label="$2" left status
+              shift 2
               left=$(( CAPTURE_WORK_END - 10 - $(date +%s) ))
               (( left > 120 )) && left=120
               if (( left <= 0 )); then
@@ -643,6 +655,8 @@ jobs:
               timeout --kill-after=2s "${left}s" "$@" && status=0 || status=$?
               if (( status == 124 || status == 137 )); then
                   capture_note "${label}: exceeded the capture work limit"
+              elif (( status != 0 && note_failure )); then
+                  capture_note "${label}: ended with status ${status}"
               fi
               return "$status"
           }
@@ -816,13 +830,22 @@ jobs:
           # which Case produced it. The selection stays explicit: no VTU file, no
           # checkout copy, and no unfiltered Batch Workspace copy is collected.
           #
+          # A failed search or copy is a capture error. The note names the
+          # item, and the files already copied stay in the evidence.
+          #
           # copy_relative <source-file> <destination-root>
           copy_relative() {
               local source_file="$1" destination_root="$2" relative target
               relative="${source_file#"${batch_dir}/"}"
               target="${destination_root}/${relative}"
-              mkdir -p -- "$(dirname -- "$target")" 2>/dev/null || return 0
-              cp -- "$source_file" "$target" 2>/dev/null || true
+              if ! mkdir -p -- "$(dirname -- "$target")" 2>/dev/null; then
+                  capture_note "Stage evidence copy ${relative}: the target directory cannot be created"
+                  return 0
+              fi
+              if ! cp -- "$source_file" "$target" 2>/dev/null; then
+                  capture_note "Stage evidence copy ${relative}: the copy failed"
+              fi
+              return 0
           }
 
           # collect_selected <destination-root> <find-expression>...
@@ -941,14 +964,14 @@ jobs:
               else
                   {
                     echo "VTU_SHA256=UNAVAILABLE"
-                    echo "VTU_SHA256_REASON=the checksum did not complete within the capture work limit"
+                    echo "VTU_SHA256_REASON=the checksum did not complete; see capture-work-notes.txt"
                   } >> "$vtu_manifest"
                   vtu_unavailable=$(( vtu_unavailable + 1 ))
               fi
               echo "VTU_EXPECTED_FIELDS=$(vtu_expected_fields "$vtu_file")" >> "$vtu_manifest"
 
               parse_status=0
-              observed="$(bounded "VTU PointData parse ${vtu_path}" \
+              observed="$(bounded_timeout_note "VTU PointData parse ${vtu_path}" \
                           bash "$0" --vtu-fields "$vtu_file")" || parse_status=$?
               case "$parse_status" in
                   0)
@@ -965,6 +988,12 @@ jobs:
                         echo "VTU_OBSERVED_FIELDS=UNAVAILABLE"
                         echo "VTU_OBSERVED_FIELDS_REASON=${reason}"
                       } >> "$vtu_manifest"
+                      # A parse failure is a capture error. The timeout cases
+                      # already have a note from bounded_timeout_note.
+                      case "$parse_status" in
+                          124|137) ;;
+                          *) capture_note "VTU PointData parse ${vtu_path}: ${reason}" ;;
+                      esac
                       vtu_unavailable=$(( vtu_unavailable + 1 ))
                       ;;
               esac
