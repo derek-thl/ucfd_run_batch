@@ -24,6 +24,13 @@
 # that a VTU parse failure and a failed Stage evidence search or copy give an
 # incomplete capture (PR #88 review 5289074428).
 #
+# Checks S18 to S24 cover the M3 evidence-recovery contract (Issue #80). They run
+# the extracted capture step on synthetic VTU files, checkMesh logs, simpleFoam
+# logs, and the committed Case controls. They prove the per-file required-field
+# verdict, the retained original tags with offsets and checksums, the tag output
+# limits, the scan timeout, the mesh-quality verdict, the convergence verdict,
+# and the job summary rows.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -613,10 +620,20 @@ s7_capture_step_names_every_log_directory() {
         "S7: the capture step names the post-processing conversion log directory"
 }
 
-# ab_extract_vtu_extractor - print the production vtu_header_point_data_names
-# function from the workflow, de-indented so that it can be sourced. The test
-# therefore runs the exact committed code, not a copy of it.
+# ab_extract_vtu_extractor - print the production VTU header reader from the
+# workflow, de-indented so that it can be sourced. The test therefore runs the
+# exact committed code, not a copy of it. The reader is the block between the
+# two reader marker comments. A workflow without the markers holds only the
+# single vtu_header_point_data_names function.
 ab_extract_vtu_extractor() {
+    if grep -q '^          # ---- VTU header reader: begin ----$' "$WORKFLOW"; then
+        awk '
+            /^          # ---- VTU header reader: begin ----$/ { inside = 1; next }
+            /^          # ---- VTU header reader: end ----$/ { exit }
+            inside { print }
+        ' "$WORKFLOW" | sed -e 's/^          //'
+        return 0
+    fi
     awk '
         /^          vtu_header_point_data_names\(\) \{$/ { inside = 1 }
         inside { print }
@@ -911,6 +928,9 @@ ab_run_summary() {
     env GITHUB_STEP_SUMMARY="${workspace}/step_summary" \
         CAPTURE_RESULT="$(ab_env_last "$workspace" CAPTURE_RESULT)" \
         CAPTURE_REASON="$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        VTU_REQUIRED_FIELDS_VERDICT="$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        MESH_QUALITY_VERDICT="$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        CONVERGENCE_VERDICT="$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
         OVERALL_RESULT=FAILED_EXIT_1 \
         bash "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
         _fail "the extracted summary step must succeed"
@@ -1208,6 +1228,568 @@ ab_step_names_after() {
     ' "$WORKFLOW"
 }
 
+# ---- S18 to S24: the M3 evidence-recovery verdicts (Issue #80) --------------
+
+# ab_block_value <file> <block-key> <block-value> <key> - the value of <key> in
+# the block that starts at the line <block-key>=<block-value>. A block ends at
+# the next <block-key>= line.
+ab_block_value() {
+    awk -v bk="$2" -v bv="$3" -v key="$4" '
+        index($0, bk "=") == 1 { inside = (substr($0, length(bk) + 2) == bv); next }
+        inside && index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+    ' "$1"
+}
+
+# ab_file_value <file> <key> - the last value of <key> in the file.
+ab_file_value() {
+    awk -v key="$2" 'index($0, key "=") == 1 { value = substr($0, length(key) + 2) }
+                     END { print value }' "$1"
+}
+
+# ab_vtu_result <workspace> <vtu-path> <key> - one manifest value of one VTU.
+ab_vtu_result() {
+    ab_block_value "${1}/runner_temp/evidence/vtu-point-data.txt" VTU_PATH "$2" "$3"
+}
+
+# ab_check_tag_records <workspace> - compare every retained tag record with the
+# source bytes at its recorded offset. Prints sections=<n> max_section=<bytes>
+# records=<n> bad=<n>.
+ab_check_tag_records() {
+    local workspace="$1" dir summary path offset want file bad=0
+    dir="${workspace}/tag_records"
+    mkdir -p "$dir"
+    : > "${dir}/list"
+    summary="$(LC_ALL=C awk -v dir="$dir" '
+        /^== VTU_TAGS path=/ && !in_record {
+            in_section = 1; size = length($0) + 1
+            path = $3; sub(/^path=/, "", path); next
+        }
+        /^== VTU_TAGS_END path=/ && !in_record {
+            size += length($0) + 1; sections++
+            if (size > max) max = size
+            in_section = 0; next
+        }
+        /^TAG offset=/ && !in_record {
+            size += length($0) + 1
+            split($2, a, "="); offset = a[2]; split($3, b, "="); want = b[2]
+            n++; body = ""; got = -1; in_record = 1; next
+        }
+        in_record {
+            size += length($0) + 1
+            body = (got < 0 ? $0 : body "\n" $0); got = length(body)
+            if (got >= want) {
+                file = dir "/rec" n
+                printf "%s", body > file; close(file)
+                print path "\t" offset "\t" want "\t" file >> (dir "/list")
+                in_record = 0
+            }
+            next
+        }
+        END { printf "sections=%d max_section=%d records=%d", sections, max, n }
+    ' "${workspace}/runner_temp/evidence/vtu-tags.txt")"
+    while IFS=$'\t' read -r path offset want file; do
+        if ! cmp -s <(tail -c +"$(( offset + 1 ))" -- \
+                "${workspace}/checkout/src/batch_9/${path}" | head -c "$want") "$file"; then
+            bad=$(( bad + 1 ))
+        fi
+    done < "${dir}/list"
+    printf '%s bad=%s\n' "$summary" "$bad"
+}
+
+# ab_tag_section <workspace> <vtu-path> - the retained tag section of one VTU.
+ab_tag_section() {
+    awk -v want="$2" '
+        /^== VTU_TAGS path=/ { inside = ($3 == "path=" want) }
+        inside { print }
+        /^== VTU_TAGS_END path=/ { inside = 0 }
+    ' "${1}/runner_temp/evidence/vtu-tags.txt"
+}
+
+# ab_vtu_appended <file> <PointData-text> [<CellData-text>] - an appended-data VTU
+# file. The payload holds NUL bytes and text that looks like a PointData
+# element, so a reader that passes the marker gives a wrong result.
+ab_vtu_appended() {
+    local file="$1" point="$2" cell="${3-}"
+    {
+        printf '<?xml version="1.0"?>\n<VTKFile type="UnstructuredGrid" version="1.0">\n'
+        printf '<UnstructuredGrid>\n<Piece NumberOfPoints="8" NumberOfCells="1">\n'
+        if [[ -n "$point" ]]; then printf '%s\n' "$point"; fi
+        if [[ -n "$cell" ]]; then printf '%s\n' "$cell"; fi
+        printf '</Piece>\n</UnstructuredGrid>\n<AppendedData encoding="raw">\n_'
+        head -c 64 /dev/zero
+        printf '<PointData><DataArray Name="AB_PAYLOAD_NAME"/></PointData>'
+        head -c 64 /dev/zero
+        printf '\n</AppendedData>\n</VTKFile>\n'
+    } > "$file"
+}
+
+# ab_fake_find_extra <workspace> <extra-path> - a fake find that also lists one
+# path that does not exist when it searches for VTU files.
+ab_fake_find_extra() {
+    local workspace="$1" extra="$2" real
+    real="$(command -v find)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    if [[ "$argument" == "*.vtu" ]]; then\n'
+        printf '        %q "$@"; status=$?\n' "$real"
+        printf '        printf "%%s\\n" %q\n' "$extra"
+        printf '        exit "$status"\n'
+        printf '    fi\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$real"
+    } > "${workspace}/fakebin/find"
+    chmod +x "${workspace}/fakebin/find"
+}
+
+s18_vtu_required_field_verdicts_and_original_tags() {
+    local workspace run evidence vtk section checked sha_manifest sha_section
+    workspace="$(new_workspace s18_vtu_verdicts)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+
+    # flow_0 requires wallDistance, which the file does not declare.
+    ab_vtu_appended "${vtk}/flow_0.vtu" \
+        "$(printf '<PointData>\n<DataArray type="Float32" Name="U" format="appended" offset="0"/>\n<DataArray type="Float32" Name="p" format="appended" offset="0"/>\n</PointData>')" \
+        "$(printf '<CellData>\n<DataArray type="Float32" Name="U" format="appended" offset="0"/>\n</CellData>')"
+    # Reordered names and one extra name.
+    ab_vtu_appended "${vtk}/flow_latest_01_match.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="p"/>\n<DataArray Name="extra"/>\n<DataArray Name="U"/>\n</PointData>')"
+    # Single and double quotes, and one start tag across two lines.
+    ab_vtu_appended "${vtk}/flow_latest_02_quotes.vtu" \
+        "$(printf "<PointData Scalars='p'>\n<DataArray type='Float32' Name='U' format='appended'/>\n<DataArray type=\"Float32\"\n    Name=\"p\" format=\"appended\"/>\n</PointData>")"
+    # An unquoted Name attribute is not evidence.
+    printf '<VTKFile>\n<Piece>\n<PointData>\n<DataArray type="Float32" Name=U format="ascii">1 2 3</DataArray>\n<DataArray type="Float32" Name="p" format="ascii">1</DataArray>\n</PointData>\n</Piece>\n</VTKFile>\n' \
+        > "${vtk}/flow_latest_03_unquoted.vtu"
+    # An empty PointData element.
+    ab_vtu_appended "${vtk}/flow_latest_04_empty.vtu" "$(printf '<PointData>\n</PointData>')"
+    # A PointData declaration after byte 65536, in a finite ASCII file.
+    {
+        printf '<VTKFile>\n<Piece>\n<FieldData>\n'
+        awk 'BEGIN { for (i = 0; i < 900; i++) printf "  pad %05d %s\n", i, \
+             "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }'
+        printf '</FieldData>\n<PointData>\n<DataArray Name="U" format="ascii">1</DataArray>\n'
+        printf '<DataArray Name="p" format="ascii">1</DataArray>\n</PointData>\n</Piece>\n</VTKFile>\n'
+    } > "${vtk}/flow_latest_05_late.vtu"
+    # No PointData and no CellData.
+    ab_vtu_appended "${vtk}/flow_latest_06_absent.vtu" ""
+    # CellData only.
+    ab_vtu_appended "${vtk}/flow_latest_07_cellonly.vtu" "" \
+        "$(printf '<CellData>\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</CellData>')"
+    # A finite ASCII file without a marker.
+    ab_ascii_vtu "${vtk}/flow_latest_08_ascii.vtu" 2000
+    # Malformed XML: the PointData element never closes.
+    printf '<VTKFile>\n<Piece>\n<PointData>\n<DataArray Name="U"/>\n' \
+        > "${vtk}/flow_latest_09_malformed.vtu"
+    # A selected file that does not exist when the scan starts.
+    ab_fake_find_extra "$workspace" "${vtk}/flow_latest_10_missing.vtu"
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S18: the capture step ends with status 0"
+    assert_file_exists "${evidence}/vtu-tags.txt" "S18: the tag evidence file exists"
+
+    assert_eq "MISSING_REQUIRED_FIELDS" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_0.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: flow_0 without wallDistance is MISSING_REQUIRED_FIELDS"
+    assert_eq "wallDistance" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_0.vtu VTU_MISSING_REQUIRED_FIELDS)" \
+        "S18: flow_0 names the missing required field"
+    assert_eq "U" "$(ab_vtu_result "$workspace" case_7/vtk/flow_0.vtu VTU_OBSERVED_CELL_FIELDS)" \
+        "S18: the CellData names stay separate"
+    assert_eq "MATCH" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_01_match.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: reordered names with an extra name are MATCH"
+    assert_eq "p extra U" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_01_match.vtu VTU_OBSERVED_FIELDS)" \
+        "S18: the observed names keep the source order"
+    assert_eq "MATCH" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_02_quotes.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: single- and double-quoted names are MATCH"
+    assert_eq "MISSING_REQUIRED_FIELDS" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_03_unquoted.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: an unquoted Name attribute does not count"
+    assert_eq "p" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_03_unquoted.vtu VTU_OBSERVED_FIELDS)" \
+        "S18: only the quoted name is observed"
+    assert_eq "MISSING_REQUIRED_FIELDS" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_04_empty.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: empty observed names are MISSING_REQUIRED_FIELDS"
+    assert_eq "U p" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_04_empty.vtu VTU_MISSING_REQUIRED_FIELDS)" \
+        "S18: empty observed names miss every required field"
+    assert_eq "MATCH" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_05_late.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: a PointData declaration after byte 65536 is MATCH"
+    assert_eq "SOURCE_POINTDATA_ABSENT" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_06_absent.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: a file without PointData is SOURCE_POINTDATA_ABSENT"
+    assert_eq "SOURCE_POINTDATA_ABSENT" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_07_cellonly.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: a CellData-only file is SOURCE_POINTDATA_ABSENT"
+    assert_eq "U p" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_07_cellonly.vtu VTU_OBSERVED_CELL_FIELDS)" \
+        "S18: the CellData-only names are recorded as CellData"
+    assert_eq "MATCH" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_08_ascii.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: a finite ASCII file is MATCH"
+    assert_eq "PARSER_FAILURE" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_09_malformed.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: malformed XML is PARSER_FAILURE"
+    assert_eq "UNAVAILABLE" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_09_malformed.vtu VTU_TAG_EVIDENCE)" \
+        "S18: malformed XML has no complete tag evidence"
+    assert_eq "MISSING_FILE" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_10_missing.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: a selected file that does not exist is MISSING_FILE"
+    assert_eq "MATCH" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_100.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S18: the base fixture file is MATCH"
+
+    # A parser failure is a capture error; a source mismatch is not.
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S18: a parser failure gives an incomplete capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        "VTU PointData parse case_7/vtk/flow_latest_09_malformed.vtu" \
+        "S18: the capture reason names the parser failure"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PARTIAL" \
+        "S18: the aggregate VTU evidence is not PRESENT"
+    assert_eq "INCOMPLETE" \
+        "$(ab_file_value "${evidence}/vtu-point-data.txt" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S18: the required-field verdict is INCOMPLETE"
+
+    # The retained tags are the original bytes at their recorded offsets.
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S18: every retained tag equals its source bytes"
+    assert_not_contains "$checked" "records=0 " "S18: the tag evidence holds tag records"
+    section="$(ab_tag_section "$workspace" case_7/vtk/flow_latest_02_quotes.vtu)"
+    assert_contains "$section" "Name='U'" "S18: a single-quoted attribute keeps its quotes"
+    assert_contains "$section" "$(printf '<DataArray type="Float32"\n    Name="p"')" \
+        "S18: a start tag across two lines keeps its line end"
+    sha_manifest="$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_02_quotes.vtu VTU_SHA256)"
+    sha_section="$(printf '%s\n' "$section" | head -n 1 | sed -n 's/.* sha256=\([0-9a-f]*\).*/\1/p')"
+    assert_eq "$(sha256sum -- "${vtk}/flow_latest_02_quotes.vtu" | cut -d' ' -f1)" "$sha_manifest" \
+        "S18: the manifest checksum is the source checksum"
+    assert_eq "$sha_manifest" "$sha_section" "S18: the tag section names the source checksum"
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_03_unquoted.vtu)" \
+        "Name=U format" "S18: the unquoted tag is kept as original evidence"
+    if ! ab_tag_section "$workspace" case_7/vtk/flow_latest_05_late.vtu |
+            awk '/^TAG offset=/ { split($2, a, "="); if (a[2] + 0 > 65536 && $4 == "element=PointData") found = 1 }
+                 END { exit !found }'; then
+        _fail "S18: the late PointData tag is recorded at an offset above 65536"
+    fi
+    if grep -rq 'AB_PAYLOAD_NAME' "$evidence"; then
+        _fail "S18: no appended-payload byte may reach the evidence"
+    fi
+    if find "$evidence" -name '*.vtu' | grep -q .; then
+        _fail "S18: the evidence directory must hold no VTU file"
+    fi
+    ab_assert_kept_evidence "$workspace" "S18"
+}
+
+s19_source_mismatch_keeps_a_complete_capture() {
+    local workspace run evidence
+    workspace="$(new_workspace s19_source_mismatch)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    ab_vtu_appended "${workspace}/checkout/src/batch_9/case_7/vtk/flow_0.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S19: the capture step ends with status 0"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S19: a source mismatch alone keeps a complete capture"
+    assert_eq "MISSING_REQUIRED_FIELDS" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_0.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S19: flow_0 without wallDistance is MISSING_REQUIRED_FIELDS"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=INCOMPLETE" \
+        "S19: the aggregate VTU evidence is INCOMPLETE"
+    assert_not_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S19: the aggregate VTU evidence is not PRESENT"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S19: GITHUB_ENV records an incomplete required-field verdict"
+    # The base fixture has no checkMesh log and no solver log.
+    assert_eq "UNAVAILABLE" "$(ab_file_value "${evidence}/mesh-quality.txt" MESH_QUALITY_VERDICT)" \
+        "S19: a missing checkMesh log gives an UNAVAILABLE mesh verdict"
+    assert_eq "UNAVAILABLE" "$(ab_file_value "${evidence}/convergence.txt" CONVERGENCE_VERDICT)" \
+        "S19: a missing solver log gives an UNAVAILABLE convergence verdict"
+    ab_assert_kept_evidence "$workspace" "S19"
+}
+
+s20_vtu_tag_evidence_output_limits() {
+    local workspace run evidence vtk i checked total file max
+    workspace="$(new_workspace s20_output_limit)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+    # Five files, each with more than 16384 bytes of CellData tags.
+    for i in 1 2 3 4 5; do
+        ab_vtu_appended "${vtk}/flow_latest_${i}.vtu" \
+            "$(printf '<PointData>\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</PointData>')" \
+            "$(printf '<CellData>\n'; awk 'BEGIN { for (j = 0; j < 400; j++)
+                printf "<DataArray type=\"Float32\" Name=\"cell_%03d\" format=\"appended\" offset=\"0\"/>\n", j }'
+               printf '</CellData>')"
+    done
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S20: the capture step ends with status 0"
+    total="$(wc -c < "${evidence}/vtu-tags.txt" | tr -d ' ')"
+    if (( total > 65536 )); then
+        _fail "S20: the tag evidence must hold at most 65536 bytes" "bytes: ${total}"
+    fi
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S20: no retained tag is cut"
+    max="$(printf '%s\n' "$checked" | sed -n 's/.*max_section=\([0-9]*\).*/\1/p')"
+    if (( max > 16384 )); then
+        _fail "S20: each tag section must hold at most 16384 bytes" "bytes: ${max}"
+    fi
+    for i in 1 2 3 4 5; do
+        file="case_7/vtk/flow_latest_${i}.vtu"
+        assert_eq "OUTPUT_LIMIT" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S20: ${file} with too many tags is OUTPUT_LIMIT"
+        assert_eq "UNAVAILABLE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+            "S20: ${file} has no complete tag evidence"
+        assert_eq "OUTPUT_LIMIT" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE_REASON)" \
+            "S20: ${file} names the output limit"
+        assert_eq "U p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S20: ${file} still reports the parsed PointData names"
+    done
+    assert_eq "MATCH" "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_100.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S20: a file whose tags fit is MATCH"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=INCOMPLETE" \
+        "S20: an output limit makes the aggregate VTU evidence INCOMPLETE"
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_1.vtu)" \
+        "tag_evidence=OUTPUT_LIMIT" "S20: the tag section ends with the output-limit result"
+}
+
+s21_vtu_scan_timeout_is_distinct() {
+    local workspace run evidence elapsed
+    workspace="$(new_workspace s21_scan_timeout)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    # The tag scan blocks. Every other awk call runs the real command.
+    ab_fake_hang "$workspace" awk 'vtu_scan=1'
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 180 + 16 ))")"
+
+    assert_contains "$run" "status=0" "S21: the capture step ends with status 0"
+    elapsed="$(printf '%s\n' "$run" | awk -F= '$1 == "elapsed" { print $2 }')"
+    if (( elapsed > 16 )); then
+        _fail "S21: the capture step must end at the work limit" "elapsed: ${elapsed}"
+    fi
+    ab_assert_fakes_stopped "$workspace" "S21"
+    assert_eq "TIMEOUT" \
+        "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_100.vtu VTU_REQUIRED_FIELDS_RESULT)" \
+        "S21: a stopped scan is TIMEOUT"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S21: a stopped scan gives an incomplete capture"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        "VTU PointData parse case_7/vtk/flow_latest_100.vtu: exceeded the capture work limit" \
+        "S21: the capture reason names the stopped scan"
+    assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PARTIAL" \
+        "S21: the aggregate VTU evidence is PARTIAL"
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_100.vtu)" \
+        "tag_evidence=TIMEOUT" "S21: the tag section ends with the timeout result"
+    ab_assert_kept_evidence "$workspace" "S21"
+}
+
+# ab_checkmesh_log <file> <mode> - a checkMesh log tail. mode: failed | clean |
+# missing (the log has no summary line).
+ab_checkmesh_log() {
+    local file="$1" mode="$2"
+    mkdir -p "$(dirname -- "$file")"
+    {
+        printf 'Checking geometry...\n    Max skewness = 0.333695 OK.\n'
+        case "$mode" in
+            failed)
+                printf ' ***Concave cells (using face planes) found, number of cells: 23912\n'
+                printf '  <<Writing 23912 concave cells to set concaveCells\n\nFailed 1 mesh checks.\n\nEnd\n' ;;
+            clean)
+                printf '    Concave cell check OK.\n\nMesh OK.\n\nEnd\n' ;;
+            missing)
+                printf '    Mesh non-orthogonality Max: 27.2781 average: 5.17536\n' ;;
+        esac
+    } > "$file"
+}
+
+s22_mesh_quality_evidence() {
+    local workspace run evidence batch mesh
+    workspace="$(new_workspace s22_mesh_quality)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    batch="${workspace}/checkout/src/batch_9"
+    ab_checkmesh_log "${batch}/case_7/flow/log.checkMesh" failed
+    ab_checkmesh_log "${batch}/case_8/flow/log.checkMesh" clean
+    ab_checkmesh_log "${batch}/case_9/flow/log.checkMesh" missing
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S22: the capture step ends with status 0"
+    mesh="${evidence}/mesh-quality.txt"
+    assert_file_exists "$mesh" "S22: the mesh-quality evidence exists"
+    assert_eq "1" "$(ab_block_value "$mesh" MESH_LOG case_7/flow/log.checkMesh MESH_FAILED_CHECKS)" \
+        "S22: the failed log reports one failed check"
+    assert_eq "23912" "$(ab_block_value "$mesh" MESH_LOG case_7/flow/log.checkMesh MESH_CONCAVE_CELLS)" \
+        "S22: the failed log reports 23912 concave cells"
+    assert_eq "MESH_QUALITY_REVIEW_REQUIRED" \
+        "$(ab_block_value "$mesh" MESH_LOG case_7/flow/log.checkMesh MESH_LOG_VERDICT)" \
+        "S22: the failed log needs a mesh-quality review"
+    assert_eq "0" "$(ab_block_value "$mesh" MESH_LOG case_8/flow/log.checkMesh MESH_FAILED_CHECKS)" \
+        "S22: the clean log reports no failed check"
+    assert_eq "MESH_QUALITY_CHECKS_PASSED" \
+        "$(ab_block_value "$mesh" MESH_LOG case_8/flow/log.checkMesh MESH_LOG_VERDICT)" \
+        "S22: the clean log passes the checks"
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$mesh" MESH_LOG case_9/flow/log.checkMesh MESH_FAILED_CHECKS)" \
+        "S22: a log without summary text is UNAVAILABLE, not zero"
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$mesh" MESH_LOG case_9/flow/log.checkMesh MESH_CONCAVE_CELLS)" \
+        "S22: a log without summary text has no concave-cell count"
+    assert_eq "UNAVAILABLE" \
+        "$(ab_block_value "$mesh" MESH_LOG case_9/flow/log.checkMesh MESH_LOG_VERDICT)" \
+        "S22: a log without summary text has an UNAVAILABLE verdict"
+    assert_eq "MESH_QUALITY_REVIEW_REQUIRED" "$(ab_file_value "$mesh" MESH_QUALITY_VERDICT)" \
+        "S22: one failed log makes the aggregate mesh verdict a review"
+    assert_eq "MESH_QUALITY_REVIEW_REQUIRED" "$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        "S22: GITHUB_ENV records the mesh verdict"
+    # The Stage evidence is not changed by the mesh verdict.
+    if ! cmp -s "${batch}/run_flow_cases_summary.csv" "${evidence}/summaries/run_flow_cases_summary.csv"; then
+        _fail "S22: the Stage summary must stay byte-identical"
+    fi
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S22: a mesh verdict does not change the capture result"
+}
+
+# ab_simplefoam_log <file> <mode> - a simpleFoam log. mode: converged | endtime
+ab_simplefoam_log() {
+    local file="$1" mode="$2" time
+    mkdir -p "$(dirname -- "$file")"
+    {
+        printf 'Exec   : simpleFoam -parallel\nnProcs : 8\n\nStarting time loop\n\n'
+        for time in 2999 3000; do
+            printf 'Time = %s\n\n' "$time"
+            printf 'smoothSolver:  Solving for Ux, Initial residual = %s, Final residual = 3e-07, No Iterations 1\n' \
+                "$([[ $time == 3000 ]] && echo 1.06518e-05 || echo 2e-05)"
+            printf 'smoothSolver:  Solving for Uy, Initial residual = 0.000174519, Final residual = 5e-06, No Iterations 1\n'
+            printf 'smoothSolver:  Solving for Uz, Initial residual = 9.66882e-05, Final residual = 3e-06, No Iterations 1\n'
+            printf 'GAMG:  Solving for p, Initial residual = 0.00136639, Final residual = 0.0001, No Iterations 1\n'
+            printf 'time step continuity errors : sum local = 1e-08, global = -2e-10, cumulative = -%s\n' "$time"
+            printf 'GAMG:  Solving for p, Initial residual = 0.000146973, Final residual = 8e-06, No Iterations 2\n'
+            printf 'smoothSolver:  Solving for epsilon, Initial residual = 1.2842e-05, Final residual = 3e-07, No Iterations 1\n'
+            printf 'smoothSolver:  Solving for k, Initial residual = 2.43816e-05, Final residual = 6e-07, No Iterations 1\n'
+            printf 'ExecutionTime = 1 s  ClockTime = 1 s\n\n'
+        done
+        if [[ "$mode" == converged ]]; then
+            printf '\nSIMPLE solution converged in 3000 iterations\n\n'
+        fi
+        printf 'End\n\n'
+    } > "$file"
+}
+
+s23_flow_convergence_evidence() {
+    local workspace run evidence batch conv label
+    workspace="$(new_workspace s23_convergence)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    batch="${workspace}/checkout/src/batch_9"
+    ab_simplefoam_log "${batch}/case_7/flow/log.simpleFoam" converged
+    ab_simplefoam_log "${batch}/case_8/flow/log.simpleFoam" endtime
+    ab_simplefoam_log "${batch}/case_9/flow/log.simpleFoam" endtime
+    mkdir -p "${batch}/case_7/flow/system" "${batch}/case_8/flow/system"
+    # The committed Case controls, so the recorded criterion is the real one.
+    cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" "${batch}/case_7/flow/system/fvSolution"
+    cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" "${batch}/case_8/flow/system/fvSolution"
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S23: the capture step ends with status 0"
+    conv="${evidence}/convergence.txt"
+    assert_file_exists "$conv" "S23: the convergence evidence exists"
+    label=case_7/flow/log.simpleFoam
+    assert_eq "CONVERGED" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S23: an explicit solver marker is CONVERGED"
+    assert_eq "SIMPLE solution converged in 3000 iterations" \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" SOLVER_CONVERGENCE_MARKER)" \
+        "S23: the solver marker is recorded"
+    assert_eq 'U 1e-4; p 1e-4; "(k|omega|epsilon)" 1e-4' \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" RESIDUAL_CONTROL)" \
+        "S23: the actual residualControl values are recorded"
+    assert_eq "true" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" RESIDUAL_CONTROL_REFERENCE_MATCH)" \
+        "S23: the committed controls match the M3 reference"
+    assert_eq "case_7/flow/system/fvSolution" \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_CONTROLS_SOURCE)" \
+        "S23: the controls source path is recorded"
+    label=case_8/flow/log.simpleFoam
+    assert_eq "NOT_CONVERGED" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S23: an end-time log without a marker is NOT_CONVERGED"
+    assert_eq "ABSENT" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" SOLVER_CONVERGENCE_MARKER)" \
+        "S23: the missing marker is recorded as ABSENT"
+    assert_eq "3000" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_TIME)" \
+        "S23: the final time is recorded"
+    assert_eq "1.06518e-05" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_INITIAL_RESIDUAL_Ux)" \
+        "S23: the final Ux initial residual is from the final time step"
+    assert_eq "0.00136639" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_INITIAL_RESIDUAL_p)" \
+        "S23: the final p initial residual is the first pressure solve"
+    assert_eq "2.43816e-05" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_INITIAL_RESIDUAL_k)" \
+        "S23: the final k initial residual is recorded"
+    assert_eq "1.2842e-05" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_INITIAL_RESIDUAL_epsilon)" \
+        "S23: the final epsilon initial residual is recorded"
+    assert_contains "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_CONTINUITY)" \
+        "cumulative = -3000" "S23: the final continuity record is recorded"
+    label=case_9/flow/log.simpleFoam
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S23: a log without control values is UNAVAILABLE"
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" RESIDUAL_CONTROL)" \
+        "S23: missing control values are UNAVAILABLE"
+    assert_eq "UNAVAILABLE" "$(ab_file_value "$conv" CONVERGENCE_VERDICT)" \
+        "S23: one unavailable log makes the aggregate verdict UNAVAILABLE"
+    assert_file_exists "${evidence}/case-config/case_7/flow/system/fvSolution" \
+        "S23: the Case controls are kept as evidence"
+
+    # One converged log alone, and one end-time log alone. The shared fixture
+    # holds one more solver log without controls, so these runs remove it.
+    workspace="$(new_workspace s23_converged_only)"
+    ab_capture_fixture "$workspace"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/log.simpleFoam"
+    ab_simplefoam_log "${workspace}/checkout/src/batch_9/case_7/flow/log.simpleFoam" converged
+    mkdir -p "${workspace}/checkout/src/batch_9/case_7/flow/system"
+    cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" \
+        "${workspace}/checkout/src/batch_9/case_7/flow/system/fvSolution"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+    assert_eq "CONVERGED" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        "S23: a converged log alone gives a CONVERGED verdict"
+
+    workspace="$(new_workspace s23_endtime_only)"
+    ab_capture_fixture "$workspace"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/log.simpleFoam"
+    ab_simplefoam_log "${workspace}/checkout/src/batch_9/case_7/flow/log.simpleFoam" endtime
+    mkdir -p "${workspace}/checkout/src/batch_9/case_7/flow/system"
+    cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" \
+        "${workspace}/checkout/src/batch_9/case_7/flow/system/fvSolution"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+    assert_eq "NOT_CONVERGED" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        "S23: reaching the end time is not convergence"
+}
+
+s24_summary_shows_the_evidence_verdicts() {
+    local workspace summary
+    workspace="$(new_workspace s24_summary)"
+    ab_capture_fixture "$workspace"
+    ab_checkmesh_log "${workspace}/checkout/src/batch_9/case_7/flow/log.checkMesh" failed
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+
+    summary="$(ab_run_summary "$workspace")"
+    assert_contains "$summary" '| VTU required fields | `COMPLETE` |' \
+        "S24: the job summary shows the VTU required-field verdict"
+    assert_contains "$summary" '| Mesh quality | `MESH_QUALITY_REVIEW_REQUIRED` |' \
+        "S24: the job summary shows the mesh verdict"
+    assert_contains "$summary" '| Convergence | `UNAVAILABLE` |' \
+        "S24: the job summary shows the convergence verdict"
+    assert_contains "$summary" '| Capture result | `COMPLETE` |' \
+        "S24: the job summary keeps the capture result"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -1243,6 +1825,13 @@ AB_OBSERVATIONS=(
     s15_capture_failure_keeps_summary_and_upload_eligible
     s16_vtu_parse_failure_is_an_incomplete_capture
     s17_stage_evidence_failure_is_an_incomplete_capture
+    s18_vtu_required_field_verdicts_and_original_tags
+    s19_source_mismatch_keeps_a_complete_capture
+    s20_vtu_tag_evidence_output_limits
+    s21_vtu_scan_timeout_is_distinct
+    s22_mesh_quality_evidence
+    s23_flow_convergence_evidence
+    s24_summary_shows_the_evidence_verdicts
 )
 
 # One observation runs in this process when the caller names it. The scenario
