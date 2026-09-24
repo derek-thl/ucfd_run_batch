@@ -1,0 +1,857 @@
+name: openfoam-m3-mesh-diagnostic
+
+# Manual Case 7 mesh-phase diagnostic for the M3 Item (Issue #80).
+#
+# One mesh-only run of the committed Case 7 row with OpenCFD OpenFOAM v2512.
+# The run finds the first checked mesh state with concave cells: the
+# background block mesh, the emitted refined mesh, or the final reconstructed
+# mesh. It can also report that no concavity is reproduced, or an explicit
+# INCONCLUSIVE result. It never solves flow and never accepts M3.
+#
+# The workflow starts only through workflow_dispatch. It is never a required
+# check. It uses the existing setup Stage and the committed Case inputs, and it
+# changes no Case input. The only production-command difference is that the
+# temporary snappyHexMesh call has no -overwrite, so each active phase writes
+# its own time.
+#
+# Time: the job limit is 20 minutes. The active work ends 12 minutes after the
+# first step starts. Each command runs under the smaller of its cap and the
+# active time left. The package, summary, and upload steps have 1, 1, and 2
+# minutes, so summary and upload keep 3 minutes. Every step has a timeout, and
+# the six step timeouts sum to 18 minutes (1 + 1 + 12 + 1 + 1 + 2), so even the
+# worst case keeps a 2-minute job margin. The diagnostic step timeout equals the
+# active window, so it cannot stop the work before the active-work deadline.
+# The step timeouts are only final guards.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: OpenFOAM v2512 Case 7 mesh-phase diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. The clock. This step is first, so the active-work deadline covers
+      #    the checkout, the installation, the setup Stage, and every mesh
+      #    command. The OpenFOAM root is published here, so the later steps
+      #    derive the environment file from one value.
+      # ---------------------------------------------------------------------
+      - name: Start the diagnostic clock
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          start="$(date +%s)"
+          dir="${RUNNER_TEMP}/m3-mesh-diagnostic"
+          mkdir -p "${dir}/evidence"
+          {
+            echo "DIAG_DIR=${dir}"
+            echo "DIAG_CLOCK_START=${start}"
+            echo "DIAG_ACTIVE_DEADLINE=$(( start + 720 ))"
+            echo "OPENFOAM_ROOT=/usr/lib/openfoam"
+          } >> "$GITHUB_ENV"
+          # An early result, so a stop before the diagnostic step still
+          # uploads an explicit INCONCLUSIVE result.
+          {
+            echo "DIAG_RESULT=INCONCLUSIVE_DIAGNOSTIC_NOT_STARTED"
+            echo "DIAG_REASON=the diagnostic step did not start"
+            echo "DIAG_CLOCK_START=${start}"
+            echo "DIAG_ACTIVE_DEADLINE=$(( start + 720 ))"
+          } > "${dir}/evidence/result.env"
+          echo "clock start          : ${start}"
+          echo "active-work deadline : $(( start + 720 ))"
+
+      - name: Check out the repository
+        id: checkout
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: actions/checkout@v5
+
+      # ---------------------------------------------------------------------
+      # 2. The diagnostic. The step writes one script and runs it. The script
+      #    records each result as it is known and ends with status 0, so the
+      #    package, summary, and upload steps always run.
+      # ---------------------------------------------------------------------
+      - name: Run the mesh diagnostic
+        if: always()
+        timeout-minutes: 12
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+        run: |
+          set -uo pipefail
+          mkdir -p "${DIAG_DIR}/evidence"
+          script="${DIAG_DIR}/diagnostic.sh"
+          cat > "$script" <<'MESH_DIAGNOSTIC'
+          set -uo pipefail
+
+          # ---- constants --------------------------------------------------
+          EXPECTED_BASELINE="v2512"
+          CASE_ID="7"
+          SOURCE_CSV="src/output_batch_1.csv"
+          RUN_CSV="src/output_batch_9.csv"
+          BATCH_DIR="src/batch_9"
+          FLOW_DIR="src/batch_9/case_7/flow"
+          RANKS=8
+          LOG_LIMIT=1048576
+          KILL_GRACE=5
+          EVIDENCE="${DIAG_DIR}/evidence"
+          EXCLUDED="${DIAG_DIR}/excluded"
+
+          mkdir -p "${EVIDENCE}/logs" "${EVIDENCE}/help" "${EVIDENCE}/dictionaries" "$EXCLUDED"
+          : > "${EVIDENCE}/identity.txt"
+          : > "${EVIDENCE}/help-checks.txt"
+          printf 'seq\tlabel\tcap_seconds\tlimit_seconds\tstart\tend\tstatus\toutcome\tlog\tvector\n' \
+              > "${EVIDENCE}/commands.tsv"
+          printf 'check\tstate\ttime\tmode\tstatus\tresult\tfailed_checks\tconcave_cells\tlog\n' \
+              > "${EVIDENCE}/checks.tsv"
+          printf 'check\tpath\tbytes\tsha256\n' > "${EVIDENCE}/sets.tsv"
+          printf 'path\tbytes\tsha256\treason\n' > "${EVIDENCE}/excluded.tsv"
+
+          DIAG_SEQ=0
+          DIAG_RESULT=""
+          DIAG_REASON=""
+          DIAG_STOP_POINT="NONE"
+          FINISHED=0
+          for state in BACKGROUND REFINED FINAL; do
+              printf -v "${state}_RESULT" '%s' NOT_RUN
+              printf -v "${state}_FAILED_CHECKS" '%s' UNAVAILABLE
+              printf -v "${state}_CONCAVE_CELLS" '%s' UNAVAILABLE
+              printf -v "${state}_TIME" '%s' UNAVAILABLE
+          done
+          BACKGROUND_TIME=0
+          FINAL_COMPARISON=UNAVAILABLE
+
+          # ---- result record ----------------------------------------------
+
+          # inconclusive <cause> <reason> - record an INCONCLUSIVE cause. The
+          # first cause is the result. A later cause does not replace it.
+          inconclusive() {
+              if [[ -z "$DIAG_RESULT" ]]; then
+                  DIAG_RESULT="INCONCLUSIVE_$1"
+                  DIAG_REASON="$2"
+              fi
+              echo "inconclusive: $1: $2"
+          }
+
+          write_result() {
+              local end state key name
+              end="$(date +%s)"
+              {
+                echo "DIAG_RESULT=${DIAG_RESULT:-INCONCLUSIVE_UNCLASSIFIED}"
+                echo "DIAG_REASON=${DIAG_REASON:-no result class was selected}"
+                echo "DIAG_STOP_POINT=${DIAG_STOP_POINT}"
+                for state in BACKGROUND REFINED FINAL; do
+                    for key in TIME RESULT FAILED_CHECKS CONCAVE_CELLS; do
+                        name="${state}_${key}"
+                        echo "${name}=${!name}"
+                    done
+                done
+                echo "FINAL_COMPARISON=${FINAL_COMPARISON}"
+                echo "DIAG_CLOCK_START=${DIAG_CLOCK_START}"
+                echo "DIAG_ACTIVE_DEADLINE=${DIAG_ACTIVE_DEADLINE}"
+                echo "DIAG_ACTIVE_END=${end}"
+                echo "DIAG_ACTIVE_ELAPSED_SECONDS=$(( end - DIAG_CLOCK_START ))"
+              } > "${EVIDENCE}/result.env.tmp"
+              mv -f -- "${EVIDENCE}/result.env.tmp" "${EVIDENCE}/result.env"
+          }
+
+          finish() {
+              FINISHED=1
+              classify
+              write_result
+              echo "result: ${DIAG_RESULT}: ${DIAG_REASON}"
+              exit 0
+          }
+
+          # stop <cause> <reason> <stop-point> - record the cause and end the run.
+          # The evidence kept so far stays eligible for the upload.
+          stop() {
+              inconclusive "$1" "$2"
+              DIAG_STOP_POINT="$3"
+              finish
+          }
+
+          trap 'if (( FINISHED == 0 )); then
+                    inconclusive INTERNAL_ERROR "the diagnostic script ended before its result"
+                    write_result
+                fi' EXIT
+
+          identity() {
+              printf '%s=%s\n' "$1" "$2" >> "${EVIDENCE}/identity.txt"
+          }
+
+          sha256_of() {
+              sha256sum < "$1" | cut -d' ' -f1
+          }
+
+          # ---- the bounded command runner ---------------------------------
+
+          # run_bounded <label> <cap-seconds> <command> [args...] - run one
+          # command in the current directory. The limit is the smaller of the
+          # cap and the active time left, less the kill grace, so no command
+          # runs into the reserve for the package, summary, and upload steps.
+          # timeout stops the command and its process group. A log above
+          # LOG_LIMIT bytes is not cut: it leaves the evidence, and its size and
+          # checksum are recorded. Sets RUN_STATUS, RUN_OUTCOME, and RUN_LOG.
+          run_bounded() {
+              local label="$1" cap="$2" now left limit start end vector log_ref bytes
+              shift 2
+              DIAG_SEQ=$(( DIAG_SEQ + 1 ))
+              RUN_LOG="${EVIDENCE}/logs/$(printf '%02d' "$DIAG_SEQ")-${label}.log"
+              log_ref="${RUN_LOG#"${EVIDENCE}/"}"
+              vector="$(printf '%q ' "$@")"
+              vector="${vector% }"
+              now="$(date +%s)"
+              left=$(( DIAG_ACTIVE_DEADLINE - now - KILL_GRACE ))
+              limit="$cap"
+              (( left < limit )) && limit="$left"
+              if (( limit <= 0 )); then
+                  RUN_STATUS=124
+                  RUN_OUTCOME=NOT_STARTED
+                  RUN_LOG=""
+                  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$DIAG_SEQ" "$label" "$cap" "$limit" \
+                      "$now" "$now" "-" "$RUN_OUTCOME" "-" "$vector" >> "${EVIDENCE}/commands.tsv"
+                  echo "command ${label}: NOT_STARTED, no active time left"
+                  return 0
+              fi
+              start="$now"
+              echo "command ${label}: limit ${limit} s: ${vector}"
+              timeout --kill-after="${KILL_GRACE}s" "${limit}s" "$@" > "$RUN_LOG" 2>&1 < /dev/null
+              RUN_STATUS=$?
+              end="$(date +%s)"
+              case "$RUN_STATUS" in
+                  0) RUN_OUTCOME=COMPLETED ;;
+                  124|137) RUN_OUTCOME=TIMEOUT ;;
+                  *) RUN_OUTCOME=FAILED ;;
+              esac
+              bytes="$(stat -c %s -- "$RUN_LOG" 2>/dev/null || echo 0)"
+              if (( bytes > LOG_LIMIT )); then
+                  printf '%s\t%s\t%s\t%s\n' "$log_ref" "$bytes" "$(sha256_of "$RUN_LOG")" \
+                      "the log is above ${LOG_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
+                  mv -f -- "$RUN_LOG" "${EXCLUDED}/"
+                  RUN_LOG=""
+                  RUN_OUTCOME=OUTPUT_LIMIT
+              fi
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$DIAG_SEQ" "$label" "$cap" "$limit" \
+                  "$start" "$end" "$RUN_STATUS" "$RUN_OUTCOME" "$log_ref" "$vector" >> "${EVIDENCE}/commands.tsv"
+              echo "command ${label}: ${RUN_OUTCOME}, status ${RUN_STATUS}, $(( end - start )) s"
+              return 0
+          }
+
+          # stop_on_limits <label> - stop after a timeout, no time, or a log above
+          # the limit.
+          stop_on_limits() {
+              case "$RUN_OUTCOME" in
+                  TIMEOUT) stop TIMEOUT "the $1 command did not complete within its limit" "$1" ;;
+                  NOT_STARTED) stop TIMEOUT "no active time was left for the $1 command" "$1" ;;
+                  OUTPUT_LIMIT) stop OUTPUT_LIMIT "the $1 log is above ${LOG_LIMIT} bytes" "$1" ;;
+              esac
+          }
+
+          # run_preparation <label> <cap-seconds> <command> [args...] - a
+          # preparation command must complete with status 0.
+          run_preparation() {
+              local label="$1"
+              run_bounded "$@"
+              stop_on_limits "$label"
+              if [[ "$RUN_OUTCOME" != COMPLETED ]]; then
+                  stop PREPARATION_FAILURE "the ${label} command ended with status ${RUN_STATUS}" "$label"
+              fi
+          }
+
+          # ---- checkMesh evidence -----------------------------------------
+
+          # parse_check <log> - prints: result failed-checks concave-cells.
+          # checkMesh can report failed checks and return status 0, so only
+          # the text decides. One "Mesh OK." or "Failed N mesh checks." line is
+          # required. The concave count comes from the concave-cells line or
+          # the concave check OK line. A clean log without either line has count
+          # 0. A failed log without an exact count gives UNAVAILABLE, not 0.
+          parse_check() {
+              awk '
+                  /^[ \t]*Mesh OK\.[ \t]*$/ { ok++ }
+                  /^[ \t]*Failed [0-9]+ mesh checks\.[ \t]*$/ { failed++; n = $2 }
+                  /\*\*\*Concave cells \(using face planes\) found, number of cells: [0-9]+[ \t]*$/ {
+                      found++; count = $NF
+                  }
+                  /^[ \t]*Concave cell check OK\.[ \t]*$/ { clean++ }
+                  END {
+                      if (ok + failed != 1) { print "UNAVAILABLE UNAVAILABLE UNAVAILABLE"; exit }
+                      result = (ok ? "MESH_OK" : "FAILED")
+                      checks = (ok ? 0 : n)
+                      if (found == 1 && clean == 0 && count + 0 > 0 && !ok) concave = count + 0
+                      else if (found == 0 && clean <= 1) concave = (clean || ok) ? 0 : "UNAVAILABLE"
+                      else concave = "UNAVAILABLE"
+                      if (ok && found) { print "UNAVAILABLE UNAVAILABLE UNAVAILABLE"; exit }
+                      print result, checks, concave
+                  }' "$1"
+          }
+
+          # set_paths <state> <time> - the concaveCells set files that one check
+          # writes, relative to the flow Case: the mesh instance of the checked
+          # time, and one file for each processor in a parallel check.
+          set_paths() {
+              local n
+              case "$1" in
+                  BACKGROUND) echo "constant/polyMesh/sets/concaveCells" ;;
+                  REFINED)
+                      for (( n = 0; n < RANKS; n++ )); do
+                          echo "processor${n}/$2/polyMesh/sets/concaveCells"
+                      done ;;
+                  FINAL) echo "$2/polyMesh/sets/concaveCells" ;;
+              esac
+          }
+
+          # run_check <state> <mode> <time> <command> [args...] - one checkMesh
+          # check. A set file from an earlier command is removed first, so a
+          # recorded set belongs to this check.
+          run_check() {
+              local state="$1" mode="$2" time="$3" label parsed result checks concave path missing=0 lower
+              shift 3
+              lower="$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"
+              label="checkMesh-${lower}"
+              while IFS= read -r path; do
+                  rm -f -- "$path"
+              done < <(set_paths "$state" "$time")
+              run_bounded "$label" 60 "$@"
+              stop_on_limits "$label"
+              printf -v "${state}_TIME" '%s' "$time"
+              if [[ "$RUN_OUTCOME" != COMPLETED ]]; then
+                  inconclusive CHECK_RESULT "the ${lower} checkMesh ended with status ${RUN_STATUS}"
+              fi
+              parsed="$(parse_check "$RUN_LOG")"
+              read -r result checks concave <<< "$parsed"
+              printf -v "${state}_RESULT" '%s' "$result"
+              printf -v "${state}_FAILED_CHECKS" '%s' "$checks"
+              printf -v "${state}_CONCAVE_CELLS" '%s' "$concave"
+              if [[ "$result" == UNAVAILABLE ]]; then
+                  inconclusive CHECK_RESULT "the ${lower} check log has no single Mesh OK. or Failed N mesh checks. line"
+              elif [[ "$concave" == UNAVAILABLE ]]; then
+                  inconclusive CONCAVE_COUNT "the ${lower} check reports ${checks} failed checks without an exact concave count"
+              elif (( concave > 0 )); then
+                  while IFS= read -r path; do
+                      if [[ -f "$path" ]]; then
+                          printf '%s\t%s\t%s\t%s\n' "$lower" "$path" "$(stat -c %s -- "$path")" \
+                              "$(sha256_of "$path")" >> "${EVIDENCE}/sets.tsv"
+                      else
+                          missing=$(( missing + 1 ))
+                      fi
+                  done < <(set_paths "$state" "$time")
+                  if (( missing > 0 )); then
+                      inconclusive CONCAVE_SET "the ${lower} check reports ${concave} concave cells, but ${missing} concaveCells set files are missing"
+                  fi
+              fi
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$lower" "$state" "$time" "$mode" "$RUN_STATUS" \
+                  "$result" "$checks" "$concave" "${RUN_LOG#"${EVIDENCE}/"}" >> "${EVIDENCE}/checks.tsv"
+          }
+
+          # ---- classification ---------------------------------------------
+
+          clean_check() {
+              local result_var="$1_RESULT" concave_var="$1_CONCAVE_CELLS"
+              [[ "${!result_var}" == MESH_OK && "${!concave_var}" == 0 ]]
+          }
+
+          positive() {
+              [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 ))
+          }
+
+          classify() {
+              [[ -z "$DIAG_RESULT" ]] || return 0
+              if positive "$BACKGROUND_CONCAVE_CELLS"; then
+                  DIAG_RESULT=FIRST_CONCAVITY_AT_BACKGROUND
+                  DIAG_REASON="the background block mesh has ${BACKGROUND_CONCAVE_CELLS} concave cells"
+              elif clean_check BACKGROUND && positive "$REFINED_CONCAVE_CELLS"; then
+                  DIAG_RESULT=FIRST_CONCAVITY_AT_REFINED_MESH
+                  DIAG_REASON="the background mesh is clean, and the refined mesh at time ${REFINED_TIME} has ${REFINED_CONCAVE_CELLS} concave cells"
+              elif clean_check BACKGROUND && clean_check REFINED && [[ "$FINAL_RESULT" == FAILED ]]; then
+                  DIAG_RESULT=NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS
+                  DIAG_REASON="the phase checks are clean, and the reconstructed serial check reports ${FINAL_FAILED_CHECKS} failed checks and ${FINAL_CONCAVE_CELLS} concave cells"
+              elif clean_check BACKGROUND && clean_check REFINED && clean_check FINAL; then
+                  DIAG_RESULT=NO_CONCAVITY_REPRODUCED
+                  DIAG_REASON="the background, refined, and final serial checks are clean; this does not accept Run 2 or M3"
+              else
+                  inconclusive NON_CONCAVE_PHASE_FAILURE "the background or refined check failed without concavity: background ${BACKGROUND_RESULT} ${BACKGROUND_FAILED_CHECKS} failed, refined ${REFINED_RESULT} ${REFINED_FAILED_CHECKS} failed"
+              fi
+          }
+
+          # ---- 1. checkout and baseline ------------------------------------
+
+          if [[ "${CHECKOUT_OUTCOME:-}" != success ]]; then
+              stop CHECKOUT "the checkout outcome is '${CHECKOUT_OUTCOME:-UNAVAILABLE}'" checkout
+          fi
+          cd "$GITHUB_WORKSPACE" || stop CHECKOUT "the checkout directory is not available" checkout
+          identity MAIN_SHA "${GITHUB_SHA:-UNAVAILABLE}"
+          identity RUN_ID "${GITHUB_RUN_ID:-UNAVAILABLE}"
+
+          # One literal X keeps the final newline byte significant, so this one
+          # comparison rejects a missing line ending, a second line, and another
+          # target.
+          if [[ ! -f .openfoam-version ]]; then
+              stop VERSION "the baseline file .openfoam-version is missing" baseline
+          fi
+          raw="$(cat -- .openfoam-version; printf X)"
+          if [[ "$raw" != "${EXPECTED_BASELINE}"$'\n'"X" ]]; then
+              stop VERSION "the baseline file must hold exactly '${EXPECTED_BASELINE}' and one line ending" baseline
+          fi
+          release="${EXPECTED_BASELINE#v}"
+          package="openfoam${release}-default"
+          bashrc="${OPENFOAM_ROOT}/openfoam${release}/etc/bashrc"
+          identity OPENFOAM_BASELINE "$EXPECTED_BASELINE"
+          identity OPENFOAM_PACKAGE "$package"
+          identity OPENFOAM_BASHRC "$bashrc"
+
+          # ---- 2. installation and environment ----------------------------
+
+          run_bounded install 120 bash -c '
+              set -euo pipefail
+              curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends "$1"
+          ' _ "$package"
+          stop_on_limits install
+          if [[ "$RUN_OUTCOME" != COMPLETED ]]; then
+              stop INSTALL "the installation ended with status ${RUN_STATUS}" install
+          fi
+
+          if [[ ! -f "$bashrc" ]]; then
+              stop VERSION "the OpenFOAM environment file is missing: ${bashrc}" environment
+          fi
+          set +u
+          # shellcheck disable=SC1090
+          source "$bashrc" > "${EVIDENCE}/logs/environment.log" 2>&1
+          source_status=$?
+          set -u
+          if (( source_status != 0 )) || [[ "${WM_PROJECT_VERSION:-}" != "$EXPECTED_BASELINE" ]]; then
+              stop VERSION "the loaded environment is not ${EXPECTED_BASELINE}: source status ${source_status}, WM_PROJECT_VERSION '${WM_PROJECT_VERSION:-}'" environment
+          fi
+          identity WM_PROJECT_VERSION "$WM_PROJECT_VERSION"
+          identity OPENFOAM_PACKAGE_VERSION "$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || echo UNAVAILABLE)"
+          identity WM_OPTIONS "${WM_OPTIONS:-UNAVAILABLE}"
+          identity OS_IDENTITY "$( ( . /etc/os-release && printf '%s' "${PRETTY_NAME:-UNAVAILABLE}" ) 2>/dev/null || echo UNAVAILABLE)"
+          identity ARCHITECTURE "$(uname -m 2>/dev/null || echo UNAVAILABLE)"
+          identity GCC_VERSION "$(gcc -dumpfullversion 2>/dev/null || echo UNAVAILABLE)"
+          for command in surfaceFeatureExtract blockMesh checkMesh decomposePar snappyHexMesh \
+                         reconstructParMesh mpirun; do
+              identity "PATH_${command}" "$(command -v "$command" || echo UNAVAILABLE)"
+          done
+
+          # ---- 3. installed v2512 help ------------------------------------
+
+          # The installed help is the command validation. The status of a help
+          # call is recorded but not required. Its text must show each option.
+          help_missing=""
+          for command in snappyHexMesh checkMesh reconstructParMesh; do
+              run_bounded "help-${command}" 20 "$command" -help-full
+              stop_on_limits "help-${command}"
+              cp -- "$RUN_LOG" "${EVIDENCE}/help/${command}.txt"
+          done
+          # require_option <command> <option> [<argument-pattern> <argument-name>]
+          require_option() {
+              local file="${EVIDENCE}/help/$1.txt" spec="$2" pattern state=MISSING
+              if (( $# == 2 )); then
+                  pattern="^[[:space:]]+$2([[:space:]]*\$|[[:space:]]+[^<[:space:]])"
+              else
+                  pattern="^[[:space:]]+$2[[:space:]]+$3([[:space:]]|\$)"
+                  spec="$2 $4"
+              fi
+              LC_ALL=C grep -Eq -- "$pattern" "$file" && state=FOUND
+              printf '%s %s %s\n' "$1" "$spec" "$state" >> "${EVIDENCE}/help-checks.txt"
+              [[ "$state" == FOUND ]] || help_missing="${help_missing} $1 ${spec};"
+          }
+          require_option snappyHexMesh -parallel
+          require_option snappyHexMesh -overwrite
+          require_option checkMesh -parallel
+          require_option checkMesh -allGeometry
+          require_option checkMesh -allTopology
+          require_option checkMesh -writeAllFields
+          require_option checkMesh -time '<[^>]+>' '<argument>'
+          require_option checkMesh -writeSets '<surfaceFormat>' '<surfaceFormat>'
+          require_option reconstructParMesh -time '<[^>]+>' '<argument>'
+          if [[ -n "$help_missing" ]]; then
+              stop COMMAND_VALIDATION "the installed help does not show:${help_missing}" help
+          fi
+
+          # ---- 4. the one-Case DOE Batch CSV ------------------------------
+
+          [[ -f "$SOURCE_CSV" ]] || stop CASE_IDENTITY "the source CSV ${SOURCE_CSV} is missing" csv
+          [[ ! -e "$RUN_CSV" ]] || stop CASE_IDENTITY "the run CSV ${RUN_CSV} already exists" csv
+          [[ ! -e "$BATCH_DIR" ]] || stop CASE_IDENTITY "the Batch Workspace ${BATCH_DIR} already exists" csv
+          header="$(head -n 1 -- "$SOURCE_CSV")"
+          if [[ "${header%%,*}" != "Case" ]]; then
+              stop CASE_IDENTITY "the header of ${SOURCE_CSV} does not start with the Case column" csv
+          fi
+          matches="$(awk -F, -v want="$CASE_ID" 'NR > 1 && $1 == want { n++ } END { print n + 0 }' "$SOURCE_CSV")"
+          if (( matches != 1 )); then
+              stop CASE_IDENTITY "${SOURCE_CSV} holds ${matches} rows for Case ${CASE_ID}; exactly 1 is required" csv
+          fi
+          row="$(awk -F, -v want="$CASE_ID" 'NR > 1 && $1 == want { print; exit }' "$SOURCE_CSV")"
+          header_fields="$(printf '%s\n' "$header" | awk -F, '{ print NF }')"
+          row_fields="$(printf '%s\n' "$row" | awk -F, '{ print NF }')"
+          if (( header_fields != row_fields )); then
+              stop CASE_IDENTITY "the Case ${CASE_ID} row has ${row_fields} fields, and the header has ${header_fields}" csv
+          fi
+          printf '%s\n%s\n' "$header" "$row" > "$RUN_CSV"
+          if [[ "$(wc -l < "$RUN_CSV" | tr -d ' ')" != 2 || "$(head -n 1 -- "$RUN_CSV")" != "$header" \
+                || "$(sed -n 2p -- "$RUN_CSV")" != "$row" || "$(sed -n 2p -- "$RUN_CSV" | cut -d, -f1)" != "$CASE_ID" ]]; then
+              stop CASE_IDENTITY "the run CSV ${RUN_CSV} is not the header and the one Case ${CASE_ID} row" csv
+          fi
+          cp -- "$RUN_CSV" "${EVIDENCE}/case-row.csv"
+          identity CASE_ID "$CASE_ID"
+          identity SOURCE_CSV "$SOURCE_CSV"
+          identity SOURCE_CSV_SHA256 "$(sha256_of "$SOURCE_CSV")"
+          identity HEADER_SHA256 "$(printf '%s\n' "$header" | sha256sum | cut -d' ' -f1)"
+          identity CASE_ROW "$row"
+          identity CASE_ROW_SHA256 "$(printf '%s\n' "$row" | sha256sum | cut -d' ' -f1)"
+          identity RUN_CSV "$RUN_CSV"
+          identity RUN_CSV_SHA256 "$(sha256_of "$RUN_CSV")"
+
+          # ---- 5. the existing setup Stage --------------------------------
+
+          run_preparation setup 90 bash src/run_batch.sh --stage setup -j 1 "$RUN_CSV"
+          summary="${BATCH_DIR}/setup_cases_summary.csv"
+          [[ -f "$summary" ]] || stop CASE_IDENTITY "the setup Stage wrote no ${summary}" setup
+          cp -- "$summary" "${EVIDENCE}/setup_cases_summary.csv"
+          # The setup Stage writes a flow row and a transport row for one Case.
+          # Every row must name Case 7, and exactly one created case_7/flow row
+          # is required.
+          read -r other_rows flow_rows < <(awk '
+              NR == 1 { next }
+              { line = $0; sub(/^"/, "", line); sub(/"$/, "", line); split(line, f, /","/)
+                if (f[3] != "case_7") other++
+                if (f[4] == "case_7/flow" && f[9] == "created") flow++ }
+              END { print other + 0, flow + 0 }' "$summary")
+          if (( other_rows != 0 )); then
+              stop CASE_IDENTITY "the setup summary names ${other_rows} rows of another Case" setup
+          fi
+          if (( flow_rows != 1 )); then
+              stop CASE_IDENTITY "the setup summary holds ${flow_rows} created case_7/flow rows; exactly 1 is required" setup
+          fi
+          other_dirs="$(find "$BATCH_DIR" -mindepth 1 -maxdepth 1 -type d -name 'case_*' ! -name case_7 | wc -l | tr -d ' ')"
+          if (( other_dirs != 0 )); then
+              stop CASE_IDENTITY "the Batch Workspace holds ${other_dirs} other Case directories" setup
+          fi
+          [[ -d "$FLOW_DIR" ]] || stop CASE_IDENTITY "the setup Stage wrote no ${FLOW_DIR}" setup
+
+          # ---- 6. the generated dictionaries and controls -----------------
+
+          : > "${EVIDENCE}/dictionaries.sha256"
+          for dict in snappyHexMeshDict fvSolution controlDict decomposeParDict; do
+              if [[ ! -f "${FLOW_DIR}/system/${dict}" ]]; then
+                  stop CASE_OR_PHASE_MISMATCH "the generated Case has no system/${dict}" dictionaries
+              fi
+              cp -- "${FLOW_DIR}/system/${dict}" "${EVIDENCE}/dictionaries/${dict}"
+              printf '%s  %s\n' "$(sha256_of "${FLOW_DIR}/system/${dict}")" "${FLOW_DIR}/system/${dict}" \
+                  >> "${EVIDENCE}/dictionaries.sha256"
+          done
+          # top_value <file> <keyword> - the value of one top-level entry, or
+          # MISSING or DUPLICATE.
+          top_value() {
+              awk -v key="$2" '
+                  { line = $0; sub(/\/\/.*/, "", line) }
+                  line ~ ("^" key "[ \t]+[^ \t;]+[ \t]*;") {
+                      n++; value = line
+                      sub("^" key "[ \t]+", "", value); sub(/[ \t]*;.*$/, "", value)
+                  }
+                  END { if (n == 1) print value; else if (n == 0) print "MISSING"; else print "DUPLICATE" }' "$1"
+          }
+          castellated="$(top_value "${FLOW_DIR}/system/snappyHexMeshDict" castellatedMesh)"
+          snap="$(top_value "${FLOW_DIR}/system/snappyHexMeshDict" snap)"
+          layers="$(top_value "${FLOW_DIR}/system/snappyHexMeshDict" addLayers)"
+          subdomains="$(top_value "${FLOW_DIR}/system/decomposeParDict" numberOfSubdomains)"
+          {
+            echo "CASTELLATED_MESH=${castellated}"
+            echo "SNAP=${snap}"
+            echo "ADD_LAYERS=${layers}"
+            echo "NUMBER_OF_SUBDOMAINS=${subdomains}"
+            echo "CONTROL_START_TIME=$(top_value "${FLOW_DIR}/system/controlDict" startTime)"
+            echo "CONTROL_DELTA_T=$(top_value "${FLOW_DIR}/system/controlDict" deltaT)"
+          } > "${EVIDENCE}/controls.txt"
+          case "$castellated" in on|true|yes) ;; *)
+              stop CASE_OR_PHASE_MISMATCH "the generated castellatedMesh is '${castellated}', not on" dictionaries ;;
+          esac
+          case "$snap" in off|false|no) ;; *)
+              stop CASE_OR_PHASE_MISMATCH "the generated snap is '${snap}', not the committed off" dictionaries ;;
+          esac
+          case "$layers" in off|false|no) ;; *)
+              stop CASE_OR_PHASE_MISMATCH "the generated addLayers is '${layers}', not the committed off" dictionaries ;;
+          esac
+          if [[ "$subdomains" != "$RANKS" ]]; then
+              stop CASE_OR_PHASE_MISMATCH "the generated numberOfSubdomains is '${subdomains}', not ${RANKS}" dictionaries
+          fi
+
+          # ---- 7. background mesh and its check ---------------------------
+
+          cd "$FLOW_DIR" || stop PREPARATION_FAILURE "the flow Case ${FLOW_DIR} is not available" mesh
+          run_preparation surfaceFeatureExtract 60 surfaceFeatureExtract
+          run_preparation blockMesh 30 blockMesh
+          run_check BACKGROUND serial 0 checkMesh -allGeometry -allTopology -time 0
+          run_preparation decomposePar 60 decomposePar -force
+
+          # ---- 8. snappyHexMesh without -overwrite and its phase map ------
+
+          run_preparation snappyHexMesh 240 mpirun --oversubscribe -np "$RANKS" snappyHexMesh -parallel
+          snappy_log="$RUN_LOG"
+          # Each "Writing mesh to time <T>" line is one emitted phase. Its label
+          # is the phase line after the previous write line: "Refined mesh",
+          # "Snapped mesh", or "Layer mesh".
+          awk '
+              /^(Refined|Snapped|Layer) mesh : cells:/ { label = $1 " " $2 }
+              /^Writing mesh to time / {
+                  n++
+                  printf "%s\t%s\t%s\n", (NF == 5 ? $5 : "INVALID"), (label == "" ? "NONE" : label), NR
+                  label = ""
+              }' "$snappy_log" > "${EVIDENCE}/phase-lines.tsv"
+          phase_count="$(wc -l < "${EVIDENCE}/phase-lines.tsv" | tr -d ' ')"
+          phase_times="$(cut -f1 "${EVIDENCE}/phase-lines.tsv" | tr '\n' ' ')"
+          phase_labels="$(cut -f2 "${EVIDENCE}/phase-lines.tsv" | paste -sd ',' -)"
+          {
+            echo "PHASE_COUNT=${phase_count}"
+            n=0
+            while IFS=$'\t' read -r time label line; do
+                n=$(( n + 1 ))
+                echo "PHASE_${n}_TIME=${time}"
+                echo "PHASE_${n}_LABEL=${label}"
+                echo "PHASE_${n}_LOG_LINE=${line}"
+            done < "${EVIDENCE}/phase-lines.tsv"
+          } > "${EVIDENCE}/phase-map.txt"
+          if (( phase_count == 0 )); then
+              stop CASE_OR_PHASE_MISMATCH "the snappyHexMesh log has no refined-mesh write" phase-map
+          fi
+          if [[ " ${phase_times} " == *" constant "* || " ${phase_times} " == *" INVALID "* ]]; then
+              stop PHASE_MAP "the snappyHexMesh log writes to '${phase_times% }', not to phase times" phase-map
+          fi
+          if [[ -n "$(cut -f1 "${EVIDENCE}/phase-lines.tsv" | sort | uniq -d)" ]]; then
+              stop PHASE_MAP "the snappyHexMesh log writes one phase time more than once: ${phase_times% }" phase-map
+          fi
+          if [[ ",${phase_labels}," == *",NONE,"* ]]; then
+              stop PHASE_MAP "a snappyHexMesh write line has no phase label: ${phase_labels}" phase-map
+          fi
+          if [[ "$phase_count" != 1 || "$phase_labels" != "Refined mesh" ]]; then
+              stop CASE_OR_PHASE_MISMATCH "snap=off and addLayers=off permit only the refined phase; the log shows: ${phase_labels}" phase-map
+          fi
+          phase_time="${phase_times%% *}"
+          if [[ ! "$phase_time" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+              stop PHASE_MAP "the phase time '${phase_time}' is not a time name" phase-map
+          fi
+          # Every processor directory counts, not only processor0: exactly
+          # processor0 to processor<RANKS-1>, each with the phase mesh, and no
+          # directory other than constant, 0, and the phase time.
+          directories=0
+          for (( n = 0; n < RANKS; n++ )); do
+              [[ -d "processor${n}/${phase_time}/polyMesh" ]] && directories=$(( directories + 1 ))
+          done
+          processor_dirs="$(find . -mindepth 1 -maxdepth 1 -type d -name 'processor*' -printf '%f\n' 2>/dev/null |
+                            sort -V | tr '\n' ' ')"
+          other_processors=""
+          extra_times=""
+          for processor in $processor_dirs; do
+              if [[ ! "$processor" =~ ^processor(0|[1-9][0-9]*)$ ]] || (( ${processor#processor} >= RANKS )); then
+                  other_processors="${other_processors}${processor} "
+                  continue
+              fi
+              extra_times="${extra_times}$(find "$processor" -mindepth 1 -maxdepth 1 -type d \
+                  ! -name constant ! -name 0 ! -name "$phase_time" -printf "${processor}/%f " 2>/dev/null)"
+          done
+          {
+            echo "PHASE_1_PROCESSOR_DIRECTORIES=${directories}"
+            echo "PHASE_1_PROCESSOR_DIRECTORY_NAMES=${processor_dirs:-NONE}"
+            echo "PHASE_1_OTHER_PROCESSOR_DIRECTORIES=${other_processors:-NONE}"
+            echo "PHASE_1_OTHER_PROCESSOR_TIMES=${extra_times:-NONE}"
+          } >> "${EVIDENCE}/phase-map.txt"
+          if (( directories != RANKS )) || [[ -n "$other_processors" || -n "$extra_times" ]]; then
+              stop PHASE_MAP "the processor meshes do not match the phase time ${phase_time}: ${directories} of ${RANKS} directories, other processor directories '${other_processors% }', other times '${extra_times% }'" phase-map
+          fi
+          echo "PHASE_MAP_RESULT=COMPLETE" >> "${EVIDENCE}/phase-map.txt"
+
+          # ---- 9. the phase check, reconstruction, and final check --------
+
+          run_check REFINED parallel "$phase_time" mpirun --oversubscribe -np "$RANKS" \
+              checkMesh -parallel -allGeometry -allTopology -time "$phase_time" -writeSets vtk
+          run_preparation reconstructParMesh 90 reconstructParMesh -time "$phase_time"
+          run_check FINAL serial "$phase_time" \
+              checkMesh -allGeometry -allTopology -writeAllFields -time "$phase_time"
+
+          # The final parallel check and the reconstructed serial check.
+          if [[ "$REFINED_RESULT" != UNAVAILABLE && "$FINAL_RESULT" != UNAVAILABLE ]]; then
+              if [[ "$REFINED_RESULT" == "$FINAL_RESULT" && "$REFINED_FAILED_CHECKS" == "$FINAL_FAILED_CHECKS" \
+                    && "$REFINED_CONCAVE_CELLS" == "$FINAL_CONCAVE_CELLS" ]]; then
+                  FINAL_COMPARISON=SAME
+              else
+                  FINAL_COMPARISON=DIFFERENT
+              fi
+          fi
+          {
+            echo "PARALLEL_CHECK=${REFINED_RESULT} ${REFINED_FAILED_CHECKS} failed ${REFINED_CONCAVE_CELLS} concave"
+            echo "SERIAL_CHECK=${FINAL_RESULT} ${FINAL_FAILED_CHECKS} failed ${FINAL_CONCAVE_CELLS} concave"
+            echo "FINAL_COMPARISON=${FINAL_COMPARISON}"
+          } > "${EVIDENCE}/comparison.txt"
+
+          finish
+          MESH_DIAGNOSTIC
+          if ! bash -n "$script"; then
+              echo "the diagnostic script does not parse" >&2
+              {
+                echo "DIAG_RESULT=INCONCLUSIVE_INTERNAL_ERROR"
+                echo "DIAG_REASON=the diagnostic script does not parse"
+              } > "${DIAG_DIR}/evidence/result.env"
+              exit 0
+          fi
+          bash "$script" || echo "the diagnostic script ended with status $?" >&2
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # 3. The package. Only the selected evidence reaches the upload. A log
+      #    above 1 MiB is left out, never cut. An archive above 45 MiB is not
+      #    uploaded: the upload then holds a reason and an inventory only, and
+      #    the result is INCONCLUSIVE_OUTPUT_LIMIT.
+      # ---------------------------------------------------------------------
+      - name: Package the diagnostic evidence
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          dir="${DIAG_DIR:-${RUNNER_TEMP}/m3-mesh-diagnostic}"
+          evidence="${dir}/evidence"
+          upload="${dir}/upload"
+          archive_name="m3-mesh-diagnostic-evidence.tar.gz"
+          archive_limit=47185920
+          log_limit=1048576
+          rm -rf -- "$upload" "${dir}/reduced"
+          mkdir -p "$upload" "$evidence" "${dir}/excluded"
+          result="${evidence}/result.env"
+          if [[ ! -f "$result" ]]; then
+              printf 'DIAG_RESULT=INCONCLUSIVE_DIAGNOSTIC_NOT_STARTED\nDIAG_REASON=no result file was written\n' > "$result"
+          fi
+          [[ -f "${evidence}/excluded.tsv" ]] || printf 'path\tbytes\tsha256\treason\n' > "${evidence}/excluded.tsv"
+
+          value() {
+              awk -v key="$1" 'index($0, key "=") == 1 { v = substr($0, length(key) + 2) } END { print v }' "$result"
+          }
+          # set_value <key> <value> - replace or add one line of the result file.
+          set_value() {
+              awk -v key="$1" -v value="$2" '
+                  index($0, key "=") == 1 { if (!done) print key "=" value; done = 1; next }
+                  { print }
+                  END { if (!done) print key "=" value }' "$result" > "${result}.tmp"
+              mv -f -- "${result}.tmp" "$result"
+          }
+          # output_limit <reason> - make the output limit explicit. A conclusive
+          # result cannot stand without its evidence.
+          output_limit() {
+              local prior
+              prior="$(value DIAG_RESULT)"
+              if [[ "$prior" != INCONCLUSIVE_OUTPUT_LIMIT ]]; then
+                  set_value DIAG_PRIOR_RESULT "$prior"
+              fi
+              set_value DIAG_RESULT INCONCLUSIVE_OUTPUT_LIMIT
+              set_value DIAG_REASON "$1"
+          }
+
+          # Every log above the limit leaves the evidence here too.
+          while IFS= read -r -d '' file; do
+              printf '%s\t%s\t%s\t%s\n' "${file#"${evidence}/"}" "$(stat -c %s -- "$file")" \
+                  "$(sha256sum < "$file" | cut -d' ' -f1)" "the log is above ${log_limit} bytes" \
+                  >> "${evidence}/excluded.tsv"
+              mv -f -- "$file" "${dir}/excluded/"
+          done < <(find "$evidence" -type f -name '*.log' -size +"${log_limit}"c -print0 2>/dev/null)
+          if [[ "$(value DIAG_RESULT)" != INCONCLUSIVE_* ]] \
+             && (( $(wc -l < "${evidence}/excluded.tsv") > 1 )); then
+              output_limit "a required log is above ${log_limit} bytes"
+          fi
+          if [[ -n "${DIAG_CLOCK_START:-}" ]]; then
+              set_value DIAG_ELAPSED_AT_PACKAGE_SECONDS "$(( $(date +%s) - DIAG_CLOCK_START ))"
+          fi
+
+          # The inventory: every evidence file, and every excluded file.
+          write_inventory() {
+              {
+                printf 'kind\tbytes\tsha256\tpath\n'
+                find "$evidence" -type f ! -name inventory.txt -print0 | sort -z |
+                    while IFS= read -r -d '' file; do
+                        printf 'FILE\t%s\t%s\t%s\n' "$(stat -c %s -- "$file")" \
+                            "$(sha256sum < "$file" | cut -d' ' -f1)" "${file#"${evidence}/"}"
+                    done
+                tail -n +2 "${evidence}/excluded.tsv" |
+                    while IFS=$'\t' read -r path bytes sha reason; do
+                        printf 'EXCLUDED\t%s\t%s\t%s\t%s\n' "$bytes" "$sha" "$path" "$reason"
+                    done
+              } > "${evidence}/inventory.txt"
+          }
+          write_inventory
+
+          tar -czf "${upload}/${archive_name}" -C "$dir" evidence
+          bytes="$(stat -c %s -- "${upload}/${archive_name}")"
+          if (( bytes > archive_limit )); then
+              rm -f -- "${upload}/${archive_name}"
+              output_limit "the evidence archive has ${bytes} bytes, above ${archive_limit}; only the reason and the inventory are uploaded"
+              mkdir -p "${dir}/reduced/evidence"
+              cp -- "$result" "${evidence}/inventory.txt" "${dir}/reduced/evidence/"
+              printf 'The evidence archive had %s bytes, above the %s-byte limit.\n' "$bytes" "$archive_limit" \
+                  > "${dir}/reduced/evidence/reason.txt"
+              tar -czf "${upload}/${archive_name}" -C "${dir}/reduced" evidence
+          fi
+          cp -- "$result" "${upload}/result.env"
+          cp -- "${evidence}/inventory.txt" "${upload}/inventory.txt"
+          ls -l "$upload"
+          cat "${upload}/result.env"
+
+      - name: Write the diagnostic summary
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          dir="${DIAG_DIR:-${RUNNER_TEMP}/m3-mesh-diagnostic}"
+          result="${dir}/upload/result.env"
+          [[ -f "$result" ]] || result="${dir}/evidence/result.env"
+          value() {
+              local v=""
+              if [[ -f "$result" ]]; then
+                  v="$(awk -v key="$1" 'index($0, key "=") == 1 { v = substr($0, length(key) + 2) } END { print v }' "$result")"
+              fi
+              printf '%s' "${v:-UNAVAILABLE}"
+          }
+          archive="${dir}/upload/m3-mesh-diagnostic-evidence.tar.gz"
+          archive_bytes="$(stat -c %s -- "$archive" 2>/dev/null || echo UNAVAILABLE)"
+          {
+            echo "## OpenFOAM v2512 Case 7 mesh-phase diagnostic"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Result | \`$(value DIAG_RESULT)\` |"
+            echo "| Reason | $(value DIAG_REASON) |"
+            echo "| Prior result | \`$(value DIAG_PRIOR_RESULT)\` |"
+            echo "| Stop point | \`$(value DIAG_STOP_POINT)\` |"
+            echo "| Background check | \`$(value BACKGROUND_RESULT)\`, $(value BACKGROUND_FAILED_CHECKS) failed, $(value BACKGROUND_CONCAVE_CELLS) concave |"
+            echo "| Refined phase time | \`$(value REFINED_TIME)\` |"
+            echo "| Refined phase check | \`$(value REFINED_RESULT)\`, $(value REFINED_FAILED_CHECKS) failed, $(value REFINED_CONCAVE_CELLS) concave |"
+            echo "| Final serial check | \`$(value FINAL_RESULT)\`, $(value FINAL_FAILED_CHECKS) failed, $(value FINAL_CONCAVE_CELLS) concave |"
+            echo "| Final comparison | \`$(value FINAL_COMPARISON)\` |"
+            echo "| Active elapsed seconds | $(value DIAG_ACTIVE_ELAPSED_SECONDS) |"
+            echo "| Elapsed seconds at package | $(value DIAG_ELAPSED_AT_PACKAGE_SECONDS) |"
+            echo "| Archive bytes | ${archive_bytes} |"
+            echo
+            echo "A green job does not select a result class. The Architect reviews this evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the diagnostic evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-mesh-diagnostic-evidence
+          # Only the package: one archive, the result, and the inventory. The
+          # archive holds no mesh, solver field, VTU, source archive, or
+          # exported set geometry.
+          path: ${{ runner.temp }}/m3-mesh-diagnostic/upload
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
