@@ -755,10 +755,17 @@ jobs:
           #
           # The scan keeps quoted attribute values intact, so a '>' inside a value
           # does not end a tag. A name counts only from a Name attribute with a
-          # single- or double-quoted value in a DataArray start tag inside a
-          # complete PointData or CellData element. The attributes of the tag are
-          # read in order, so Name text inside the quoted value of another
-          # attribute is not a Name attribute. An unquoted value, an attribute
+          # single- or double-quoted value in a DataArray start tag that is a
+          # direct child of a complete PointData or CellData element. The scan
+          # keeps a stack of open elements: each end tag must close the element
+          # that is open on top, and a tag without a valid element name is not
+          # well formed. Either fault makes the header malformed. Without an
+          # appended-data marker, every element must be closed at the end of the
+          # file. With a marker, the elements that contain the marker, such as
+          # VTKFile, can stay open, but PointData and CellData must be closed.
+          # The attributes of the tag are read in order, so Name text inside the
+          # quoted value of another attribute is not a Name attribute. An
+          # unquoted value, an attribute
           # that is not well formed, or a second Name attribute gives no name.
           # An XML comment, a CDATA section, or a processing instruction is
           # skipped as one unit up to its own end ("-->", "]]>", or "?>"), so a
@@ -781,7 +788,7 @@ jobs:
                            -v require_end="$(( 1 - VTU_MARKER_FOUND ))" '
                   BEGIN {
                       off = 0; intag = 0; tag = ""; taglen = 0; tagoff = 0; quote = ""; skip = ""
-                      pd = 0; cd = 0; seen_pd = 0; seen_cd = 0; saw_end = 0; bad = 0
+                      pd = 0; cd = 0; seen_pd = 0; seen_cd = 0; saw_end = 0; bad = 0; depth = 0
                       used = 0; limit_hit = 0
                   }
                   function tag_name(s) {
@@ -825,7 +832,7 @@ jobs:
                       printf "%s%s\n", header, t > tag_file
                       used += size
                   }
-                  function handle(t, o,    second, kind, name, selfclose, ctx, value) {
+                  function handle(t, o,    second, kind, name, selfclose, ctx, value, parent) {
                       second = substr(t, 2, 1)
                       selfclose = 0
                       if (second == "/") {
@@ -833,6 +840,14 @@ jobs:
                       } else {
                           kind = "start"; name = tag_name(substr(t, 2))
                           selfclose = (t ~ /\/[ \t\r\n]*>$/)
+                      }
+                      if (name == "") { bad = 1; return }
+                      parent = (depth > 0 ? open_element[depth] : "")
+                      if (kind == "end") {
+                          if (parent != name) { bad = 1; return }
+                          depth--
+                      } else if (!selfclose) {
+                          open_element[++depth] = name
                       }
                       if (name == "VTKFile" && kind == "end") saw_end = 1
                       if (name == "PointData" || name == "CellData") {
@@ -842,15 +857,15 @@ jobs:
                               if (name == "PointData") seen_pd = 1; else seen_cd = 1
                               if (!selfclose) { if (name == "PointData") pd = 1; else cd = 1 }
                           } else {
-                              if ((name == "PointData" && !pd) || (name == "CellData" && !cd)) bad = 1
                               pd = 0; cd = 0
                           }
-                      } else if (name == "DataArray" && kind == "start" && (pd || cd)) {
-                          ctx = pd ? "PointData" : "CellData"
+                      } else if (name == "DataArray" && kind == "start" &&
+                                 (parent == "PointData" || parent == "CellData")) {
+                          ctx = parent
                           record(t, o, "DataArray", ctx)
                           value = name_attr(t)
                           if (name_found) {
-                              print (pd ? "POINT" : "CELL") "\t" value
+                              print (ctx == "PointData" ? "POINT" : "CELL") "\t" value
                           } else {
                               print "UNNAMED\t" ctx
                           }
@@ -888,7 +903,8 @@ jobs:
                       off += n
                   }
                   END {
-                      if (intag || skip != "" || pd || cd || bad || (require_end && !saw_end)) exit 2
+                      if (intag || skip != "" || pd || cd || bad) exit 2
+                      if (require_end && (!saw_end || depth > 0)) exit 2
                       print "POINTDATA_SEEN\t" seen_pd
                       print "CELLDATA_SEEN\t" seen_cd
                       print "OUTPUT_LIMIT\t" limit_hit

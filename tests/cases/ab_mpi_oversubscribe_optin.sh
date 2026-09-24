@@ -34,7 +34,9 @@
 # verdict fails closed on changed controls, missing final records, and a stale
 # or wrong solver marker. S27 covers PR #89 review 5299046150: text inside an
 # XML comment, a CDATA section, or a processing instruction is not markup, and
-# an unterminated comment or a document type declaration gives no names.
+# an unterminated comment or a document type declaration gives no names. S28
+# covers PR #89 review 5299460078: an unclosed or mismatched element gives no
+# names, and only a direct DataArray child of PointData or CellData counts.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -2068,6 +2070,98 @@ s27_vtu_comment_text_is_not_markup() {
         "S27: a source mismatch alone keeps a complete capture"
 }
 
+# ---- S28: element nesting inside the header (review 5299460078) ------------
+
+s28_vtu_unclosed_or_mismatched_elements_are_not_evidence() {
+    local workspace evidence vtk file checked
+    workspace="$(new_workspace s28_vtu_nesting)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+
+    # The review input: the first DataArray inside PointData never closes.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="U"><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_23_review.vtu"
+    # The valid control: paired DataArray elements with content.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="U" format="ascii">1 2 3</DataArray><DataArray Name="p" format="ascii">4</DataArray></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_24_paired.vtu"
+    # A DataArray closed by an end tag with another name.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="U" format="ascii">1</DataArrayX><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_25_mismatch.vtu"
+    # Another child element inside PointData that never closes.
+    printf '%s\n' '<VTKFile><Piece><PointData><InformationKey name="k"><DataArray Name="U"/><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_26_other_child.vtu"
+    # Well-formed XML, but the U DataArray is inside another DataArray, so it is
+    # not a PointData array.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="p" format="ascii"><DataArray Name="U"/></DataArray></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_27_nested.vtu"
+    # An unclosed DataArray in an appended-data file.
+    ab_vtu_appended "${vtk}/flow_latest_28_appended_unclosed.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="U">\n<DataArray Name="p"/>\n</PointData>')"
+    # Complete PointData, but an unclosed DataArray inside CellData.
+    ab_vtu_appended "${vtk}/flow_latest_29_celldata_unclosed.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</PointData>')" \
+        "$(printf '<CellData>\n<DataArray Name="c">\n</CellData>')"
+    # Complete PointData, but the Piece element never closes.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="U"/><DataArray Name="p"/></PointData></VTKFile>' \
+        > "${vtk}/flow_latest_30_piece_unclosed.vtu"
+    # A complete VTKFile element inside an outer element that never closes.
+    printf '%s\n' '<Outer><VTKFile><Piece><PointData><DataArray Name="U"/><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_31_outer_unclosed.vtu"
+    # A raw '<' in element text starts no valid element name, although the text
+    # after it looks like a self-closing tag.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="p" format="ascii">1 < 2/></DataArray><DataArray Name="U"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_32_raw_lt.vtu"
+
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+
+    for file in case_7/vtk/flow_latest_23_review.vtu case_7/vtk/flow_latest_25_mismatch.vtu \
+            case_7/vtk/flow_latest_26_other_child.vtu case_7/vtk/flow_latest_28_appended_unclosed.vtu \
+            case_7/vtk/flow_latest_29_celldata_unclosed.vtu case_7/vtk/flow_latest_30_piece_unclosed.vtu \
+            case_7/vtk/flow_latest_31_outer_unclosed.vtu case_7/vtk/flow_latest_32_raw_lt.vtu; do
+        assert_eq "PARSER_FAILURE" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S28: ${file}: an unclosed or mismatched element is not evidence"
+        assert_eq "UNAVAILABLE" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S28: ${file}: no name is reported"
+        assert_eq "UNAVAILABLE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+            "S28: ${file}: the tag evidence is not complete"
+        assert_eq "PARSER_FAILURE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE_REASON)" \
+            "S28: ${file}: the tag evidence names the parser failure"
+    done
+    file=case_7/vtk/flow_latest_24_paired.vtu
+    assert_eq "MATCH" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+        "S28: paired DataArray elements are MATCH"
+    assert_eq "U p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+        "S28: the paired names are observed"
+    assert_eq "COMPLETE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+        "S28: the paired tag evidence is complete"
+    file=case_7/vtk/flow_latest_27_nested.vtu
+    assert_eq "MISSING_REQUIRED_FIELDS" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+        "S28: a DataArray inside another DataArray is not a PointData field"
+    assert_eq "p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+        "S28: only the direct PointData child is observed"
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S28: every retained tag equals its source bytes"
+    assert_not_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S28: the aggregate VTU evidence is not PRESENT"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S28: a malformed header gives an incomplete capture"
+
+    # The review input alone: nothing is PRESENT or COMPLETE.
+    workspace="$(new_workspace s28_review_only)"
+    ab_capture_fixture "$workspace"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_100.vtu"
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="U"><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_23_review.vtu"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+    assert_not_contains "$(cat "${workspace}/runner_temp/evidence/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S28: the review input alone is not PRESENT VTU evidence"
+    assert_ne "COMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S28: the review input alone gives no complete required-field verdict"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S28: the review input alone gives an incomplete capture"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -2113,6 +2207,7 @@ AB_OBSERVATIONS=(
     s25_vtu_name_text_inside_a_value_is_not_a_name
     s26_convergence_verdict_fails_closed
     s27_vtu_comment_text_is_not_markup
+    s28_vtu_unclosed_or_mismatched_elements_are_not_evidence
 )
 
 # One observation runs in this process when the caller names it. The scenario
