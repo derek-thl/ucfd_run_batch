@@ -2402,6 +2402,8 @@ case "$name" in
             snapped) phase Refined 1; phase Snapped 2 ;;
             constant) phase Refined constant ;;
             inconsistent) echo "Refined mesh : cells:1175333"; echo "Writing mesh to time 1"; phase_dirs 2 ;;
+            extra_rank7) phase Refined 1; mkdir -p processor7/2/polyMesh; : > processor7/2/polyMesh/owner ;;
+            extra_processor) phase Refined 1; mkdir -p processor8/1/polyMesh; : > processor8/1/polyMesh/owner ;;
         esac
         echo "Finished meshing without any errors"
         echo "End" ;;
@@ -2597,6 +2599,16 @@ ab_diag_run() {
     printf 'status=%s elapsed=%s package=%s summary=%s\n' "$status" "$elapsed" "$package" "$summary"
 }
 
+# ab_diag_step_timeout <step-name> - the timeout-minutes value of one step of
+# the diagnostic workflow, or nothing.
+ab_diag_step_timeout() {
+    awk -v want="      - name: $1" '
+        $0 == want { found = 1; next }
+        found && /^      - name: / { exit }
+        found && /^        timeout-minutes: [0-9]+[[:space:]]*$/ { print $2; exit }
+    ' "$DIAG_WORKFLOW"
+}
+
 # ab_diag_dir <workspace> - the diagnostic directory on the fake runner.
 ab_diag_dir() {
     printf '%s\n' "${1}/runner_temp/m3-mesh-diagnostic"
@@ -2649,9 +2661,39 @@ s30_diagnostic_workflow_interface() {
         bash "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S30: the clock step must succeed"
     assert_eq "/usr/lib/openfoam" "$(ab_file_value "${workspace}/github_env" OPENFOAM_ROOT)" \
         "S30: the clock step names the installed OpenFOAM root"
-    assert_eq "900" "$(( $(ab_file_value "${workspace}/github_env" DIAG_ACTIVE_DEADLINE) - \
-                         $(ab_file_value "${workspace}/github_env" DIAG_CLOCK_START) ))" \
-        "S30: the active-work deadline is 15 minutes after the clock start"
+    # The time reserve (PR #91 review 5303287747). The contract needs at least
+    # 3 minutes for summary and upload and a 2-minute job margin after the
+    # active work.
+    local window job step minutes total=0 later=0 report=0 diag=0
+    window=$(( $(ab_file_value "${workspace}/github_env" DIAG_ACTIVE_DEADLINE) - \
+               $(ab_file_value "${workspace}/github_env" DIAG_CLOCK_START) ))
+    job="$(awk '/^    timeout-minutes: [0-9]+[[:space:]]*$/ { print $2; exit }' "$DIAG_WORKFLOW")"
+    assert_eq "20" "$job" "S30: the job limit is 20 minutes"
+    for step in "Start the diagnostic clock" "Check out the repository" "Run the mesh diagnostic" \
+                "Package the diagnostic evidence" "Write the diagnostic summary" "Upload the diagnostic evidence"; do
+        minutes="$(ab_diag_step_timeout "$step")"
+        [[ "$minutes" =~ ^[0-9]+$ ]] || { _fail "S30: the step '${step}' must have a timeout"; minutes=0; }
+        total=$(( total + minutes ))
+        case "$step" in
+            "Run the mesh diagnostic") diag="$minutes" ;;
+            "Package the diagnostic evidence") later=$(( later + minutes )) ;;
+            "Write the diagnostic summary"|"Upload the diagnostic evidence")
+                later=$(( later + minutes )); report=$(( report + minutes )) ;;
+        esac
+    done
+    (( window <= 900 )) ||
+        _fail "S30: the active work must end at most 15 minutes after the clock start" "window: ${window} s"
+    (( window <= diag * 60 )) ||
+        _fail "S30: the diagnostic step guard must not stop the work before the active-work deadline" \
+              "window: ${window} s, guard: ${diag} min"
+    (( report >= 3 )) ||
+        _fail "S30: the summary and upload steps must have at least 3 minutes" "minutes: ${report}"
+    (( window + later * 60 + 120 <= job * 60 )) ||
+        _fail "S30: the active work and the later steps must leave a 2-minute job margin" \
+              "window: ${window} s, later steps: ${later} min, job: ${job} min"
+    (( total + 2 <= job )) ||
+        _fail "S30: all step timeouts together must leave a 2-minute job margin" \
+              "steps: ${total} min, job: ${job} min"
     assert_eq "${workspace}/runner_temp/m3-mesh-diagnostic" "$(ab_file_value "${workspace}/github_env" DIAG_DIR)" \
         "S30: the diagnostic directory is runner-temporary"
 }
@@ -2942,7 +2984,9 @@ s35_diagnostic_version_and_help_gates() {
 
 s36_diagnostic_phase_map_must_be_complete() {
     local workspace mode
-    for mode in duplicate unlabelled constant inconsistent; do
+    # extra_rank7 and extra_processor cover PR #91 review 5303287747: every
+    # processor directory counts, not only processor0.
+    for mode in duplicate unlabelled constant inconsistent extra_rank7 extra_processor; do
         workspace="$(new_workspace "s36_${mode}")"
         ab_diag_fixture "$workspace"
         ab_diag_run "$workspace" FAKE_SNAPPY="$mode" > /dev/null
