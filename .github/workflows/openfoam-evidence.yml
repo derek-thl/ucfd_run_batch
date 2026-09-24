@@ -742,7 +742,8 @@ jobs:
           }
 
           # vtu_scan_header <source-file> <tag-file> <limit> - scan the header of one
-          # VTU file. Prints one record for each line:
+          # VTU file. After a complete scan (status 0) only, prints one record for
+          # each line:
           #   POINT<TAB>name  CELL<TAB>name  UNNAMED<TAB>PointData|CellData
           #   POINTDATA_SEEN<TAB>0|1  CELLDATA_SEEN<TAB>0|1  OUTPUT_LIMIT<TAB>0|1
           # and appends each PointData, CellData, and enclosed DataArray start tag,
@@ -763,10 +764,16 @@ jobs:
           # appended-data marker, every element must be closed at the end of the
           # file. With a marker, the elements that contain the marker, such as
           # VTKFile, can stay open, but PointData and CellData must be closed.
-          # The attributes of the tag are read in order, so Name text inside the
-          # quoted value of another attribute is not a Name attribute. An
-          # unquoted value, an attribute
-          # that is not well formed, or a second Name attribute gives no name.
+          # Each start and end tag must have complete XML tag syntax, or the header
+          # is malformed. A start tag holds a valid element name, then attributes
+          # that each follow white space, each with a valid name, '=', and a
+          # single- or double-quoted value, and then an optional space and '>' or
+          # '/>'. A value holds no '<', each '&' in it starts a reference, and no
+          # attribute name repeats. An end tag holds only the name and optional
+          # white space. The attributes are read in order, so Name text inside the
+          # quoted value of another attribute is not a Name attribute. References
+          # are not expanded. The original bytes of a PointData, CellData, or
+          # DataArray tag are kept, also when the tag is rejected.
           # An XML comment, a CDATA section, or a processing instruction is
           # skipped as one unit up to its own end ("-->", "]]>", or "?>"), so a
           # '>' or an apparent tag inside it is not markup. If one of them does
@@ -795,33 +802,37 @@ jobs:
                       if (match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return substr(s, 1, RLENGTH)
                       return ""
                   }
-                  # name_attr(t) - the Name attribute value of start tag t. Sets
-                  # name_found to 1 only for one well-formed quoted Name attribute.
-                  function name_attr(t,    s, sep, an, q, j, value) {
-                      name_found = 0; value = ""
+                  # tag_syntax_ok(t, kind) - 1 when t is a complete, well-formed start
+                  # or end tag. For a start tag, it also fills tag_attr with the
+                  # attribute values.
+                  function tag_syntax_ok(t, kind,    s, sep, an, q, j, v) {
+                      split("", tag_attr)
+                      if (kind == "end") return (t ~ /^<\/[A-Za-z_:][-A-Za-z0-9_:.]*[ \t\r\n]*>$/)
                       s = substr(t, 2)
-                      if (!match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return ""
+                      if (!match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return 0
                       s = substr(s, RLENGTH + 1)
                       while (1) {
                           sep = match(s, /^[ \t\r\n]+/)
                           if (sep) s = substr(s, RLENGTH + 1)
-                          if (s == ">" || s == "/>") return value
-                          if (!sep || !match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) break
+                          if (s == ">" || s == "/>") return 1
+                          if (!sep || !match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return 0
                           an = substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1)
-                          if (!match(s, /^[ \t\r\n]*=[ \t\r\n]*/)) break
+                          if (an in tag_attr) return 0
+                          if (!match(s, /^[ \t\r\n]*=[ \t\r\n]*/)) return 0
                           s = substr(s, RLENGTH + 1)
                           q = substr(s, 1, 1)
-                          if (q != "\"" && q != sq) break
+                          if (q != "\"" && q != sq) return 0
                           s = substr(s, 2); j = index(s, q)
-                          if (j == 0) break
-                          if (an == "Name") {
-                              if (name_found) break
-                              name_found = 1; value = substr(s, 1, j - 1)
-                          }
-                          s = substr(s, j + 1)
+                          if (j == 0) return 0
+                          v = substr(s, 1, j - 1); s = substr(s, j + 1)
+                          if (index(v, "<") || !references_ok(v)) return 0
+                          tag_attr[an] = v
                       }
-                      name_found = 0
-                      return ""
+                  }
+                  # references_ok(v) - 1 when each ampersand in v starts a reference.
+                  function references_ok(v) {
+                      gsub(/&([A-Za-z_:][-A-Za-z0-9_:.]*|#[0-9]+|#x[0-9A-Fa-f]+);/, "", v)
+                      return (index(v, "&") == 0)
                   }
                   function record(t, o, element, context,    header, size) {
                       header = "TAG offset=" o " bytes=" length(t) " element=" element \
@@ -832,17 +843,21 @@ jobs:
                       printf "%s%s\n", header, t > tag_file
                       used += size
                   }
-                  function handle(t, o,    second, kind, name, selfclose, ctx, value, parent) {
+                  function handle(t, o,    second, kind, name, selfclose, parent, evidence) {
                       second = substr(t, 2, 1)
-                      selfclose = 0
                       if (second == "/") {
                           kind = "end"; name = tag_name(substr(t, 3))
                       } else {
                           kind = "start"; name = tag_name(substr(t, 2))
-                          selfclose = (t ~ /\/[ \t\r\n]*>$/)
                       }
                       if (name == "") { bad = 1; return }
                       parent = (depth > 0 ? open_element[depth] : "")
+                      evidence = (kind == "start" && name == "DataArray" &&
+                                  (parent == "PointData" || parent == "CellData"))
+                      if (name == "PointData" || name == "CellData") record(t, o, name, "-")
+                      else if (evidence) record(t, o, "DataArray", parent)
+                      if (!tag_syntax_ok(t, kind)) { bad = 1; return }
+                      selfclose = (kind == "start" && t ~ /\/>$/)
                       if (kind == "end") {
                           if (parent != name) { bad = 1; return }
                           depth--
@@ -851,7 +866,6 @@ jobs:
                       }
                       if (name == "VTKFile" && kind == "end") saw_end = 1
                       if (name == "PointData" || name == "CellData") {
-                          record(t, o, name, "-")
                           if (kind == "start") {
                               if (pd || cd) bad = 1
                               if (name == "PointData") seen_pd = 1; else seen_cd = 1
@@ -859,15 +873,11 @@ jobs:
                           } else {
                               pd = 0; cd = 0
                           }
-                      } else if (name == "DataArray" && kind == "start" &&
-                                 (parent == "PointData" || parent == "CellData")) {
-                          ctx = parent
-                          record(t, o, "DataArray", ctx)
-                          value = name_attr(t)
-                          if (name_found) {
-                              print (ctx == "PointData" ? "POINT" : "CELL") "\t" value
+                      } else if (evidence) {
+                          if ("Name" in tag_attr) {
+                              names = names (parent == "PointData" ? "POINT" : "CELL") "\t" tag_attr["Name"] "\n"
                           } else {
-                              print "UNNAMED\t" ctx
+                              names = names "UNNAMED\t" parent "\n"
                           }
                       }
                   }
@@ -905,6 +915,7 @@ jobs:
                   END {
                       if (intag || skip != "" || pd || cd || bad) exit 2
                       if (require_end && (!saw_end || depth > 0)) exit 2
+                      printf "%s", names
                       print "POINTDATA_SEEN\t" seen_pd
                       print "CELLDATA_SEEN\t" seen_cd
                       print "OUTPUT_LIMIT\t" limit_hit
@@ -1517,7 +1528,7 @@ jobs:
                                   reason="the VTU file cannot be read"
                               fi
                               ;;
-                          2) vtu_result=PARSER_FAILURE; reason="the VTU header is incomplete" ;;
+                          2) vtu_result=PARSER_FAILURE; reason="the VTU header is incomplete or malformed" ;;
                           124|137)
                               vtu_result=TIMEOUT
                               reason="the PointData parse did not complete within the capture work limit"

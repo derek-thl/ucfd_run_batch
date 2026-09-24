@@ -36,7 +36,9 @@
 # XML comment, a CDATA section, or a processing instruction is not markup, and
 # an unterminated comment or a document type declaration gives no names. S28
 # covers PR #89 review 5299460078: an unclosed or mismatched element gives no
-# names, and only a direct DataArray child of PointData or CellData counts.
+# names, and only a direct DataArray child of PointData or CellData counts. S29
+# covers PR #89 review 5300443151: a start or end tag with invalid syntax gives
+# no names, and the original bytes of a rejected evidence tag are kept.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -1366,7 +1368,8 @@ s18_vtu_required_field_verdicts_and_original_tags() {
     # Single and double quotes, and one start tag across two lines.
     ab_vtu_appended "${vtk}/flow_latest_02_quotes.vtu" \
         "$(printf "<PointData Scalars='p'>\n<DataArray type='Float32' Name='U' format='appended'/>\n<DataArray type=\"Float32\"\n    Name=\"p\" format=\"appended\"/>\n</PointData>")"
-    # An unquoted Name attribute is not evidence.
+    # An unquoted Name attribute is not evidence. The tag syntax is invalid, so
+    # the header is malformed (review 5300443151).
     printf '<VTKFile>\n<Piece>\n<PointData>\n<DataArray type="Float32" Name=U format="ascii">1 2 3</DataArray>\n<DataArray type="Float32" Name="p" format="ascii">1</DataArray>\n</PointData>\n</Piece>\n</VTKFile>\n' \
         > "${vtk}/flow_latest_03_unquoted.vtu"
     # An empty PointData element.
@@ -1414,12 +1417,12 @@ s18_vtu_required_field_verdicts_and_original_tags() {
     assert_eq "MATCH" \
         "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_02_quotes.vtu VTU_REQUIRED_FIELDS_RESULT)" \
         "S18: single- and double-quoted names are MATCH"
-    assert_eq "MISSING_REQUIRED_FIELDS" \
+    assert_eq "PARSER_FAILURE" \
         "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_03_unquoted.vtu VTU_REQUIRED_FIELDS_RESULT)" \
-        "S18: an unquoted Name attribute does not count"
-    assert_eq "p" \
+        "S18: an unquoted Name attribute does not count, and the header is malformed"
+    assert_eq "UNAVAILABLE" \
         "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_03_unquoted.vtu VTU_OBSERVED_FIELDS)" \
-        "S18: only the quoted name is observed"
+        "S18: no name is observed from a malformed header"
     assert_eq "MISSING_REQUIRED_FIELDS" \
         "$(ab_vtu_result "$workspace" case_7/vtk/flow_latest_04_empty.vtu VTU_REQUIRED_FIELDS_RESULT)" \
         "S18: empty observed names are MISSING_REQUIRED_FIELDS"
@@ -1457,9 +1460,14 @@ s18_vtu_required_field_verdicts_and_original_tags() {
     # A parser failure is a capture error; a source mismatch is not.
     assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
         "S18: a parser failure gives an incomplete capture"
+    # Two files are malformed. The capture reason names the first note, and the
+    # notes list both files.
     assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" \
-        "VTU PointData parse case_7/vtk/flow_latest_09_malformed.vtu" \
+        "VTU PointData parse case_7/vtk/flow_latest_03_unquoted.vtu: the VTU header is incomplete or malformed" \
         "S18: the capture reason names the parser failure"
+    assert_contains "$(cat "${evidence}/capture-work-notes.txt")" \
+        "VTU PointData parse case_7/vtk/flow_latest_09_malformed.vtu" \
+        "S18: the capture notes name the malformed file"
     assert_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PARTIAL" \
         "S18: the aggregate VTU evidence is not PRESENT"
     assert_eq "INCOMPLETE" \
@@ -1835,20 +1843,15 @@ s25_vtu_name_text_inside_a_value_is_not_a_name() {
     # character, with spaces around '=' and a tab before the attribute.
     ab_vtu_appended "${vtk}/flow_latest_13_after_text.vtu" \
         "$(printf "<PointData>\n<DataArray Note='a > Name=\"x\"' Name = \"U\"/>\n<DataArray\tName='p'/>\n</PointData>")"
-    # Two Name attributes in one tag are not well formed, so no name counts.
-    ab_vtu_appended "${vtk}/flow_latest_14_two_names.vtu" \
-        "$(printf '<PointData>\n<DataArray Name="U" Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
-    # A quoted Name after an unquoted attribute value does not count.
-    ab_vtu_appended "${vtk}/flow_latest_15_unquoted_first.vtu" \
-        "$(printf '<PointData>\n<DataArray format=ascii Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
+    # S29 holds the invalid-syntax cases: two Name attributes, and a Name after
+    # an unquoted value.
 
     ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
 
-    for file in case_7/vtk/flow_latest_11_text_single.vtu case_7/vtk/flow_latest_12_text_double.vtu \
-            case_7/vtk/flow_latest_14_two_names.vtu case_7/vtk/flow_latest_15_unquoted_first.vtu; do
+    for file in case_7/vtk/flow_latest_11_text_single.vtu case_7/vtk/flow_latest_12_text_double.vtu; do
         assert_eq "MISSING_REQUIRED_FIELDS" \
             "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
-            "S25: ${file}: a Name outside a well-formed attribute list is not a field"
+            "S25: ${file}: Name text inside another attribute value is not a field"
         assert_eq "p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
             "S25: ${file}: only the real Name attribute is observed"
         assert_eq "U" "$(ab_vtu_result "$workspace" "$file" VTU_MISSING_REQUIRED_FIELDS)" \
@@ -2162,6 +2165,103 @@ s28_vtu_unclosed_or_mismatched_elements_are_not_evidence() {
         "S28: the review input alone gives an incomplete capture"
 }
 
+# ---- S29: complete tag syntax (review 5300443151) ---------------------------
+
+# ab_vtu_finite <file> <PointData-text> - a finite ASCII VTU file with one Piece.
+ab_vtu_finite() {
+    printf '<VTKFile type="UnstructuredGrid">\n<Piece NumberOfPoints="1">\n%s\n</Piece>\n</VTKFile>\n' \
+        "$2" > "$1"
+}
+
+s29_vtu_invalid_tag_syntax_is_not_evidence() {
+    local workspace evidence vtk file checked scan status
+    workspace="$(new_workspace s29_vtu_tag_syntax)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+    local u='<DataArray Name="U"/>' p='<DataArray Name="p"/>'
+
+    # The two review inputs.
+    ab_vtu_finite "${vtk}/flow_latest_33_bad_start.vtu" "<PointData bogus>${u}${p}</PointData>"
+    ab_vtu_finite "${vtk}/flow_latest_34_bad_end.vtu" "<PointData>${u}${p}</PointData bogus>"
+    # The valid control: attributes with both quotes, spaces around '=' and
+    # before '>' and '/>', a tab and a line end between attributes, references,
+    # and a '>' inside a value.
+    ab_vtu_finite "${vtk}/flow_latest_35_valid.vtu" \
+        "$(printf '<PointData Scalars="p" Vectors = '"'"'U'"'"' >\n<DataArray type="Float32"\tName="U"\n  NumberOfComponents="3" format="ascii" Note="a &amp; b &#62; &#x3E; c > d">1 2 3</DataArray >\n<DataArray Name='"'"'p'"'"' />\n</PointData >')"
+    # Two Name attributes (from S25), and any other repeated attribute.
+    ab_vtu_finite "${vtk}/flow_latest_14_two_names.vtu" "<PointData><DataArray Name=\"U\" Name=\"U\"/>${p}</PointData>"
+    ab_vtu_finite "${vtk}/flow_latest_36_repeated.vtu" "<PointData>${u}<DataArray type=\"a\" type=\"b\" Name=\"p\"/></PointData>"
+    # A quoted Name after an unquoted value (from S25).
+    ab_vtu_finite "${vtk}/flow_latest_15_unquoted_first.vtu" "<PointData><DataArray format=ascii Name=\"U\"/>${p}</PointData>"
+    # An attribute without a value inside a DataArray tag.
+    ab_vtu_finite "${vtk}/flow_latest_37_bad_dataarray.vtu" "<PointData><DataArray Name=\"U\" bogus/>${p}</PointData>"
+    # Invalid syntax in a tag outside PointData.
+    printf '%s\n' "<VTKFile><Piece NumberOfPoints=1><PointData>${u}${p}</PointData></Piece></VTKFile>" \
+        > "${vtk}/flow_latest_38_bad_piece_start.vtu"
+    printf '%s\n' "<VTKFile><Piece><PointData>${u}${p}</PointData></Piece bogus></VTKFile>" \
+        > "${vtk}/flow_latest_39_bad_piece_end.vtu"
+    # A '<' inside a value, a '&' that starts no reference, a space inside
+    # '/>', and no space between two attributes.
+    ab_vtu_finite "${vtk}/flow_latest_40_lt_in_value.vtu" "<PointData><DataArray Name=\"U\" Note=\"a<b\"/>${p}</PointData>"
+    ab_vtu_finite "${vtk}/flow_latest_41_bad_reference.vtu" "<PointData><DataArray Name=\"U\" Note=\"a & b\"/>${p}</PointData>"
+    ab_vtu_finite "${vtk}/flow_latest_42_slash_space.vtu" "<PointData>${u}<DataArray Name=\"p\" / ></PointData>"
+    ab_vtu_finite "${vtk}/flow_latest_43_no_space.vtu" "<PointData><DataArray type=\"a\"Name=\"U\"/>${p}</PointData>"
+    # A self-closing end tag.
+    ab_vtu_finite "${vtk}/flow_latest_44_end_slash.vtu" "<PointData>${u}${p}</PointData/>"
+
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+
+    for file in 33_bad_start 34_bad_end 14_two_names 36_repeated 15_unquoted_first 37_bad_dataarray \
+            38_bad_piece_start 39_bad_piece_end 40_lt_in_value 41_bad_reference 42_slash_space \
+            43_no_space 44_end_slash; do
+        file="case_7/vtk/flow_latest_${file}.vtu"
+        assert_eq "PARSER_FAILURE" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S29: ${file}: invalid tag syntax is not evidence"
+        assert_eq "UNAVAILABLE" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S29: ${file}: no name is reported"
+        assert_eq "PARSER_FAILURE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE_REASON)" \
+            "S29: ${file}: the tag evidence names the parser failure"
+    done
+    file=case_7/vtk/flow_latest_35_valid.vtu
+    assert_eq "MATCH" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+        "S29: valid PointData and DataArray attributes are MATCH"
+    assert_eq "U p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+        "S29: the valid names are observed"
+    assert_eq "COMPLETE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+        "S29: the valid tag evidence is complete"
+    # The original bytes of a rejected evidence tag stay in the evidence.
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_33_bad_start.vtu)" \
+        "<PointData bogus>" "S29: the rejected start tag is kept as original evidence"
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_34_bad_end.vtu)" \
+        "</PointData bogus>" "S29: the rejected end tag is kept as original evidence"
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S29: every retained tag equals its source bytes"
+    assert_not_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S29: the aggregate VTU evidence is not PRESENT"
+    # A direct scan of a rejected header prints no name record, although the
+    # names come before the invalid end tag.
+    scan="$(EVIDENCE_DIR="$evidence" TMPDIR="${workspace}/tmp" bash "${workspace}/runner_temp/capture_work.sh" \
+            --vtu-scan "${vtk}/flow_latest_34_bad_end.vtu" "" 0)" && status=0 || status=$?
+    assert_eq "2" "$status" "S29: a direct scan of a rejected header ends with status 2"
+    assert_eq "" "$scan" "S29: a direct scan of a rejected header prints no name record"
+
+    # Each review input alone: nothing is PRESENT or COMPLETE.
+    for file in 33_bad_start 34_bad_end; do
+        workspace="$(new_workspace "s29_${file}_only")"
+        ab_capture_fixture "$workspace"
+        rm -f -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_100.vtu"
+        cp -- "${vtk}/flow_latest_${file}.vtu" "${workspace}/checkout/src/batch_9/case_7/vtk/"
+        ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+        assert_not_contains "$(cat "${workspace}/runner_temp/evidence/vtu-point-data.txt")" \
+            "VTU_EVIDENCE=PRESENT" "S29: ${file} alone is not PRESENT VTU evidence"
+        assert_ne "COMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+            "S29: ${file} alone gives no complete required-field verdict"
+        assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+            "S29: ${file} alone gives an incomplete capture"
+    done
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -2208,6 +2308,7 @@ AB_OBSERVATIONS=(
     s26_convergence_verdict_fails_closed
     s27_vtu_comment_text_is_not_markup
     s28_vtu_unclosed_or_mismatched_elements_are_not_evidence
+    s29_vtu_invalid_tag_syntax_is_not_evidence
 )
 
 # One observation runs in this process when the caller names it. The scenario
