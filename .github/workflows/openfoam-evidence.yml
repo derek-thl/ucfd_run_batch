@@ -683,46 +683,38 @@ jobs:
               esac
           }
 
-          vtu_header_point_data_names() {
-              # One linear streaming pass that stops at the appended-payload marker.
-              #
-              # Each dd call issues one read, so it returns the bytes that are
-              # available instead of waiting for a full block. Each chunk goes to a
-              # file, and only the new chunk and the last 12 bytes before it are
-              # searched for the marker, so the work for each chunk is constant. The
-              # loop ends as soon as the marker appears, and the text is then cut at
-              # the marker, so the parser input holds no appended-payload byte and
-              # the extraction never waits for payload that a producer has not
-              # released. Without a marker, the loop ends at end of file.
-              #
-              # Three earlier forms were wrong. A 65536-byte limit dropped a valid
-              # PointData declaration past that byte. Making the awk record separator
-              # the tag opening character ended the marker record only at the next
-              # such byte, so the parser could wait for, and hold, the complete
-              # payload. Appending each chunk to one shell string and searching the
-              # complete string again after each chunk made a file without a marker
-              # take time that grows with the square of its size.
-              #
-              # The reader keeps one temporary disk copy of the bytes that it read,
-              # and removes it before it returns. The parser reads that copy one
-              # line at a time and keeps no copy of it in memory. The scan is scoped to each PointData element, so a CellData element that
-              # shares one line with a PointData end tag contributes no name. The
-              # regular expressions use the string form, so no separator needs
-              # escaping.
-              #
-              # Status 0: a complete parse. The output is the names, and an empty
-              # line is a valid empty PointData result. Status 1: the file cannot be
-              # read. Status 2: the header is incomplete, so no name is reported.
-              local source_file="$1" work_dir marker_found=0 read_failed=0
-              local marker_offset parse_input
+          # ---- VTU header reader: begin ----
+          # vtu_read_header <source-file> <work-dir> - copy the header bytes of one
+          # VTU file to <work-dir>. Sets VTU_PARSE_INPUT and VTU_MARKER_FOUND.
+          #
+          # One linear streaming pass that stops at the appended-payload marker.
+          # Each dd call issues one read, so it returns the bytes that are available
+          # instead of waiting for a full block. Each chunk goes to a file, and only
+          # the new chunk and the last 12 bytes before it are searched for the
+          # marker, so the work for each chunk is constant. The loop ends as soon as
+          # the marker appears, and the text is then cut at the marker, so the parser
+          # input holds no appended-payload byte and the extraction never waits for
+          # payload that a producer has not released. Without a marker, the loop
+          # ends at end of file, and the complete finite file is the parser input.
+          #
+          # Three earlier forms were wrong. A 65536-byte limit dropped a valid
+          # PointData declaration past that byte. Making the awk record separator
+          # the tag opening character ended the marker record only at the next such
+          # byte, so the parser could wait for, and hold, the complete payload.
+          # Appending each chunk to one shell string and searching the complete
+          # string again after each chunk made a file without a marker take time
+          # that grows with the square of its size.
+          #
+          # Status 0: the header is ready. Status 1: the file cannot be read.
+          # Status 2: the marker position cannot be found.
+          vtu_read_header() {
+              local source_file="$1" work_dir="$2" read_failed=0 marker_offset
+              VTU_MARKER_FOUND=0
+              VTU_PARSE_INPUT="${work_dir}/header"
               [[ -e "$source_file" && -r "$source_file" && ! -d "$source_file" ]] || return 1
-              work_dir="$(mktemp -d "${TMPDIR:-/tmp}/vtu-header.XXXXXX")" || return 1
               : > "${work_dir}/header"
               : > "${work_dir}/tail"
-              if ! exec 3< "$source_file"; then
-                  rm -rf -- "$work_dir"
-                  return 1
-              fi
+              exec 3< "$source_file" || return 1
               while :; do
                   if ! dd bs=65536 count=1 status=none <&3 > "${work_dir}/chunk" 2>/dev/null; then
                       read_failed=1
@@ -732,83 +724,232 @@ jobs:
                   cat -- "${work_dir}/chunk" >> "${work_dir}/header"
                   cat -- "${work_dir}/tail" "${work_dir}/chunk" > "${work_dir}/window"
                   if LC_ALL=C grep -aqF '<AppendedData' -- "${work_dir}/window"; then
-                      marker_found=1
+                      VTU_MARKER_FOUND=1
                       break
                   fi
                   tail -c 12 -- "${work_dir}/window" > "${work_dir}/tail"
               done
               exec 3<&-
-              if (( read_failed )); then
-                  rm -rf -- "$work_dir"
-                  return 1
-              fi
-
-              parse_input="${work_dir}/header"
-              if (( marker_found )); then
+              (( read_failed == 0 )) || return 1
+              if (( VTU_MARKER_FOUND )); then
                   marker_offset="$(LC_ALL=C grep -abo -m 1 -F '<AppendedData' -- \
                                    "${work_dir}/header" | head -n 1 | cut -d: -f1 || true)"
-                  if [[ ! "$marker_offset" =~ ^[0-9]+$ ]]; then
-                      rm -rf -- "$work_dir"
-                      return 2
-                  fi
+                  [[ "$marker_offset" =~ ^[0-9]+$ ]] || return 2
                   head -c "$marker_offset" -- "${work_dir}/header" > "${work_dir}/parse"
-                  parse_input="${work_dir}/parse"
+                  VTU_PARSE_INPUT="${work_dir}/parse"
               fi
+              return 0
+          }
 
-              local parse_status=0
-              LC_ALL=C awk -v require_end="$(( 1 - marker_found ))" '
-                  BEGIN { state = 0; count = 0; names = ""; saw_end = 0 }
-                  {
-                      if (index($0, "</VTKFile")) saw_end = 1
-                      # A line end counts as a space, so a tag name at a line end
-                      # still ends at a separator.
-                      line = $0 " "
-                      while (line != "") {
-                          if (state == 0) {
-                              if (!match(line, "<PointData[ />]")) break
-                              line = substr(line, RSTART + 10)
-                              state = 1
-                          } else if (state == 1) {
-                              # The rest of the PointData start tag.
-                              if (!match(line, ">")) break
-                              if (RSTART > 1 && substr(line, RSTART - 1, 1) == "/") {
-                                  state = 0
-                              } else {
-                                  state = 2
-                              }
-                              line = substr(line, RSTART + 1)
+          # vtu_scan_header <source-file> <tag-file> <limit> - scan the header of one
+          # VTU file. After a complete scan (status 0) only, prints one record for
+          # each line:
+          #   POINT<TAB>name  CELL<TAB>name  UNNAMED<TAB>PointData|CellData
+          #   POINTDATA_SEEN<TAB>0|1  CELLDATA_SEEN<TAB>0|1  OUTPUT_LIMIT<TAB>0|1
+          # and appends each PointData, CellData, and enclosed DataArray start tag,
+          # and each PointData and CellData end tag, to <tag-file> as original bytes:
+          #   TAG offset=<zero-based byte offset> bytes=<n> element=<name> context=<name>
+          #   <the n original tag bytes>
+          # A record that does not fit in <limit> bytes is not written, and
+          # OUTPUT_LIMIT is then 1, so no tag is cut. <limit> 0 means no limit, and
+          # a negative <limit> writes no record. An empty <tag-file> writes nothing.
+          #
+          # The scan keeps quoted attribute values intact, so a '>' inside a value
+          # does not end a tag. A name counts only from a Name attribute with a
+          # single- or double-quoted value in a DataArray start tag that is a
+          # direct child of a complete PointData or CellData element. The scan
+          # keeps a stack of open elements: each end tag must close the element
+          # that is open on top, and a tag without a valid element name is not
+          # well formed. Either fault makes the header malformed. Without an
+          # appended-data marker, every element must be closed at the end of the
+          # file. With a marker, the elements that contain the marker, such as
+          # VTKFile, can stay open, but PointData and CellData must be closed.
+          # Each start and end tag must have complete XML tag syntax, or the header
+          # is malformed. A start tag holds a valid element name, then attributes
+          # that each follow white space, each with a valid name, '=', and a
+          # single- or double-quoted value, and then an optional space and '>' or
+          # '/>'. A value holds no '<', each '&' in it starts a reference, and no
+          # attribute name repeats. An end tag holds only the name and optional
+          # white space. The attributes are read in order, so Name text inside the
+          # quoted value of another attribute is not a Name attribute. References
+          # are not expanded. The original bytes of a PointData, CellData, or
+          # DataArray tag are kept, also when the tag is rejected.
+          # An XML comment, a CDATA section, or a processing instruction is
+          # skipped as one unit up to its own end ("-->", "]]>", or "?>"), so a
+          # '>' or an apparent tag inside it is not markup. If one of them does
+          # not end, the header is incomplete. Any other "<!" declaration, such as
+          # a document type declaration, is not read, and the header is then
+          # malformed. No element body and no appended-payload byte is kept.
+          #
+          # Status 0: a complete scan. Status 1: the file cannot be read. Status 2:
+          # the header is incomplete or malformed, so the names are not evidence.
+          vtu_scan_header() {
+              local source_file="$1" tag_file="$2" limit="$3" work_dir status=0
+              work_dir="$(mktemp -d "${TMPDIR:-/tmp}/vtu-header.XXXXXX")" || return 1
+              vtu_read_header "$source_file" "$work_dir" || status=$?
+              if (( status != 0 )); then
+                  rm -rf -- "$work_dir"
+                  return "$status"
+              fi
+              LC_ALL=C awk -v vtu_scan=1 -v sq="'" -v tag_file="$tag_file" -v limit="$limit" \
+                           -v require_end="$(( 1 - VTU_MARKER_FOUND ))" '
+                  BEGIN {
+                      off = 0; intag = 0; tag = ""; taglen = 0; tagoff = 0; quote = ""; skip = ""
+                      pd = 0; cd = 0; seen_pd = 0; seen_cd = 0; saw_end = 0; bad = 0; depth = 0
+                      used = 0; limit_hit = 0
+                  }
+                  function tag_name(s) {
+                      if (match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return substr(s, 1, RLENGTH)
+                      return ""
+                  }
+                  # tag_syntax_ok(t, kind) - 1 when t is a complete, well-formed start
+                  # or end tag. For a start tag, it also fills tag_attr with the
+                  # attribute values.
+                  function tag_syntax_ok(t, kind,    s, sep, an, q, j, v) {
+                      split("", tag_attr)
+                      if (kind == "end") return (t ~ /^<\/[A-Za-z_:][-A-Za-z0-9_:.]*[ \t\r\n]*>$/)
+                      s = substr(t, 2)
+                      if (!match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return 0
+                      s = substr(s, RLENGTH + 1)
+                      while (1) {
+                          sep = match(s, /^[ \t\r\n]+/)
+                          if (sep) s = substr(s, RLENGTH + 1)
+                          if (s == ">" || s == "/>") return 1
+                          if (!sep || !match(s, /^[A-Za-z_:][-A-Za-z0-9_:.]*/)) return 0
+                          an = substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1)
+                          if (an in tag_attr) return 0
+                          if (!match(s, /^[ \t\r\n]*=[ \t\r\n]*/)) return 0
+                          s = substr(s, RLENGTH + 1)
+                          q = substr(s, 1, 1)
+                          if (q != "\"" && q != sq) return 0
+                          s = substr(s, 2); j = index(s, q)
+                          if (j == 0) return 0
+                          v = substr(s, 1, j - 1); s = substr(s, j + 1)
+                          if (index(v, "<") || !references_ok(v)) return 0
+                          tag_attr[an] = v
+                      }
+                  }
+                  # references_ok(v) - 1 when each ampersand in v starts a reference.
+                  function references_ok(v) {
+                      gsub(/&([A-Za-z_:][-A-Za-z0-9_:.]*|#[0-9]+|#x[0-9A-Fa-f]+);/, "", v)
+                      return (index(v, "&") == 0)
+                  }
+                  function record(t, o, element, context,    header, size) {
+                      header = "TAG offset=" o " bytes=" length(t) " element=" element \
+                               " context=" context "\n"
+                      size = length(header) + length(t) + 1
+                      if (limit < 0 || (limit > 0 && used + size > limit)) { limit_hit = 1; return }
+                      if (tag_file == "") return
+                      printf "%s%s\n", header, t > tag_file
+                      used += size
+                  }
+                  function handle(t, o,    second, kind, name, selfclose, parent, evidence) {
+                      second = substr(t, 2, 1)
+                      if (second == "/") {
+                          kind = "end"; name = tag_name(substr(t, 3))
+                      } else {
+                          kind = "start"; name = tag_name(substr(t, 2))
+                      }
+                      if (name == "") { bad = 1; return }
+                      parent = (depth > 0 ? open_element[depth] : "")
+                      evidence = (kind == "start" && name == "DataArray" &&
+                                  (parent == "PointData" || parent == "CellData"))
+                      if (name == "PointData" || name == "CellData") record(t, o, name, "-")
+                      else if (evidence) record(t, o, "DataArray", parent)
+                      if (!tag_syntax_ok(t, kind)) { bad = 1; return }
+                      selfclose = (kind == "start" && t ~ /\/>$/)
+                      if (kind == "end") {
+                          if (parent != name) { bad = 1; return }
+                          depth--
+                      } else if (!selfclose) {
+                          open_element[++depth] = name
+                      }
+                      if (name == "VTKFile" && kind == "end") saw_end = 1
+                      if (name == "PointData" || name == "CellData") {
+                          if (kind == "start") {
+                              if (pd || cd) bad = 1
+                              if (name == "PointData") seen_pd = 1; else seen_cd = 1
+                              if (!selfclose) { if (name == "PointData") pd = 1; else cd = 1 }
                           } else {
-                              close_at = match(line, "</PointData[ >]") ? RSTART : 0
-                              if (match(line, "Name=\"[^\"]*\"") &&
-                                  (close_at == 0 || RSTART < close_at)) {
-                                  names = names (count++ ? " " : "") \
-                                      substr(line, RSTART + 6, RLENGTH - 7)
-                                  line = substr(line, RSTART + RLENGTH)
-                              } else if (close_at) {
-                                  state = 0
-                                  line = substr(line, close_at + 11)
-                              } else {
-                                  break
-                              }
+                              pd = 0; cd = 0
+                          }
+                      } else if (evidence) {
+                          if ("Name" in tag_attr) {
+                              names = names (parent == "PointData" ? "POINT" : "CELL") "\t" tag_attr["Name"] "\n"
+                          } else {
+                              names = names "UNNAMED\t" parent "\n"
                           }
                       }
                   }
+                  {
+                      line = $0 "\n"; n = length(line); i = 1
+                      while (i <= n) {
+                          if (skip != "") {
+                              j = index(substr(line, i), skip)
+                              if (j == 0) break
+                              i += j - 1 + length(skip); skip = ""
+                              continue
+                          }
+                          if (!intag) {
+                              j = index(substr(line, i), "<")
+                              if (j == 0) break
+                              i += j - 1
+                              if (substr(line, i, 4) == "<!--") { skip = "-->"; i += 4; continue }
+                              if (substr(line, i, 9) == "<![CDATA[") { skip = "]]>"; i += 9; continue }
+                              if (substr(line, i, 2) == "<?") { skip = "?>"; i += 2; continue }
+                              if (substr(line, i, 2) == "<!") { bad = 1; exit }
+                              intag = 1; tag = ""; taglen = 0; quote = ""
+                              tagoff = off + i - 1
+                          }
+                          while (i <= n) {
+                              c = substr(line, i, 1); i++
+                              tag = tag c; taglen++
+                              if (taglen > 1048576) { bad = 1; exit }
+                              if (quote != "") { if (c == quote) quote = "" }
+                              else if (c == "\"" || c == sq) quote = c
+                              else if (c == ">") { intag = 0; handle(tag, tagoff); break }
+                          }
+                      }
+                      off += n
+                  }
                   END {
-                      if (state != 0 || (require_end && !saw_end)) exit 2
-                      print names
-                  }' "$parse_input" 2>/dev/null || parse_status=$?
+                      if (intag || skip != "" || pd || cd || bad) exit 2
+                      if (require_end && (!saw_end || depth > 0)) exit 2
+                      printf "%s", names
+                      print "POINTDATA_SEEN\t" seen_pd
+                      print "CELLDATA_SEEN\t" seen_cd
+                      print "OUTPUT_LIMIT\t" limit_hit
+                  }' "$VTU_PARSE_INPUT" 2>/dev/null || status=$?
               rm -rf -- "$work_dir"
-              case "$parse_status" in
+              case "$status" in
                   0) return 0 ;;
                   2) return 2 ;;
                   *) return 1 ;;
               esac
           }
 
-          # The capture script calls itself for one VTU parse, so the parse runs
-          # as one bounded process.
-          if [[ "${1:-}" == "--vtu-fields" ]]; then
-              vtu_header_point_data_names "$2"
+          # vtu_header_point_data_names <source-file> - the PointData names of one
+          # VTU file, in source order, on one line. Status 0: a complete parse, and
+          # an empty line is a valid empty PointData result. Status 1: the file
+          # cannot be read. Status 2: the header is incomplete, so no name is
+          # reported.
+          vtu_header_point_data_names() {
+              local records status=0 kind value names=""
+              records="$(vtu_scan_header "$1" "" 0)" || status=$?
+              (( status == 0 )) || return "$status"
+              while IFS=$'\t' read -r kind value; do
+                  if [[ "$kind" == POINT ]]; then
+                      names="${names:+${names} }${value}"
+                  fi
+              done <<< "$records"
+              printf '%s\n' "$names"
+          }
+          # ---- VTU header reader: end ----
+
+          # The capture script calls itself for one VTU scan, so the scan runs as
+          # one bounded process.
+          if [[ "${1:-}" == "--vtu-scan" ]]; then
+              vtu_scan_header "$2" "$3" "$4"
               exit $?
           fi
 
@@ -926,18 +1067,341 @@ jobs:
                                wc -l | tr -d ' ' || true)"
           fi
 
-          # Each manifest line is written when it is known, so a later timeout
-          # keeps the lines of the files that came before it.
+          # Mesh-quality evidence from the checkMesh log text. The verdict is
+          # separate from the Stage status: a checkMesh command that returns 0
+          # can still report failed mesh checks. No tolerance and no waiver.
+          mesh_file="${EVIDENCE_DIR}/mesh-quality.txt"
+          mesh_list="${EVIDENCE_DIR%/*}/checkmesh-log-list.txt"
+          : > "$mesh_list"
+          if [[ -d "$batch_dir" ]]; then
+              bounded "checkMesh log search" \
+                  find "$batch_dir" -name log.checkMesh -type f 2>/dev/null |
+                  sort > "$mesh_list" || true
+          fi
+          {
+            echo "== Mesh quality evidence =="
+            echo "MESH_QUALITY_SOURCE=checkMesh log text; the Stage status is separate"
+          } > "$mesh_file"
+          mesh_logs=0
+          mesh_review=0
+          mesh_unavailable=0
+          while IFS= read -r mesh_log; do
+              [[ -n "$mesh_log" ]] || continue
+              mesh_logs=$(( mesh_logs + 1 ))
+              mesh_rel="${mesh_log#"${batch_dir}/"}"
+              if mesh_out="$(bounded "checkMesh parse ${mesh_rel}" awk '
+                      /^Failed [0-9]+ mesh checks\./ { failed = $2; saw_failed = 1 }
+                      /^Mesh OK\./ { ok = 1 }
+                      /Concave cells \(using face planes\) found, number of cells: [0-9]+/ {
+                          concave = $NF; saw_concave = 1
+                      }
+                      END {
+                          if (saw_failed) f = failed; else if (ok) f = 0; else f = "UNAVAILABLE"
+                          if (saw_concave) c = concave
+                          else if (ok) c = 0
+                          else if (saw_failed) c = "NOT_REPORTED"
+                          else c = "UNAVAILABLE"
+                          print f " " c
+                      }' "$mesh_log")"; then
+                  mesh_failed="${mesh_out%% *}"
+                  mesh_concave="${mesh_out##* }"
+              else
+                  mesh_failed=UNAVAILABLE
+                  mesh_concave=UNAVAILABLE
+              fi
+              if [[ "$mesh_failed" == UNAVAILABLE ]]; then
+                  mesh_verdict=UNAVAILABLE
+                  mesh_reason="the checkMesh log has no 'Mesh OK.' line and no 'Failed N mesh checks.' line"
+                  mesh_unavailable=$(( mesh_unavailable + 1 ))
+              elif (( mesh_failed > 0 )); then
+                  mesh_verdict=MESH_QUALITY_REVIEW_REQUIRED
+                  mesh_reason="checkMesh reports ${mesh_failed} failed mesh checks; Stage success is not mesh acceptance"
+                  mesh_review=$(( mesh_review + 1 ))
+              else
+                  mesh_verdict=MESH_QUALITY_CHECKS_PASSED
+                  mesh_reason="checkMesh reports Mesh OK."
+              fi
+              {
+                echo
+                echo "MESH_LOG=${mesh_rel}"
+                echo "MESH_FAILED_CHECKS=${mesh_failed}"
+                echo "MESH_CONCAVE_CELLS=${mesh_concave}"
+                echo "MESH_LOG_VERDICT=${mesh_verdict}"
+                echo "MESH_LOG_REASON=${mesh_reason}"
+              } >> "$mesh_file"
+          done < "$mesh_list"
+          {
+            echo
+            echo "MESH_QUALITY_LOG_COUNT=${mesh_logs}"
+            if (( mesh_logs == 0 )); then
+                echo "MESH_QUALITY_VERDICT=UNAVAILABLE"
+                echo "MESH_QUALITY_REASON=no checkMesh log exists in the Batch Workspace"
+            elif (( mesh_review > 0 )); then
+                echo "MESH_QUALITY_VERDICT=MESH_QUALITY_REVIEW_REQUIRED"
+                echo "MESH_QUALITY_REASON=${mesh_review} checkMesh logs report failed mesh checks"
+            elif (( mesh_unavailable > 0 )); then
+                echo "MESH_QUALITY_VERDICT=UNAVAILABLE"
+                echo "MESH_QUALITY_REASON=${mesh_unavailable} checkMesh logs have no summary line"
+            else
+                echo "MESH_QUALITY_VERDICT=MESH_QUALITY_CHECKS_PASSED"
+                echo "MESH_QUALITY_REASON=every checkMesh log reports Mesh OK."
+            fi
+          } >> "$mesh_file"
+
+          # Flow convergence evidence. CONVERGED needs the explicit solver marker
+          # under the actual residualControl values of the Case. Reaching the end
+          # time or low final residuals is not convergence. The M3 reference is
+          # the committed 1e-4 for U, p, and each configured turbulence field.
+          #
+          # The verdict fails closed. Actual controls that do not match the M3
+          # reference give UNAVAILABLE, because the marker then describes another
+          # criterion. The marker describes the final solver state only when no
+          # Time line comes after it and it names the final time; a marker before
+          # the final Time block gives NOT_CONVERGED. A marker with a missing
+          # final record gives UNAVAILABLE. The final records are the Time line,
+          # the first initial residual of Ux, Uy, Uz, and p, of each turbulence
+          # field that a residualControl key other than U and p matches (at least
+          # one for each key), and the continuity line, all from the final Time
+          # block.
+          conv_file="${EVIDENCE_DIR}/convergence.txt"
+          conv_list="${EVIDENCE_DIR%/*}/solver-log-list.txt"
+          : > "$conv_list"
+          if [[ -d "$batch_dir" ]]; then
+              bounded "solver log search" \
+                  find "$batch_dir" -name log.simpleFoam -type f 2>/dev/null |
+                  sort > "$conv_list" || true
+          fi
+          {
+            echo "== Flow convergence evidence =="
+            echo "M3_REFERENCE_CRITERION=the solver convergence marker under residualControl U 1e-4, p 1e-4, and 1e-4 for each configured turbulence field"
+          } > "$conv_file"
+          conv_logs=0
+          conv_not=0
+          conv_unavailable=0
+          while IFS= read -r conv_log; do
+              [[ -n "$conv_log" ]] || continue
+              conv_logs=$(( conv_logs + 1 ))
+              conv_rel="${conv_log#"${batch_dir}/"}"
+              conv_controls="$(dirname -- "$conv_log")/system/fvSolution"
+              conv_controls_rel="${conv_controls#"${batch_dir}/"}"
+              conv_control="UNAVAILABLE"
+              conv_match="UNAVAILABLE"
+              conv_entries=""
+              if [[ -f "$conv_controls" ]]; then
+                  copy_relative "$conv_controls" "${EVIDENCE_DIR}/case-config"
+                  if conv_entries="$(bounded "residualControl parse ${conv_controls_rel}" awk '
+                          { line = $0; sub(/\/\/.*/, "", line) }
+                          !inrc && !done && line ~ /(^|[ \t])residualControl([ \t]|$)/ {
+                              inrc = 1; depth = 0; opened = 0
+                          }
+                          inrc {
+                              n_open = gsub(/\{/, "{", line); n_close = gsub(/\}/, "}", line)
+                              if (opened && depth == 1 &&
+                                  match(line, /^[ \t]*("[^"]*"|[A-Za-z_][A-Za-z0-9_.]*)[ \t]+[^ \t;]+[ \t]*;/)) {
+                                  entry = line
+                                  sub(/^[ \t]+/, "", entry); sub(/[ \t]*;.*$/, "", entry)
+                                  gsub(/[ \t]+/, " ", entry)
+                                  print entry
+                              }
+                              depth += n_open - n_close
+                              if (n_open) opened = 1
+                              if (opened && depth <= 0) { inrc = 0; done = 1 }
+                          }
+                          END { if (!done) exit 3 }' "$conv_controls")" && [[ -n "$conv_entries" ]]; then
+                      conv_control="$(printf '%s\n' "$conv_entries" | paste -sd ';' - | sed -e 's/;/; /g')"
+                      conv_match="$(printf '%s\n' "$conv_entries" | awk '
+                          { key = $1; value = $2 + 0; n++
+                            if (value != 0.0001) bad = 1
+                            if (key == "U") u = 1; else if (key == "p") p = 1; else other = 1 }
+                          END { print ((n && u && p && other && !bad) ? "true" : "false") }')"
+                  fi
+              fi
+              conv_time=UNAVAILABLE
+              conv_marker=UNAVAILABLE
+              conv_position=UNAVAILABLE
+              conv_marker_time=UNAVAILABLE
+              conv_end=UNAVAILABLE
+              conv_continuity=UNAVAILABLE
+              conv_missing=UNAVAILABLE
+              conv_residuals=""
+              conv_log_ok=0
+              if conv_out="$(bounded "solver log parse ${conv_rel}" \
+                      env CONV_CONTROL_ENTRIES="$conv_entries" awk '
+                      BEGIN {
+                          nk = split(ENVIRON["CONV_CONTROL_ENTRIES"], entry, "\n")
+                          for (i = 1; i <= nk; i++) {
+                              key = entry[i]; sub(/[ \t].*$/, "", key)
+                              if (key == "" || key == "U" || key == "p") continue
+                              nt++; tkey[nt] = key; tre[nt] = ""
+                              if (key ~ /^".*"$/) tre[nt] = "^(" substr(key, 2, length(key) - 2) ")$"
+                          }
+                      }
+                      # turbulence_key(f, j) - 1 when residualControl key j names field f.
+                      function turbulence_key(f, j) {
+                          if (tre[j] != "") return (f ~ tre[j])
+                          return (f == tkey[j])
+                      }
+                      /^Time = / {
+                          time = $3; split("", seen); order = ""; count = 0; cont = ""; after = 0
+                      }
+                      /Solving for [A-Za-z0-9_.]+, Initial residual = / {
+                          s = $0; sub(/.*Solving for /, "", s)
+                          field = s; sub(/,.*/, "", field)
+                          value = s; sub(/.*Initial residual = /, "", value); sub(/,.*/, "", value)
+                          if (!(field in seen)) {
+                              seen[field] = value; order = order (count++ ? " " : "") field
+                          }
+                          if (!(field in solved)) { solved[field] = 1; solved_order = solved_order " " field }
+                      }
+                      /time step continuity errors/ { cont = $0; sub(/^[ \t]+/, "", cont) }
+                      /SIMPLE solution converged/ { marker = $0; sub(/^[ \t]+/, "", marker); after = 1 }
+                      /^End[ \t]*$/ { end_seen = 1 }
+                      END {
+                          position = "ABSENT"
+                          if (marker != "") position = (after ? "AFTER_FINAL_TIME" : "BEFORE_FINAL_TIME")
+                          marker_time = marker
+                          if (!(sub(/^SIMPLE solution converged in /, "", marker_time) &&
+                                sub(/ iterations[ \t]*$/, "", marker_time) &&
+                                marker_time ~ /^[^ \t]+$/)) marker_time = "UNAVAILABLE"
+                          missing = ""
+                          nb = split("Ux Uy Uz p", base, " ")
+                          for (i = 1; i <= nb; i++) if (!(base[i] in seen)) missing = missing " " base[i]
+                          ns = split(solved_order, sf, " ")
+                          for (i = 1; i <= ns; i++) {
+                              for (j = 1; j <= nt; j++) {
+                                  if (turbulence_key(sf[i], j) && !(sf[i] in seen)) {
+                                      missing = missing " " sf[i]; break
+                                  }
+                              }
+                          }
+                          for (j = 1; j <= nt; j++) {
+                              hit = 0
+                              for (fld in seen) if (turbulence_key(fld, j)) hit = 1
+                              if (!hit) missing = missing " " tkey[j]
+                          }
+                          if (cont == "") missing = missing " continuity"
+                          sub(/^ /, "", missing)
+                          print "TIME\t" (time == "" ? "UNAVAILABLE" : time)
+                          print "MARKER\t" (marker == "" ? "ABSENT" : marker)
+                          print "POSITION\t" position
+                          print "MARKER_TIME\t" marker_time
+                          print "END\t" (end_seen ? "true" : "false")
+                          print "CONTINUITY\t" (cont == "" ? "UNAVAILABLE" : cont)
+                          print "MISSING\t" (missing == "" ? "NONE" : missing)
+                          n = split(order, f, " ")
+                          for (i = 1; i <= n; i++) print "RES\t" f[i] "\t" seen[f[i]]
+                      }' "$conv_log")"; then
+                  conv_log_ok=1
+                  while IFS=$'\t' read -r conv_kind conv_a conv_b; do
+                      case "$conv_kind" in
+                          TIME) conv_time="$conv_a" ;;
+                          MARKER) conv_marker="$conv_a" ;;
+                          POSITION) conv_position="$conv_a" ;;
+                          MARKER_TIME) conv_marker_time="$conv_a" ;;
+                          END) conv_end="$conv_a" ;;
+                          CONTINUITY) conv_continuity="$conv_a" ;;
+                          MISSING) conv_missing="$conv_a" ;;
+                          RES) conv_residuals="${conv_residuals}FINAL_INITIAL_RESIDUAL_${conv_a}=${conv_b}"$'\n' ;;
+                      esac
+                  done <<< "$conv_out"
+              fi
+              if (( conv_log_ok == 0 )); then
+                  conv_verdict=UNAVAILABLE
+                  conv_reason="the solver log cannot be parsed"
+              elif [[ "$conv_control" == UNAVAILABLE ]]; then
+                  conv_verdict=UNAVAILABLE
+                  conv_reason="the residualControl configuration is not available at ${conv_controls_rel}"
+              elif [[ "$conv_match" != true ]]; then
+                  conv_verdict=UNAVAILABLE
+                  conv_reason="the actual residualControl values do not match the M3 reference, so the solver log is not evidence under that reference"
+              elif [[ "$conv_time" == UNAVAILABLE ]]; then
+                  conv_verdict=UNAVAILABLE
+                  conv_reason="the solver log has no Time line"
+              elif [[ "$conv_position" == AFTER_FINAL_TIME ]]; then
+                  if [[ "$conv_missing" != NONE ]]; then
+                      conv_verdict=UNAVAILABLE
+                      conv_reason="the final Time = ${conv_time} block has no record for: ${conv_missing}"
+                  elif [[ "$conv_marker_time" != "$conv_time" ]]; then
+                      conv_verdict=UNAVAILABLE
+                      conv_reason="the solver marker '${conv_marker}' does not name the final Time = ${conv_time}"
+                  else
+                      conv_verdict=CONVERGED
+                      conv_reason="the solver reports '${conv_marker}' after the final Time = ${conv_time} block"
+                  fi
+              elif [[ "$conv_position" == BEFORE_FINAL_TIME ]]; then
+                  conv_verdict=NOT_CONVERGED
+                  conv_reason="the solver marker '${conv_marker}' comes before the final Time = ${conv_time} block, so it does not describe the final solver state"
+              else
+                  conv_verdict=NOT_CONVERGED
+                  conv_reason="the solver log reaches Time = ${conv_time} with no 'SIMPLE solution converged' marker"
+              fi
+              case "$conv_verdict" in
+                  UNAVAILABLE) conv_unavailable=$(( conv_unavailable + 1 )) ;;
+                  NOT_CONVERGED) conv_not=$(( conv_not + 1 )) ;;
+              esac
+              {
+                echo
+                echo "CONVERGENCE_LOG=${conv_rel}"
+                echo "CONVERGENCE_CONTROLS_SOURCE=${conv_controls_rel}"
+                echo "RESIDUAL_CONTROL=${conv_control}"
+                echo "RESIDUAL_CONTROL_REFERENCE_MATCH=${conv_match}"
+                echo "SOLVER_CONVERGENCE_MARKER=${conv_marker}"
+                echo "SOLVER_CONVERGENCE_MARKER_POSITION=${conv_position}"
+                echo "FINAL_TIME=${conv_time}"
+                echo "SOLVER_END_REACHED=${conv_end}"
+                printf '%s' "$conv_residuals"
+                echo "FINAL_CONTINUITY=${conv_continuity}"
+                echo "CONVERGENCE_REQUIRED_RECORDS_MISSING=${conv_missing}"
+                echo "CONVERGENCE_LOG_VERDICT=${conv_verdict}"
+                echo "CONVERGENCE_LOG_REASON=${conv_reason}"
+              } >> "$conv_file"
+          done < "$conv_list"
+          {
+            echo
+            echo "CONVERGENCE_LOG_COUNT=${conv_logs}"
+            if (( conv_logs == 0 )); then
+                echo "CONVERGENCE_VERDICT=UNAVAILABLE"
+                echo "CONVERGENCE_REASON=no simpleFoam log exists in the Batch Workspace"
+            elif (( conv_unavailable > 0 )); then
+                echo "CONVERGENCE_VERDICT=UNAVAILABLE"
+                echo "CONVERGENCE_REASON=${conv_unavailable} solver logs have no complete convergence evidence"
+            elif (( conv_not > 0 )); then
+                echo "CONVERGENCE_VERDICT=NOT_CONVERGED"
+                echo "CONVERGENCE_REASON=${conv_not} solver logs have no solver convergence marker"
+            else
+                echo "CONVERGENCE_VERDICT=CONVERGED"
+                echo "CONVERGENCE_REASON=every solver log reports convergence"
+            fi
+          } >> "$conv_file"
+
+          # The VTU manifest. Each manifest line is written when it is known, so a
+          # later timeout keeps the lines of the files that came before it.
+          #
+          # For each selected VTU file, the capture compares the required names
+          # with the observed PointData names by set inclusion, and keeps the
+          # original PointData, CellData, and DataArray tags in vtu-tags.txt with
+          # their byte offsets and the source checksum. A tag section holds at most
+          # 16384 bytes, and vtu-tags.txt holds at most 65536 bytes. A limit never
+          # cuts a tag; it gives OUTPUT_LIMIT.
           vtu_manifest="${EVIDENCE_DIR}/vtu-point-data.txt"
+          vtu_tags="${EVIDENCE_DIR}/vtu-tags.txt"
+          vtu_tag_file_limit=16384
+          vtu_tag_total_limit=65536
+          vtu_tag_used=0
+          : > "$vtu_tags"
           {
             echo "== VTU point-data manifest =="
             echo "EXPECTED_FIELD_SOURCE=run_post_processing_cases.sh FLOW_ZERO_FIELDS, FLOW_RESULT_FIELDS, TRD_FIELDS"
             echo "SCALAR_FIELD=${SCALAR_FIELD:-T}"
             echo "VTK_DIRECTORY_COUNT=${vtk_dir_count}"
+            echo "VTU_TAG_EVIDENCE_FILE=vtu-tags.txt"
+            echo "VTU_TAG_EVIDENCE_LIMITS=${vtu_tag_file_limit} bytes for each VTU file; ${vtu_tag_total_limit} bytes in total"
           } > "$vtu_manifest"
           vtu_count=0
           vtu_unavailable=0
+          vtu_not_matched=0
           vtu_list="${EVIDENCE_DIR%/*}/vtu-file-list.txt"
+          vtu_part="${EVIDENCE_DIR%/*}/vtu-tags.part"
           : > "$vtu_list"
           if [[ -d "$batch_dir" ]]; then
               bounded "VTU file search" \
@@ -948,10 +1412,28 @@ jobs:
               [[ -n "$vtu_file" ]] || continue
               vtu_count=$(( vtu_count + 1 ))
               vtu_path="${vtu_file#"${batch_dir}/"}"
+              vtu_required="$(vtu_expected_fields "$vtu_file")"
               {
                 echo
                 echo "VTU_PATH=${vtu_path}"
               } >> "$vtu_manifest"
+
+              # A selected file that does not exist is source content, not a
+              # capture error.
+              if [[ ! -e "$vtu_file" ]]; then
+                  {
+                    echo "VTU_BYTES=UNAVAILABLE"
+                    echo "VTU_SHA256=UNAVAILABLE"
+                    echo "VTU_EXPECTED_FIELDS=${vtu_required}"
+                    echo "VTU_OBSERVED_FIELDS=UNAVAILABLE"
+                    echo "VTU_OBSERVED_FIELDS_REASON=the selected VTU file does not exist"
+                    echo "VTU_REQUIRED_FIELDS_RESULT=MISSING_FILE"
+                    echo "VTU_TAG_EVIDENCE=UNAVAILABLE"
+                    echo "VTU_TAG_EVIDENCE_REASON=MISSING_FILE"
+                  } >> "$vtu_manifest"
+                  vtu_not_matched=$(( vtu_not_matched + 1 ))
+                  continue
+              fi
 
               if observed="$(bounded "VTU byte count ${vtu_path}" wc -c -- "$vtu_file")"; then
                   echo "VTU_BYTES=${observed%% *}" >> "$vtu_manifest"
@@ -959,8 +1441,10 @@ jobs:
                   echo "VTU_BYTES=UNAVAILABLE" >> "$vtu_manifest"
                   vtu_unavailable=$(( vtu_unavailable + 1 ))
               fi
+              vtu_sha=UNAVAILABLE
               if observed="$(bounded "VTU checksum ${vtu_path}" sha256sum -- "$vtu_file")"; then
-                  echo "VTU_SHA256=${observed%% *}" >> "$vtu_manifest"
+                  vtu_sha="${observed%% *}"
+                  echo "VTU_SHA256=${vtu_sha}" >> "$vtu_manifest"
               else
                   {
                     echo "VTU_SHA256=UNAVAILABLE"
@@ -968,35 +1452,135 @@ jobs:
                   } >> "$vtu_manifest"
                   vtu_unavailable=$(( vtu_unavailable + 1 ))
               fi
-              echo "VTU_EXPECTED_FIELDS=$(vtu_expected_fields "$vtu_file")" >> "$vtu_manifest"
+              echo "VTU_EXPECTED_FIELDS=${vtu_required}" >> "$vtu_manifest"
 
-              parse_status=0
-              observed="$(bounded_timeout_note "VTU PointData parse ${vtu_path}" \
-                          bash "$0" --vtu-fields "$vtu_file")" || parse_status=$?
-              case "$parse_status" in
+              # The tag section budget: the smaller of the per-file limit and the
+              # rest of the total limit, less the section header and the longest
+              # section end line.
+              vtu_section_head="== VTU_TAGS path=${vtu_path} sha256=${vtu_sha}"
+              vtu_section_end_max="== VTU_TAGS_END path=${vtu_path} tag_evidence=PARSER_FAILURE"
+              vtu_cap=$(( vtu_tag_total_limit - vtu_tag_used ))
+              (( vtu_cap > vtu_tag_file_limit )) && vtu_cap=$vtu_tag_file_limit
+              vtu_frame=$(( ${#vtu_section_head} + ${#vtu_section_end_max} + 2 ))
+              vtu_write_section=1
+              vtu_scan_limit=$(( vtu_cap - vtu_frame ))
+              if (( vtu_scan_limit <= 0 )); then
+                  vtu_scan_limit=-1
+                  (( vtu_cap >= vtu_frame )) || vtu_write_section=0
+              fi
+              : > "$vtu_part"
+
+              scan_status=0
+              scan_out="$(bounded_timeout_note "VTU PointData parse ${vtu_path}" \
+                          bash "$0" --vtu-scan "$vtu_file" "$vtu_part" "$vtu_scan_limit")" \
+                  || scan_status=$?
+
+              vtu_point="" vtu_cell="" vtu_pd_seen=0 vtu_limit_hit=0
+              if (( scan_status == 0 || scan_status == 2 )); then
+                  while IFS=$'\t' read -r scan_kind scan_value; do
+                      case "$scan_kind" in
+                          POINT) vtu_point="${vtu_point:+${vtu_point} }${scan_value}" ;;
+                          CELL) vtu_cell="${vtu_cell:+${vtu_cell} }${scan_value}" ;;
+                          POINTDATA_SEEN) vtu_pd_seen="$scan_value" ;;
+                          OUTPUT_LIMIT) vtu_limit_hit="$scan_value" ;;
+                      esac
+                  done <<< "$scan_out"
+              fi
+
+              vtu_missing=""
+              case "$scan_status" in
                   0)
-                      echo "VTU_OBSERVED_FIELDS=${observed}" >> "$vtu_manifest"
+                      for vtu_name in $vtu_required; do
+                          case " ${vtu_point} " in
+                              *" ${vtu_name} "*) ;;
+                              *) vtu_missing="${vtu_missing:+${vtu_missing} }${vtu_name}" ;;
+                          esac
+                      done
+                      if (( vtu_limit_hit )); then
+                          vtu_result=OUTPUT_LIMIT
+                          vtu_tag_state=OUTPUT_LIMIT
+                      else
+                          vtu_tag_state=COMPLETE
+                          if [[ "$vtu_required" == UNKNOWN ]]; then
+                              vtu_result=REQUIRED_FIELDS_UNKNOWN
+                          elif (( vtu_pd_seen == 0 )); then
+                              vtu_result=SOURCE_POINTDATA_ABSENT
+                          elif [[ -n "$vtu_missing" ]]; then
+                              vtu_result=MISSING_REQUIRED_FIELDS
+                          else
+                              vtu_result=MATCH
+                          fi
+                      fi
+                      {
+                        echo "VTU_OBSERVED_FIELDS=${vtu_point}"
+                        echo "VTU_OBSERVED_CELL_FIELDS=${vtu_cell}"
+                        echo "VTU_MISSING_REQUIRED_FIELDS=${vtu_missing}"
+                      } >> "$vtu_manifest"
                       ;;
                   *)
-                      case "$parse_status" in
-                          1) reason="the VTU file cannot be read" ;;
-                          2) reason="the VTU header is incomplete" ;;
-                          124|137) reason="the PointData parse did not complete within the capture work limit" ;;
-                          *) reason="the PointData parse ended with status ${parse_status}" ;;
+                      case "$scan_status" in
+                          1)
+                              if [[ ! -e "$vtu_file" ]]; then
+                                  vtu_result=MISSING_FILE
+                                  reason="the selected VTU file does not exist"
+                              else
+                                  vtu_result=PARSER_FAILURE
+                                  reason="the VTU file cannot be read"
+                              fi
+                              ;;
+                          2) vtu_result=PARSER_FAILURE; reason="the VTU header is incomplete or malformed" ;;
+                          124|137)
+                              vtu_result=TIMEOUT
+                              reason="the PointData parse did not complete within the capture work limit"
+                              ;;
+                          *)
+                              vtu_result=PARSER_FAILURE
+                              reason="the PointData parse ended with status ${scan_status}"
+                              ;;
                       esac
+                      vtu_tag_state="$vtu_result"
                       {
                         echo "VTU_OBSERVED_FIELDS=UNAVAILABLE"
                         echo "VTU_OBSERVED_FIELDS_REASON=${reason}"
                       } >> "$vtu_manifest"
-                      # A parse failure is a capture error. The timeout cases
-                      # already have a note from bounded_timeout_note.
-                      case "$parse_status" in
-                          124|137) ;;
-                          *) capture_note "VTU PointData parse ${vtu_path}: ${reason}" ;;
+                      # A parse failure is a capture error. A timeout already has
+                      # a note from bounded_timeout_note. A missing file is source
+                      # content.
+                      case "$vtu_result" in
+                          PARSER_FAILURE)
+                              capture_note "VTU PointData parse ${vtu_path}: ${reason}"
+                              vtu_unavailable=$(( vtu_unavailable + 1 ))
+                              ;;
+                          TIMEOUT)
+                              vtu_unavailable=$(( vtu_unavailable + 1 ))
+                              ;;
                       esac
-                      vtu_unavailable=$(( vtu_unavailable + 1 ))
+                      # A stopped scan can leave a partial record, so its records
+                      # are not kept.
+                      if [[ "$vtu_result" != PARSER_FAILURE ]]; then
+                          : > "$vtu_part"
+                      fi
                       ;;
               esac
+
+              if (( vtu_write_section )); then
+                  {
+                    printf '%s\n' "$vtu_section_head"
+                    cat -- "$vtu_part"
+                    printf '== VTU_TAGS_END path=%s tag_evidence=%s\n' "$vtu_path" "$vtu_tag_state"
+                  } >> "$vtu_tags"
+                  vtu_tag_used="$(wc -c < "$vtu_tags" | tr -d ' ')"
+              fi
+              {
+                echo "VTU_REQUIRED_FIELDS_RESULT=${vtu_result}"
+                if [[ "$vtu_tag_state" == COMPLETE ]]; then
+                    echo "VTU_TAG_EVIDENCE=COMPLETE"
+                else
+                    echo "VTU_TAG_EVIDENCE=UNAVAILABLE"
+                    echo "VTU_TAG_EVIDENCE_REASON=${vtu_tag_state}"
+                fi
+              } >> "$vtu_manifest"
+              [[ "$vtu_result" == MATCH ]] || vtu_not_matched=$(( vtu_not_matched + 1 ))
           done < "$vtu_list"
 
           {
@@ -1011,11 +1595,18 @@ jobs:
                 else
                     echo "VTU_REASON=A vtk directory exists and holds no .vtu file."
                 fi
+                echo "VTU_REQUIRED_FIELDS_VERDICT=UNAVAILABLE"
             elif (( vtu_unavailable > 0 )); then
                 echo "VTU_EVIDENCE=PARTIAL"
                 echo "VTU_REASON=${vtu_unavailable} VTU field values are UNAVAILABLE."
+                echo "VTU_REQUIRED_FIELDS_VERDICT=INCOMPLETE"
+            elif (( vtu_not_matched > 0 )); then
+                echo "VTU_EVIDENCE=INCOMPLETE"
+                echo "VTU_REASON=${vtu_not_matched} of ${vtu_count} selected VTU files do not have complete required PointData evidence."
+                echo "VTU_REQUIRED_FIELDS_VERDICT=INCOMPLETE"
             else
                 echo "VTU_EVIDENCE=PRESENT"
+                echo "VTU_REQUIRED_FIELDS_VERDICT=COMPLETE"
             fi
           } >> "$vtu_manifest"
 
@@ -1102,9 +1693,37 @@ jobs:
                     echo
                     echo "VTU_EVIDENCE=UNAVAILABLE"
                     echo "VTU_REASON=the capture did not complete: ${capture_result}: ${capture_reason}"
+                    echo "VTU_REQUIRED_FIELDS_VERDICT=UNAVAILABLE"
                   } >> "$vtu_manifest"
               fi
+              if ! grep -q '^MESH_QUALITY_VERDICT=' "${EVIDENCE_DIR}/mesh-quality.txt" 2>/dev/null; then
+                  {
+                    echo
+                    echo "MESH_QUALITY_VERDICT=UNAVAILABLE"
+                    echo "MESH_QUALITY_REASON=the capture did not complete: ${capture_result}: ${capture_reason}"
+                  } >> "${EVIDENCE_DIR}/mesh-quality.txt"
+              fi
+              if ! grep -q '^CONVERGENCE_VERDICT=' "${EVIDENCE_DIR}/convergence.txt" 2>/dev/null; then
+                  {
+                    echo
+                    echo "CONVERGENCE_VERDICT=UNAVAILABLE"
+                    echo "CONVERGENCE_REASON=the capture did not complete: ${capture_result}: ${capture_reason}"
+                  } >> "${EVIDENCE_DIR}/convergence.txt"
+              fi
           fi
+
+          # The evidence verdicts, for the job summary. Each is separate from the
+          # capture result and from the product result.
+          evidence_verdict() {
+              local value
+              value="$(sed -n "s/^${2}=//p" "$1" 2>/dev/null | tail -n 1 || true)"
+              printf '%s\n' "${value:-UNAVAILABLE}"
+          }
+          {
+            echo "VTU_REQUIRED_FIELDS_VERDICT=$(evidence_verdict "${EVIDENCE_DIR}/vtu-point-data.txt" VTU_REQUIRED_FIELDS_VERDICT)"
+            echo "MESH_QUALITY_VERDICT=$(evidence_verdict "${EVIDENCE_DIR}/mesh-quality.txt" MESH_QUALITY_VERDICT)"
+            echo "CONVERGENCE_VERDICT=$(evidence_verdict "${EVIDENCE_DIR}/convergence.txt" CONVERGENCE_VERDICT)"
+          } | tee -a "$GITHUB_ENV"
           if [[ -f "${EVIDENCE_DIR}/vtu-point-data.txt" ]]; then
               cat "${EVIDENCE_DIR}/vtu-point-data.txt"
           fi
@@ -1132,6 +1751,9 @@ jobs:
             echo "| Capture deadline | \`${CAPTURE_DEADLINE:-UNAVAILABLE}\` |"
             echo "| Capture result | \`${CAPTURE_RESULT:-NOT_ATTEMPTED}\` |"
             echo "| Capture reason | ${CAPTURE_REASON:-UNAVAILABLE} |"
+            echo "| VTU required fields | \`${VTU_REQUIRED_FIELDS_VERDICT:-UNAVAILABLE}\` |"
+            echo "| Mesh quality | \`${MESH_QUALITY_VERDICT:-UNAVAILABLE}\` |"
+            echo "| Convergence | \`${CONVERGENCE_VERDICT:-UNAVAILABLE}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the evidence artifacts
