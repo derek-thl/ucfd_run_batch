@@ -40,6 +40,14 @@
 # covers PR #89 review 5300443151: a start or end tag with invalid syntax gives
 # no names, and the original bytes of a rejected evidence tag are kept.
 #
+# Checks S30 to S41 cover the Case 7 mesh-phase diagnostic workflow
+# openfoam-m3-mesh-diagnostic.yml (Issue #80). They run its extracted steps with
+# a fake checkout, a fake setup Stage, a fake OpenFOAM tree, and fake system
+# commands. They prove the interface, the Case identity and version gates, the
+# help checks, the command order, the phase map, the result classes, the exact
+# check evidence, the stop rules, the timeouts, the output limits, and that no
+# solver, flow Stage, post-processing Stage, or dispatch runs.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -813,9 +821,10 @@ s10_vtu_reader_reads_a_large_no_marker_file() {
 
 # ---- S11 to S15: the bounded capture step -----------------------------------
 
-# ab_step_run_body <step-name> - the dedented shell body of one workflow step.
-# The body is the block under `run: |`, which this workflow indents by ten
-# spaces. The extraction ends at the first line that leaves that body.
+# ab_step_run_body <step-name> [<workflow>] - the dedented shell body of one
+# workflow step. The body is the block under `run: |`, which the workflows
+# indent by ten spaces. The extraction ends at the first line that leaves that
+# body. The default workflow is openfoam-evidence.yml.
 ab_step_run_body() {
     awk -v want="      - name: $1" '
         $0 == want { found = 1; next }
@@ -826,7 +835,7 @@ ab_step_run_body() {
             if ($0 !~ /^          /) { exit }
             print substr($0, 11)
         }
-    ' "$WORKFLOW"
+    ' "${2:-$WORKFLOW}"
 }
 
 # ab_capture_fixture <workspace> - a Batch Workspace with Stage evidence, one VTU
@@ -2262,6 +2271,835 @@ s29_vtu_invalid_tag_syntax_is_not_evidence() {
     done
 }
 
+# ---- S30 to S41: the Case 7 mesh-phase diagnostic (Issue #80) ---------------
+#
+# The diagnostic workflow openfoam-m3-mesh-diagnostic.yml runs one mesh-only
+# Case 7 diagnostic. These checks run its extracted steps with a fake checkout,
+# a fake setup Stage, a fake OpenFOAM tree, and fake system commands. No check
+# installs OpenFOAM, runs a solver, or dispatches a workflow.
+
+DIAG_WORKFLOW="${REPO_ROOT}/.github/workflows/openfoam-m3-mesh-diagnostic.yml"
+CONTRACT_WORKFLOW="${REPO_ROOT}/.github/workflows/batch-contract.yml"
+
+# The committed Case 7 row selects this Case directory.
+AB_DIAG_FLOW="src/batch_9/case_7/flow"
+
+# ab_diag_write_fake <file> - the one fake command of the diagnostic checks. The
+# command name comes from $0. Each call appends one line to DIAG_FAKE_CALLS:
+# name, working directory, and each argument, separated by tabs. The line is one
+# write, so the two sides of a pipeline cannot mix their records.
+ab_diag_write_fake() {
+    cat > "$1" <<'DIAG_FAKE'
+#!/usr/bin/env bash
+set -u
+name="${0##*/}"
+record="${name}"$'\t'"${PWD}"
+for argument in "$@"; do record+=$'\t'"${argument}"; done
+printf '%s\n' "$record" >> "$DIAG_FAKE_CALLS"
+has() { local want="$1" a; shift; for a in "$@"; do [[ "$a" == "$want" ]] && return 0; done; return 1; }
+after() { local want="$1" a previous=""; shift; for a in "$@"; do [[ "$previous" == "$want" ]] && { printf '%s' "$a"; return 0; }; previous="$a"; done; return 1; }
+# A forced failure or block applies to a real call, never to a help call.
+if ! has -help-full "$@"; then
+    for entry in ${FAKE_FAIL:-}; do
+        [[ "$entry" == "$name" ]] && { echo "fake ${name}: forced failure" >&2; exit 1; }
+    done
+    for entry in ${FAKE_HANG:-}; do
+        if [[ "$entry" == "$name" ]]; then
+            printf '%s\n' "$$" >> "$DIAG_FAKE_PIDS"
+            exec sleep 300
+        fi
+    done
+fi
+np="${FAKE_MPI_NP:-1}"
+write_geometry=0
+has -writeSets "$@" && write_geometry=1
+
+case "$name" in
+    curl)
+        printf 'echo repository added\n'
+        exit 0 ;;
+    sudo)
+        exec "$@" ;;
+    apt-get)
+        echo "fake apt-get $*"
+        exit 0 ;;
+    dpkg-query)
+        printf '%s' "${FAKE_PACKAGE_VERSION-2512.0-1}"
+        exit 0 ;;
+    gcc)
+        echo "13.3.0"
+        exit 0 ;;
+    gh)
+        exit 0 ;;
+    mpirun)
+        if [[ "${1:-}" != "--oversubscribe" || "${2:-}" != "-np" ]]; then
+            echo "fake mpirun: unexpected launcher $*" >&2
+            exit 2
+        fi
+        export FAKE_MPI_NP="$3"
+        shift 3
+        exec "$@" ;;
+esac
+
+if has -help-full "$@"; then
+    case "$name" in
+        snappyHexMesh) options=("-dict <file>" "-overwrite" "-parallel") ;;
+        checkMesh) options=("-allGeometry" "-allTopology" "-parallel" "-time <ranges>"
+                            "-writeAllFields" "-writeSets <surfaceFormat>") ;;
+        reconstructParMesh) options=("-constant" "-time <ranges>") ;;
+        *) options=() ;;
+    esac
+    echo "Usage: ${name} [OPTIONS]"
+    echo "Options:"
+    for option in "${options[@]}"; do
+        word="${option%% *}"
+        [[ " ${FAKE_HELP_DROP:-} " == *" ${name}:${word} "* ]] && continue
+        [[ " ${FAKE_HELP_BARE:-} " == *" ${name}:${word} "* ]] && option="$word"
+        printf '  %-28s %s\n' "$option" "fake description"
+    done
+    exit 0
+fi
+
+if [[ " ${FAKE_BIG_LOG:-} " == *" ${name} "* ]]; then
+    awk 'BEGIN { for (i = 0; i < 20000; i++) printf "fake log line %06d xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+fi
+
+case "$name" in
+    surfaceFeatureExtract)
+        echo "End" ;;
+    blockMesh)
+        mkdir -p constant/polyMesh
+        : > constant/polyMesh/owner
+        echo "End" ;;
+    decomposePar)
+        for (( n = 0; n < 8; n++ )); do
+            mkdir -p "processor${n}/constant/polyMesh" "processor${n}/0"
+            : > "processor${n}/constant/polyMesh/owner"
+        done
+        echo "End" ;;
+    snappyHexMesh)
+        phase_dirs() {
+            local time="$1" n
+            for (( n = 0; n < np; n++ )); do
+                mkdir -p "processor${n}/${time}/polyMesh"
+                : > "processor${n}/${time}/polyMesh/owner"
+            done
+        }
+        phase() {
+            echo "$1 mesh : cells:1175333  faces:3638916  points:1288205  unbalance:0.009"
+            echo "Cells per refinement level:"
+            printf '    0\t2749\n'
+            echo "Writing mesh to time $2"
+            echo "Wrote mesh in = 0.71 s."
+            phase_dirs "$2"
+        }
+        echo "Exec   : snappyHexMesh $*"
+        case "${FAKE_SNAPPY:-ok}" in
+            ok) phase Refined 1 ;;
+            missing) echo "Refined mesh : cells:1175333" ;;
+            duplicate) phase Refined 1; phase Refined 1 ;;
+            unlabelled) echo "Writing mesh to time 1"; phase_dirs 1 ;;
+            snapped) phase Refined 1; phase Snapped 2 ;;
+            constant) phase Refined constant ;;
+            inconsistent) echo "Refined mesh : cells:1175333"; echo "Writing mesh to time 1"; phase_dirs 2 ;;
+        esac
+        echo "Finished meshing without any errors"
+        echo "End" ;;
+    checkMesh)
+        time="$(after -time "$@" || true)"
+        if has -parallel "$@"; then
+            state=PHASE
+        elif [[ "$time" == "0" ]]; then
+            state=BACKGROUND
+        else
+            state=FINAL
+        fi
+        mode_var="FAKE_CHECK_${state}"
+        mode="${!mode_var:-ok}"
+        write_set() {
+            local count="$1" dir n
+            case "$state" in
+                BACKGROUND) set -- "constant/polyMesh/sets" ;;
+                FINAL) set -- "${time}/polyMesh/sets" ;;
+                PHASE) set -- ; for (( n = 0; n < np; n++ )); do set -- "$@" "processor${n}/${time}/polyMesh/sets"; done ;;
+            esac
+            for dir in "$@"; do
+                mkdir -p "$dir"
+                printf 'FoamFile { class cellSet; object concaveCells; }\n%s\n(\n)\n' "$count" > "${dir}/concaveCells"
+            done
+            if (( write_geometry )); then
+                mkdir -p "postProcessing/checkMesh/${time}"
+                printf 'fake set geometry\n' > "postProcessing/checkMesh/${time}/concaveCells.vtk"
+            fi
+        }
+        echo "Exec   : checkMesh $*"
+        echo "Time = ${time}"
+        echo "Checking geometry..."
+        case "$mode" in
+            ok)
+                echo "    Concave cell check OK."
+                printf '\nMesh OK.\n\n' ;;
+            concave:*)
+                echo " ***Concave cells (using face planes) found, number of cells: ${mode#concave:}"
+                echo "  <<Writing ${mode#concave:} concave cells to set concaveCells"
+                write_set "${mode#concave:}"
+                printf '\nFailed 1 mesh checks.\n\n' ;;
+            concave_noset:*)
+                echo " ***Concave cells (using face planes) found, number of cells: ${mode#concave_noset:}"
+                printf '\nFailed 1 mesh checks.\n\n' ;;
+            other)
+                echo "    Concave cell check OK."
+                echo " ***Zero or negative cell volume detected.  Minimum negative volume: -1"
+                printf '\nFailed 1 mesh checks.\n\n' ;;
+            failed_nocount)
+                printf '\nFailed 1 mesh checks.\n\n' ;;
+            noresult)
+                : ;;
+        esac
+        echo "End" ;;
+    reconstructParMesh)
+        time="$(after -time "$@" || true)"
+        mkdir -p "${time}/polyMesh"
+        : > "${time}/polyMesh/owner"
+        echo "End" ;;
+    *)
+        echo "End" ;;
+esac
+exit 0
+DIAG_FAKE
+    chmod +x "$1"
+}
+
+# ab_diag_write_setup_stub <file> - the fake setup Stage at src/run_batch.sh of
+# the fake checkout. It accepts only the exact setup call. It builds the Case 7
+# flow Case from the committed templates, as the real setup Stage does, with the
+# committed defaults snap off, addLayers off, and eight subdomains. FAKE_SETUP
+# selects a fault.
+ab_diag_write_setup_stub() {
+    cat > "$1" <<'DIAG_SETUP'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+    printf 'run_batch.sh\t%s' "$PWD"
+    for argument in "$@"; do printf '\t%s' "$argument"; done
+    printf '\n'
+} >> "$DIAG_FAKE_CALLS"
+[[ "$*" == "--stage setup -j 1 src/output_batch_9.csv" ]] || { echo "unexpected setup call: $*" >&2; exit 2; }
+[[ "${FAKE_SETUP:-ok}" != fail ]] || { echo "fake setup: forced failure" >&2; exit 1; }
+template="src/master_batch/simpleFoam_files/system"
+batch="src/batch_9"
+flow="${batch}/case_7/flow"
+mkdir -p "${flow}/system" "${flow}/constant/triSurface" "${flow}/0" "${batch}/case_7/trd"
+cp src/output_batch_9.csv "${batch}/output_batch_9.csv"
+for dict in controlDict fvSolution snappyHexMeshDict decomposeParDict blockMeshDict; do
+    cp "${template}/${dict}" "${flow}/system/${dict}"
+done
+snap=off layers=off np=8
+case "${FAKE_SETUP:-ok}" in
+    snap_on) snap=on ;;
+    layers_on) layers=on ;;
+    np4) np=4 ;;
+esac
+sed -i -e "s#<snap_ctrl>#${snap}#" -e "s#^addLayers[[:space:]]*on;#addLayers       ${layers};#" \
+    "${flow}/system/snappyHexMeshDict"
+sed -i -e "s#<np>#${np}#" "${flow}/system/decomposeParDict"
+row() {
+    printf '"%s","2","%s","%s","180.000","5.0","5.0","%s","%s","%s"\n' \
+        "${PWD}/${batch}/output_batch_9.csv" "$1" "$2" "${PWD}/${batch}/$2" "$3" "$4"
+}
+{
+    printf 'csv_file,row_number,case_id,case_name,wd,ws,ws_for_setup,case_dir,status,message\n'
+    if [[ "${FAKE_SETUP:-ok}" != no_flow_row ]]; then
+        row case_7 case_7/flow created "flow case created"
+    fi
+    row case_7 case_7/trd created "transport case created"
+    if [[ "${FAKE_SETUP:-ok}" == other_case ]]; then
+        mkdir -p "${batch}/case_8/flow"
+        row case_8 case_8/flow created "flow case created"
+    fi
+} > "${batch}/setup_cases_summary.csv"
+echo "setup done"
+DIAG_SETUP
+    chmod +x "$1"
+}
+
+# ab_diag_fixture <workspace> - a fake checkout with the committed inputs, a
+# fake OpenFOAM tree, fake system commands, and the extracted workflow steps.
+ab_diag_fixture() {
+    local workspace="$1" checkout name
+    checkout="${workspace}/checkout"
+    mkdir -p "${workspace}/runner_temp" "${workspace}/tmp" "${workspace}/fakebin" \
+             "${workspace}/openfoam/openfoam2512/etc" "${workspace}/openfoam/openfoam2512/bin" \
+             "${checkout}/src/master_batch"
+    : > "${workspace}/github_env"
+    : > "${workspace}/step_summary"
+    : > "${workspace}/calls.tsv"
+    : > "${workspace}/fake_pids"
+    cp -- "${REPO_ROOT}/.openfoam-version" "${checkout}/.openfoam-version"
+    cp -- "${SRC_DIR}/output_batch_1.csv" "${checkout}/src/output_batch_1.csv"
+    cp -R -- "${MASTER_SRC_DIR}/simpleFoam_files" "${checkout}/src/master_batch/simpleFoam_files"
+    ab_diag_write_setup_stub "${checkout}/src/run_batch.sh"
+
+    ab_diag_write_fake "${workspace}/diag_fake"
+    for name in curl sudo apt-get dpkg-query gcc gh; do
+        ln -s "${workspace}/diag_fake" "${workspace}/fakebin/${name}"
+    done
+    for name in surfaceFeatureExtract blockMesh checkMesh decomposePar snappyHexMesh \
+                reconstructParMesh mpirun simpleFoam foamToVTK renumberMesh reconstructPar; do
+        ln -s "${workspace}/diag_fake" "${workspace}/openfoam/openfoam2512/bin/${name}"
+    done
+    cat > "${workspace}/openfoam/openfoam2512/etc/bashrc" <<DIAG_BASHRC
+export WM_PROJECT_VERSION="\${FAKE_WM_VERSION-v2512}"
+export WM_OPTIONS=linux64GccDPInt32Opt
+export PATH="${workspace}/openfoam/openfoam2512/bin:\${PATH}"
+DIAG_BASHRC
+
+    ab_step_run_body "Start the diagnostic clock" "$DIAG_WORKFLOW" > "${workspace}/clock_step.sh"
+    ab_step_run_body "Run the mesh diagnostic" "$DIAG_WORKFLOW" > "${workspace}/diagnostic_step.sh"
+    ab_step_run_body "Package the diagnostic evidence" "$DIAG_WORKFLOW" > "${workspace}/package_step.sh"
+    ab_step_run_body "Write the diagnostic summary" "$DIAG_WORKFLOW" > "${workspace}/summary_step.sh"
+    local step
+    for step in clock diagnostic package summary; do
+        [[ -s "${workspace}/${step}_step.sh" ]] ||
+            _fail "S30: the ${step} step body must be extracted from the diagnostic workflow"
+        bash -n "${workspace}/${step}_step.sh" ||
+            _fail "S30: the extracted ${step} step must parse"
+    done
+}
+
+# ab_diag_run <workspace> [NAME=value ...] - run the extracted clock,
+# diagnostic, package, and summary steps in order. Values published through
+# GITHUB_ENV reach the later steps, as on the runner. The arguments override
+# them, and OPENFOAM_ROOT selects the fake OpenFOAM tree. Prints the diagnostic
+# step status, its elapsed seconds, and the package and summary statuses.
+ab_diag_run() {
+    local workspace="$1" start elapsed status package summary
+    shift
+    local base=(PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp"
+                RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env"
+                GITHUB_WORKSPACE="${workspace}/checkout" GITHUB_STEP_SUMMARY="${workspace}/step_summary"
+                GITHUB_SHA=6f198977b700a2bcb664bcc704a3d506eefb67ab GITHUB_RUN_ID=4242
+                DIAG_FAKE_CALLS="${workspace}/calls.tsv" DIAG_FAKE_PIDS="${workspace}/fake_pids")
+    env "${base[@]}" bash "${workspace}/clock_step.sh" > "${workspace}/clock.out" 2>&1 ||
+        _fail "S30: the clock step must succeed"
+    local published=()
+    mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
+    start="$(date +%s)"
+    env "${base[@]}" "${published[@]}" OPENFOAM_ROOT="${workspace}/openfoam" \
+        CHECKOUT_OUTCOME=success "$@" \
+        bash "${workspace}/diagnostic_step.sh" > "${workspace}/diagnostic.out" 2>&1 \
+        && status=0 || status=$?
+    elapsed=$(( $(date +%s) - start ))
+    env "${base[@]}" "${published[@]}" "$@" bash "${workspace}/package_step.sh" \
+        > "${workspace}/package.out" 2>&1 && package=0 || package=$?
+    env "${base[@]}" "${published[@]}" "$@" bash "${workspace}/summary_step.sh" \
+        > "${workspace}/summary.out" 2>&1 && summary=0 || summary=$?
+    printf 'status=%s elapsed=%s package=%s summary=%s\n' "$status" "$elapsed" "$package" "$summary"
+}
+
+# ab_diag_dir <workspace> - the diagnostic directory on the fake runner.
+ab_diag_dir() {
+    printf '%s\n' "${1}/runner_temp/m3-mesh-diagnostic"
+}
+
+# ab_diag_value <workspace> <key> - one value of the uploaded result file.
+ab_diag_value() {
+    ab_file_value "$(ab_diag_dir "$1")/upload/result.env" "$2"
+}
+
+# ab_diag_calls <workspace> - the fake calls, one per line: name, then the
+# arguments, separated by single spaces.
+ab_diag_calls() {
+    awk -F '\t' '{ line = $1; for (i = 3; i <= NF; i++) line = line " " $i; print line }' \
+        "${1}/calls.tsv"
+}
+
+# ab_diag_archive_list <workspace> - the member names of the uploaded archive.
+ab_diag_archive_list() {
+    tar -tzf "$(ab_diag_dir "$1")/upload/m3-mesh-diagnostic-evidence.tar.gz"
+}
+
+s30_diagnostic_workflow_interface() {
+    local workflow
+    assert_file_exists "$DIAG_WORKFLOW" "S30: the diagnostic workflow exists"
+    workflow="$(cat "$DIAG_WORKFLOW")"
+    # workflow_dispatch is the only trigger, and it has no inputs.
+    assert_eq $'on:\n  workflow_dispatch:' \
+        "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$DIAG_WORKFLOW")" \
+        "S30: workflow_dispatch without inputs is the only trigger"
+    assert_not_contains "$workflow" "inputs:" "S30: the dispatch has no inputs"
+    assert_contains "$workflow" $'permissions:\n  contents: read' "S30: the token can only read contents"
+    assert_contains "$workflow" "runs-on: ubuntu-24.04" "S30: the job runs on ubuntu-24.04"
+    assert_contains "$workflow" $'    timeout-minutes: 20\n' "S30: the job limit is 20 minutes"
+    assert_contains "$workflow" "retention-days: 90" "S30: the artifact is kept for 90 days"
+    assert_contains "$workflow" "uses: actions/upload-artifact@v4" "S30: the evidence is uploaded"
+    # batch-contract runs for the new workflow on push and on pull_request.
+    assert_eq "2" "$(grep -c "^      - '.github/workflows/openfoam-m3-mesh-diagnostic.yml'$" "$CONTRACT_WORKFLOW")" \
+        "S30: both batch-contract path filters name the diagnostic workflow"
+    # The clock step publishes the real OpenFOAM root and a 15-minute deadline.
+    local workspace
+    workspace="$(new_workspace s30_clock)"
+    ab_diag_fixture "$workspace"
+    # The diagnostic script inside the step body parses too.
+    awk '/<<.MESH_DIAGNOSTIC.$/ { inside = 1; next } /^MESH_DIAGNOSTIC$/ { inside = 0 } inside' \
+        "${workspace}/diagnostic_step.sh" > "${workspace}/diagnostic_script.sh"
+    [[ -s "${workspace}/diagnostic_script.sh" ]] || _fail "S30: the diagnostic script must be extracted"
+    bash -n "${workspace}/diagnostic_script.sh" || _fail "S30: the diagnostic script must parse"
+    env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S30: the clock step must succeed"
+    assert_eq "/usr/lib/openfoam" "$(ab_file_value "${workspace}/github_env" OPENFOAM_ROOT)" \
+        "S30: the clock step names the installed OpenFOAM root"
+    assert_eq "900" "$(( $(ab_file_value "${workspace}/github_env" DIAG_ACTIVE_DEADLINE) - \
+                         $(ab_file_value "${workspace}/github_env" DIAG_CLOCK_START) ))" \
+        "S30: the active-work deadline is 15 minutes after the clock start"
+    assert_eq "${workspace}/runner_temp/m3-mesh-diagnostic" "$(ab_file_value "${workspace}/github_env" DIAG_DIR)" \
+        "S30: the diagnostic directory is runner-temporary"
+}
+
+s31_diagnostic_all_clean_records_the_complete_evidence() {
+    local workspace run dir calls flow expected archive
+    workspace="$(new_workspace s31_all_clean)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace")"
+    dir="$(ab_diag_dir "$workspace")"
+    flow="${workspace}/checkout/${AB_DIAG_FLOW}"
+
+    assert_contains "$run" "status=0 " "S31: the diagnostic step ends with status 0"
+    assert_contains "$run" "package=0 " "S31: the package step ends with status 0"
+    assert_contains "$run" "summary=0" "S31: the summary step ends with status 0"
+    assert_eq "NO_CONCAVITY_REPRODUCED" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S31: clean background, phase, and final checks give NO_CONCAVITY_REPRODUCED"
+    assert_eq "0" "$(ab_diag_value "$workspace" BACKGROUND_CONCAVE_CELLS)" "S31: the background count is 0"
+    assert_eq "0" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" "S31: the refined count is 0"
+    assert_eq "0" "$(ab_diag_value "$workspace" FINAL_CONCAVE_CELLS)" "S31: the final count is 0"
+    assert_eq "1" "$(ab_diag_value "$workspace" REFINED_TIME)" "S31: the refined phase time comes from the log"
+    assert_eq "SAME" "$(ab_diag_value "$workspace" FINAL_COMPARISON)" \
+        "S31: the final parallel and serial checks are compared"
+
+    # The exact command vectors, in order, in the temporary flow Case.
+    calls="$(ab_diag_calls "$workspace")"
+    # The two sides of the repository pipeline run at the same time, so each
+    # install call is checked alone, and the update comes before the install.
+    local line
+    for line in "curl -fsSL https://dl.openfoam.com/add-debian-repo.sh" "sudo bash" \
+                "sudo apt-get update" "sudo apt-get install -y --no-install-recommends openfoam2512-default"; do
+        assert_contains "$calls" "$line" "S31: the install runs '${line}'"
+    done
+    (( $(grep -n -m1 '^sudo apt-get update$' <<< "$calls" | cut -d: -f1) <
+       $(grep -n -m1 '^sudo apt-get install' <<< "$calls" | cut -d: -f1) )) ||
+        _fail "S31: the package index update must come before the install"
+    expected="snappyHexMesh -help-full
+checkMesh -help-full
+reconstructParMesh -help-full
+run_batch.sh --stage setup -j 1 src/output_batch_9.csv
+surfaceFeatureExtract
+blockMesh
+checkMesh -allGeometry -allTopology -time 0
+decomposePar -force
+mpirun --oversubscribe -np 8 snappyHexMesh -parallel
+snappyHexMesh -parallel
+mpirun --oversubscribe -np 8 checkMesh -parallel -allGeometry -allTopology -time 1 -writeSets vtk
+checkMesh -parallel -allGeometry -allTopology -time 1 -writeSets vtk
+reconstructParMesh -time 1
+checkMesh -allGeometry -allTopology -writeAllFields -time 1"
+    assert_contains "$calls" "$expected" "S31: the help, setup, and mesh commands run in the contract order"
+    assert_not_contains "$calls" "-overwrite" "S31: no command uses -overwrite"
+    assert_eq "10" "$(awk -F '\t' -v d="$flow" '$2 == d' "${workspace}/calls.tsv" | wc -l | tr -d ' ')" \
+        "S31: every mesh command runs in the generated Case 7 flow directory"
+
+    # Identity, environment, dictionaries, help, commands, phases, and checks.
+    assert_file_exists "${dir}/evidence/identity.txt" "S31: the identity record exists"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" "CASE_ID=7" "S31: the Case ID is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" \
+        "SOURCE_CSV_SHA256=$(sha256sum < "${SRC_DIR}/output_batch_1.csv" | cut -d' ' -f1)" \
+        "S31: the source CSV checksum is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" \
+        "CASE_ROW_SHA256=$(awk -F, '$1 == "7"' "${SRC_DIR}/output_batch_1.csv" | sha256sum | cut -d' ' -f1)" \
+        "S31: the selected row checksum is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" \
+        "MAIN_SHA=6f198977b700a2bcb664bcc704a3d506eefb67ab" "S31: the commit is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" "WM_PROJECT_VERSION=v2512" \
+        "S31: the loaded OpenFOAM version is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" "OPENFOAM_PACKAGE_VERSION=2512.0-1" \
+        "S31: the package version is recorded"
+    assert_contains "$(cat "${dir}/evidence/identity.txt")" "WM_OPTIONS=linux64GccDPInt32Opt" \
+        "S31: WM_OPTIONS is recorded"
+    local dict
+    for dict in snappyHexMeshDict fvSolution controlDict; do
+        assert_file_exists "${dir}/evidence/dictionaries/${dict}" "S31: ${dict} is kept"
+        assert_contains "$(cat "${dir}/evidence/dictionaries.sha256")" \
+            "$(sha256sum < "${flow}/system/${dict}" | cut -d' ' -f1)" "S31: the ${dict} checksum is recorded"
+    done
+    assert_contains "$(cat "${dir}/evidence/controls.txt")" "SNAP=off" "S31: snap=off is recorded"
+    assert_contains "$(cat "${dir}/evidence/controls.txt")" "ADD_LAYERS=off" "S31: addLayers=off is recorded"
+    assert_contains "$(cat "${dir}/evidence/controls.txt")" "NUMBER_OF_SUBDOMAINS=8" \
+        "S31: the eight subdomains are recorded"
+    assert_contains "$(cat "${dir}/evidence/help/checkMesh.txt")" "-writeSets <surfaceFormat>" \
+        "S31: the installed checkMesh help is kept"
+    assert_contains "$(cat "${dir}/evidence/help-checks.txt")" "checkMesh -writeSets <surfaceFormat> FOUND" \
+        "S31: the -writeSets argument is verified"
+    assert_contains "$(cat "${dir}/evidence/commands.tsv")" "snappyHexMesh	240	" \
+        "S31: the snappyHexMesh cap is 240 seconds"
+    assert_contains "$(cat "${dir}/evidence/phase-map.txt")" "PHASE_1_LABEL=Refined mesh" \
+        "S31: the phase label is recorded"
+    assert_contains "$(cat "${dir}/evidence/phase-map.txt")" "PHASE_1_PROCESSOR_DIRECTORIES=8" \
+        "S31: the eight processor phase directories are verified"
+
+    # The upload holds the archive, and no mesh, field, VTU, or set geometry.
+    archive="$(ab_diag_archive_list "$workspace")"
+    assert_contains "$archive" "evidence/result.env" "S31: the archive holds the result"
+    assert_contains "$archive" "evidence/commands.tsv" "S31: the archive holds the command record"
+    assert_not_contains "$archive" "polyMesh" "S31: the archive holds no mesh"
+    assert_not_contains "$archive" ".vtk" "S31: the archive holds no set geometry"
+    assert_not_contains "$archive" ".vtu" "S31: the archive holds no VTU file"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Result | `NO_CONCAVITY_REPRODUCED` |' \
+        "S31: the job summary shows the result"
+}
+
+s32_diagnostic_result_classes() {
+    local workspace
+    # Concavity in the background mesh.
+    workspace="$(new_workspace s32_background)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_BACKGROUND=concave:12 FAKE_CHECK_PHASE=concave:30 \
+        FAKE_CHECK_FINAL=concave:30 > /dev/null
+    assert_eq "FIRST_CONCAVITY_AT_BACKGROUND" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S32: a background concavity is FIRST_CONCAVITY_AT_BACKGROUND"
+    assert_eq "12" "$(ab_diag_value "$workspace" BACKGROUND_CONCAVE_CELLS)" "S32: the background count is exact"
+    assert_eq "1" "$(ab_diag_value "$workspace" BACKGROUND_FAILED_CHECKS)" "S32: the failed checks are recorded"
+    assert_contains "$(cat "$(ab_diag_dir "$workspace")/evidence/sets.tsv")" \
+        "background	constant/polyMesh/sets/concaveCells	" "S32: the background set path is recorded"
+
+    # Concavity first in the refined mesh. checkMesh reports failure with status 0.
+    workspace="$(new_workspace s32_refined)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=concave:23912 FAKE_CHECK_FINAL=concave:23912 > /dev/null
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S32: a clean background and a refined concavity is FIRST_CONCAVITY_AT_REFINED_MESH"
+    assert_eq "23912" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" "S32: the refined count is exact"
+    assert_eq "FAILED" "$(ab_diag_value "$workspace" REFINED_RESULT)" \
+        "S32: a failed check with status 0 is still FAILED"
+    assert_eq "8" "$(grep -c '^refined	processor[0-7]/1/polyMesh/sets/concaveCells	' \
+                     "$(ab_diag_dir "$workspace")/evidence/sets.tsv")" \
+        "S32: the set of each processor is recorded"
+    assert_eq "SAME" "$(ab_diag_value "$workspace" FINAL_COMPARISON)" "S32: the final comparison is SAME"
+
+    # Clean phases, but a failed reconstructed serial check.
+    workspace="$(new_workspace s32_final)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_FINAL=concave:5 > /dev/null
+    assert_eq "NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S32: a final-only concavity is NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS"
+    assert_eq "DIFFERENT" "$(ab_diag_value "$workspace" FINAL_COMPARISON)" "S32: the final comparison is DIFFERENT"
+    workspace="$(new_workspace s32_final_other)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_FINAL=other > /dev/null
+    assert_eq "NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S32: another failed final check is NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS"
+    assert_eq "0" "$(ab_diag_value "$workspace" FINAL_CONCAVE_CELLS)" \
+        "S32: the concave check OK line gives the exact count 0"
+
+    # A phase failure without concavity fits no concavity class.
+    workspace="$(new_workspace s32_phase_other)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=other > /dev/null
+    assert_eq "INCONCLUSIVE_NON_CONCAVE_PHASE_FAILURE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S32: a phase failure without concavity is INCONCLUSIVE"
+}
+
+s33_diagnostic_check_evidence_must_be_exact() {
+    local workspace
+    workspace="$(new_workspace s33_no_count)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=failed_nocount FAKE_CHECK_FINAL=concave:9 > /dev/null
+    assert_eq "INCONCLUSIVE_CONCAVE_COUNT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S33: a failed check without an exact concave count is INCONCLUSIVE"
+    assert_eq "UNAVAILABLE" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" \
+        "S33: a missing count is UNAVAILABLE, not 0"
+
+    workspace="$(new_workspace s33_no_set)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=concave_noset:40 FAKE_CHECK_FINAL=concave:40 > /dev/null
+    assert_eq "INCONCLUSIVE_CONCAVE_SET" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S33: a positive count without its set is INCONCLUSIVE"
+    assert_eq "40" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" "S33: the count is still recorded"
+
+    workspace="$(new_workspace s33_no_result)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_BACKGROUND=noresult > /dev/null
+    assert_eq "INCONCLUSIVE_CHECK_RESULT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S33: a check log without a result line is INCONCLUSIVE"
+    assert_eq "UNAVAILABLE" "$(ab_diag_value "$workspace" BACKGROUND_RESULT)" \
+        "S33: the missing result is UNAVAILABLE"
+}
+
+s34_diagnostic_case_identity_gates() {
+    local workspace csv
+    csv="${SRC_DIR}/output_batch_1.csv"
+    # Missing, duplicate, and changed-header CSV inputs.
+    workspace="$(new_workspace s34_missing_row)"
+    ab_diag_fixture "$workspace"
+    awk -F, '$1 != "7"' "$csv" > "${workspace}/checkout/src/output_batch_1.csv"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a missing Case 7 row is INCONCLUSIVE_CASE_IDENTITY"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "run_batch.sh" "S34: setup does not run without the row"
+
+    workspace="$(new_workspace s34_duplicate_row)"
+    ab_diag_fixture "$workspace"
+    { cat "$csv"; awk -F, '$1 == "7"' "$csv"; } > "${workspace}/checkout/src/output_batch_1.csv"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a duplicate Case 7 row is INCONCLUSIVE_CASE_IDENTITY"
+
+    workspace="$(new_workspace s34_changed_header)"
+    ab_diag_fixture "$workspace"
+    sed -e '1s/^Case,/CaseID,/' "$csv" > "${workspace}/checkout/src/output_batch_1.csv"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a changed header is INCONCLUSIVE_CASE_IDENTITY"
+
+    workspace="$(new_workspace s34_extra_field)"
+    ab_diag_fixture "$workspace"
+    awk -F, -v OFS=, '$1 == "7" { $0 = $0 ",extra" } { print }' "$csv" > "${workspace}/checkout/src/output_batch_1.csv"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a row with an extra field is INCONCLUSIVE_CASE_IDENTITY"
+
+    workspace="$(new_workspace s34_existing_run_csv)"
+    ab_diag_fixture "$workspace"
+    printf 'Case\n9\n' > "${workspace}/checkout/src/output_batch_9.csv"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: an existing run CSV is never reused"
+
+    # The setup Stage output must hold Case 7 only, with the committed controls.
+    workspace="$(new_workspace s34_other_case)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_SETUP=other_case > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a setup result with another Case is INCONCLUSIVE_CASE_IDENTITY"
+    workspace="$(new_workspace s34_no_flow_row)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_SETUP=no_flow_row > /dev/null
+    assert_eq "INCONCLUSIVE_CASE_IDENTITY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a setup result without the created flow row is INCONCLUSIVE_CASE_IDENTITY"
+    local mode
+    for mode in snap_on layers_on np4; do
+        workspace="$(new_workspace "s34_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" FAKE_SETUP="$mode" > /dev/null
+        assert_eq "INCONCLUSIVE_CASE_OR_PHASE_MISMATCH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S34: generated controls ${mode} are INCONCLUSIVE_CASE_OR_PHASE_MISMATCH"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "blockMesh" \
+            "S34: no mesh command runs after the ${mode} mismatch"
+    done
+    workspace="$(new_workspace s34_setup_fails)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_SETUP=fail > /dev/null
+    assert_eq "INCONCLUSIVE_PREPARATION_FAILURE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S34: a failed setup Stage is INCONCLUSIVE_PREPARATION_FAILURE"
+}
+
+s35_diagnostic_version_and_help_gates() {
+    local workspace
+    workspace="$(new_workspace s35_baseline)"
+    ab_diag_fixture "$workspace"
+    printf 'v2506\n' > "${workspace}/checkout/.openfoam-version"
+    ab_diag_run "$workspace" > /dev/null
+    assert_eq "INCONCLUSIVE_VERSION" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S35: a baseline other than v2512 is INCONCLUSIVE_VERSION"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "apt-get" "S35: nothing is installed for a wrong baseline"
+
+    workspace="$(new_workspace s35_loaded_version)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_WM_VERSION=v2506 > /dev/null
+    assert_eq "INCONCLUSIVE_VERSION" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S35: a loaded version other than v2512 is INCONCLUSIVE_VERSION"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "run_batch.sh" "S35: setup does not run for a wrong version"
+
+    workspace="$(new_workspace s35_install_fails)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_FAIL=apt-get > /dev/null
+    assert_eq "INCONCLUSIVE_INSTALL" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S35: a failed installation is INCONCLUSIVE_INSTALL"
+
+    local entry
+    for entry in "FAKE_HELP_DROP=checkMesh:-writeSets" "FAKE_HELP_BARE=checkMesh:-writeSets" \
+                 "FAKE_HELP_DROP=reconstructParMesh:-time" "FAKE_HELP_DROP=snappyHexMesh:-parallel" \
+                 "FAKE_HELP_DROP=checkMesh:-allGeometry"; do
+        workspace="$(new_workspace "s35_help_${entry//[^A-Za-z]/_}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "$entry" > /dev/null
+        assert_eq "INCONCLUSIVE_COMMAND_VALIDATION" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S35: ${entry} is INCONCLUSIVE_COMMAND_VALIDATION"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "blockMesh" \
+            "S35: no mesh command runs after ${entry}"
+        assert_contains "$(cat "$(ab_diag_dir "$workspace")/evidence/help-checks.txt")" "MISSING" \
+            "S35: the help check records the missing option for ${entry}"
+    done
+}
+
+s36_diagnostic_phase_map_must_be_complete() {
+    local workspace mode
+    for mode in duplicate unlabelled constant inconsistent; do
+        workspace="$(new_workspace "s36_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" FAKE_SNAPPY="$mode" > /dev/null
+        assert_eq "INCONCLUSIVE_PHASE_MAP" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S36: a ${mode} phase map is INCONCLUSIVE_PHASE_MAP"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+            "S36: no reconstruction runs after a ${mode} phase map"
+    done
+    # The contract names a missing refinement write and an unexpected phase a
+    # Case or phase mismatch.
+    for mode in missing snapped; do
+        workspace="$(new_workspace "s36_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" FAKE_SNAPPY="$mode" > /dev/null
+        assert_eq "INCONCLUSIVE_CASE_OR_PHASE_MISMATCH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S36: a ${mode} refined phase is INCONCLUSIVE_CASE_OR_PHASE_MISMATCH"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+            "S36: no reconstruction runs after a ${mode} refined phase"
+    done
+}
+
+s37_diagnostic_preparation_failure_stops() {
+    local workspace name
+    for name in surfaceFeatureExtract blockMesh decomposePar snappyHexMesh reconstructParMesh; do
+        workspace="$(new_workspace "s37_${name}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" FAKE_FAIL="$name" > /dev/null
+        assert_eq "INCONCLUSIVE_PREPARATION_FAILURE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S37: a failed ${name} is INCONCLUSIVE_PREPARATION_FAILURE"
+        assert_contains "$(ab_diag_value "$workspace" DIAG_REASON)" "$name" "S37: the reason names ${name}"
+        assert_eq "$name" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "S37: the run stops at ${name}"
+    done
+    # The failed blockMesh stops every later mesh command, and the partial
+    # evidence is still packaged.
+    workspace="$(new_workspace s37_partial)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_FAIL=blockMesh > /dev/null
+    assert_not_contains "$(ab_diag_calls "$workspace")" "decomposePar" "S37: no command runs after the failure"
+    assert_contains "$(ab_diag_archive_list "$workspace")" "evidence/logs/" "S37: the partial logs are packaged"
+    assert_contains "$(ab_diag_archive_list "$workspace")" "evidence/identity.txt" \
+        "S37: the partial identity record is packaged"
+    assert_contains "$(cat "${workspace}/step_summary")" "INCONCLUSIVE_PREPARATION_FAILURE" \
+        "S37: the job summary shows the stop"
+}
+
+s38_diagnostic_timeouts_stop_the_work() {
+    local workspace run elapsed
+    # The per-command cap: blockMesh has 30 seconds, far inside the deadline.
+    workspace="$(new_workspace s38_command_cap)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" FAKE_HANG=blockMesh)"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S38: a command past its cap is INCONCLUSIVE_TIMEOUT"
+    assert_eq "blockMesh" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "S38: the run stops at blockMesh"
+    (( elapsed >= 29 && elapsed <= 45 )) ||
+        _fail "S38: the blockMesh cap must stop the command after about 30 seconds" "elapsed: ${elapsed}"
+    ab_assert_fakes_stopped "$workspace" "S38"
+    assert_contains "$(cat "$(ab_diag_dir "$workspace")/evidence/commands.tsv")" "blockMesh	30	30	" \
+        "S38: the blockMesh limit is its 30-second cap"
+
+    # The active-work deadline: less time is left than the snappyHexMesh cap.
+    workspace="$(new_workspace s38_deadline)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" FAKE_HANG=snappyHexMesh DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + 20 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S38: the active-work deadline gives INCONCLUSIVE_TIMEOUT"
+    assert_eq "snappyHexMesh" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" \
+        "S38: the deadline stops snappyHexMesh"
+    (( elapsed <= 21 )) || _fail "S38: the work must end before the active-work deadline" "elapsed: ${elapsed}"
+    ab_assert_fakes_stopped "$workspace" "S38"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+        "S38: no command runs after the timeout"
+
+    # No time left: the next command does not start.
+    workspace="$(new_workspace s38_no_time)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" DIAG_ACTIVE_DEADLINE="$(( $(date +%s) - 1 ))" > /dev/null
+    assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S38: no active time left gives INCONCLUSIVE_TIMEOUT"
+    assert_eq "install" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "S38: the install does not start"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "apt-get" "S38: no command starts without time"
+}
+
+s39_diagnostic_output_limits() {
+    local workspace dir archive size
+    # A command log above 1 MiB is not cut. It is left out, and the run stops.
+    workspace="$(new_workspace s39_log_cap)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_BIG_LOG=snappyHexMesh > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    assert_eq "INCONCLUSIVE_OUTPUT_LIMIT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S39: a log above 1 MiB is INCONCLUSIVE_OUTPUT_LIMIT"
+    assert_contains "$(cat "${dir}/upload/inventory.txt")" "EXCLUDED" "S39: the inventory names the excluded log"
+    if ab_diag_archive_list "$workspace" | grep -Eq '/[0-9]+-snappyHexMesh\.log$'; then
+        _fail "S39: the oversized snappyHexMesh log must not be packaged"
+    fi
+    assert_not_contains "$(ab_diag_calls "$workspace")" "checkMesh -parallel" "S39: no command runs after the limit"
+    if find "${dir}/evidence" -type f -size +1024k | grep -q .; then
+        _fail "S39: no evidence file may exceed 1 MiB"
+    fi
+
+    # An archive above 45 MiB is not uploaded. The upload holds a reason and an
+    # inventory only.
+    workspace="$(new_workspace s39_archive_cap)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    head -c 48000000 /dev/urandom > "${dir}/evidence/large.bin"
+    env RUNNER_TEMP="${workspace}/runner_temp" DIAG_DIR="$dir" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/package_step.sh" > "${workspace}/package2.out" 2>&1 ||
+        _fail "S39: the package step must end with status 0"
+    assert_eq "INCONCLUSIVE_OUTPUT_LIMIT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S39: an archive above 45 MiB is INCONCLUSIVE_OUTPUT_LIMIT"
+    assert_eq "NO_CONCAVITY_REPRODUCED" "$(ab_diag_value "$workspace" DIAG_PRIOR_RESULT)" \
+        "S39: the prior result is kept for reference"
+    size="$(du -cb "${dir}/upload" | tail -n 1 | cut -f1)"
+    (( size < 1048576 )) || _fail "S39: the reduced upload must be small" "bytes: ${size}"
+    archive="$(ab_diag_archive_list "$workspace")"
+    assert_not_contains "$archive" "large.bin" "S39: the large file is not uploaded"
+    assert_contains "$(cat "${dir}/upload/inventory.txt")" "large.bin" "S39: the inventory names the large file"
+}
+
+s40_diagnostic_never_solves_or_dispatches() {
+    local workspace calls
+    workspace="$(new_workspace s40_no_solver)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=concave:23912 FAKE_CHECK_FINAL=concave:23912 > /dev/null
+    calls="$(ab_diag_calls "$workspace")"
+    assert_not_contains "$calls" "simpleFoam" "S40: no solver runs"
+    assert_not_contains "$calls" "foamToVTK" "S40: no post-processing runs"
+    assert_not_contains "$calls" "renumberMesh" "S40: no flow Stage command runs"
+    assert_not_contains "$calls" "reconstructPar " "S40: no field reconstruction runs"
+    assert_eq "0" "$(grep -c '^gh' <<< "$calls" || true)" "S40: no workflow is dispatched"
+    assert_eq "1" "$(grep -c '^run_batch.sh ' <<< "$calls")" "S40: the Orchestrator runs once"
+    assert_contains "$calls" "run_batch.sh --stage setup -j 1 src/output_batch_9.csv" \
+        "S40: the Orchestrator runs the setup Stage only"
+    assert_not_contains "$calls" "--stage mesh" "S40: the mesh Stage never runs"
+    assert_not_contains "$calls" "flow,post" "S40: no full-Case run starts"
+}
+
+s41_diagnostic_checkout_failure_and_summary() {
+    local workspace run
+    workspace="$(new_workspace s41_checkout)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" CHECKOUT_OUTCOME=failure)"
+    assert_contains "$run" "status=0 " "S41: the diagnostic step ends with status 0 after a failed checkout"
+    assert_eq "INCONCLUSIVE_CHECKOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S41: a failed checkout is INCONCLUSIVE_CHECKOUT"
+    assert_eq "" "$(ab_diag_calls "$workspace")" "S41: no command runs after a failed checkout"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Result | `INCONCLUSIVE_CHECKOUT` |' \
+        "S41: the job summary shows the checkout stop"
+    assert_contains "$(cat "${workspace}/step_summary")" "| Active elapsed seconds |" \
+        "S41: the job summary shows the elapsed time"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -2309,6 +3147,18 @@ AB_OBSERVATIONS=(
     s27_vtu_comment_text_is_not_markup
     s28_vtu_unclosed_or_mismatched_elements_are_not_evidence
     s29_vtu_invalid_tag_syntax_is_not_evidence
+    s30_diagnostic_workflow_interface
+    s31_diagnostic_all_clean_records_the_complete_evidence
+    s32_diagnostic_result_classes
+    s33_diagnostic_check_evidence_must_be_exact
+    s34_diagnostic_case_identity_gates
+    s35_diagnostic_version_and_help_gates
+    s36_diagnostic_phase_map_must_be_complete
+    s37_diagnostic_preparation_failure_stops
+    s38_diagnostic_timeouts_stop_the_work
+    s39_diagnostic_output_limits
+    s40_diagnostic_never_solves_or_dispatches
+    s41_diagnostic_checkout_failure_and_summary
 )
 
 # One observation runs in this process when the caller names it. The scenario
