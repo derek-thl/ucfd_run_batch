@@ -32,7 +32,9 @@
 # and the job summary rows. S25 and S26 cover PR #89 review 5298374123: Name
 # text inside another attribute value is not a field name, and the convergence
 # verdict fails closed on changed controls, missing final records, and a stale
-# or wrong solver marker.
+# or wrong solver marker. S27 covers PR #89 review 5299046150: text inside an
+# XML comment, a CDATA section, or a processing instruction is not markup, and
+# an unterminated comment or a document type declaration gives no names.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -1985,6 +1987,87 @@ s26_convergence_verdict_fails_closed() {
         "S26: missing final records alone give no CONVERGED verdict"
 }
 
+# ---- S27: XML comments and other non-markup text (review 5299046150) --------
+
+s27_vtu_comment_text_is_not_markup() {
+    local workspace evidence vtk file checked
+    workspace="$(new_workspace s27_vtu_comments)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+
+    # The review input: a comment with '>' and an apparent DataArray tag.
+    printf '%s\n' '<VTKFile><Piece><PointData><!-- note > <DataArray Name="U"/> --><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_16_comment.vtu"
+    # A comment across lines, in an appended-data file.
+    ab_vtu_appended "${vtk}/flow_latest_17_comment_lines.vtu" \
+        "$(printf '<PointData>\n<!--\n  a > b\n  <DataArray Name="U"/>\n-->\n<DataArray Name="p"/>\n</PointData>')"
+    # A comment that holds an apparent PointData end tag does not end the element.
+    ab_vtu_appended "${vtk}/flow_latest_18_comment_end_tag.vtu" \
+        "$(printf '<PointData>\n<!-- a > </PointData> -->\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
+    # A CDATA section with '>' and an apparent DataArray tag.
+    printf '%s\n' '<VTKFile><Piece><PointData><DataArray Name="p" format="ascii"><![CDATA[ 1 > 0 <DataArray Name="U"/> ]]></DataArray></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_19_cdata.vtu"
+    # A processing instruction with '>' and an apparent DataArray tag.
+    printf '%s\n' '<VTKFile><Piece><PointData><?note a > <DataArray Name="U"/> ?><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_20_pi.vtu"
+    # A comment that is still open at the appended-data marker is an incomplete
+    # header, although the PointData element before it is complete.
+    ab_vtu_appended "${vtk}/flow_latest_21_open_comment.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="U"/>\n<DataArray Name="p"/>\n</PointData>\n<!-- open')"
+    # A document type declaration is not read, so the names are not evidence.
+    printf '%s\n' '<!DOCTYPE VTKFile>' '<VTKFile><Piece><PointData><DataArray Name="U"/><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${vtk}/flow_latest_22_doctype.vtu"
+
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+
+    for file in case_7/vtk/flow_latest_16_comment.vtu case_7/vtk/flow_latest_17_comment_lines.vtu \
+            case_7/vtk/flow_latest_19_cdata.vtu case_7/vtk/flow_latest_20_pi.vtu; do
+        assert_eq "MISSING_REQUIRED_FIELDS" \
+            "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S27: ${file}: a tag inside non-markup text is not a field"
+        assert_eq "p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S27: ${file}: only the real DataArray name is observed"
+        assert_eq "U" "$(ab_vtu_result "$workspace" "$file" VTU_MISSING_REQUIRED_FIELDS)" \
+            "S27: ${file}: the missing required field is named"
+        assert_eq "COMPLETE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+            "S27: ${file}: the tag evidence is complete"
+    done
+    file=case_7/vtk/flow_latest_18_comment_end_tag.vtu
+    assert_eq "MATCH" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+        "S27: an end tag inside a comment does not end PointData"
+    assert_eq "U p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+        "S27: the names after the comment are observed"
+    for file in case_7/vtk/flow_latest_21_open_comment.vtu case_7/vtk/flow_latest_22_doctype.vtu; do
+        assert_eq "PARSER_FAILURE" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S27: ${file}: the header is not evidence"
+        assert_eq "UNAVAILABLE" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S27: ${file}: no name is reported"
+    done
+    assert_not_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_16_comment.vtu)" \
+        'Name="U"' "S27: no tag inside a comment is kept as tag evidence"
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S27: every retained tag equals its source bytes"
+    assert_not_contains "$(cat "${evidence}/vtu-point-data.txt")" "VTU_EVIDENCE=PRESENT" \
+        "S27: the aggregate VTU evidence is not PRESENT"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S27: a header that is not evidence gives an incomplete capture"
+
+    # The review input alone: the source has only p, so nothing is PRESENT.
+    workspace="$(new_workspace s27_comment_only)"
+    ab_capture_fixture "$workspace"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_100.vtu"
+    printf '%s\n' '<VTKFile><Piece><PointData><!-- note > <DataArray Name="U"/> --><DataArray Name="p"/></PointData></Piece></VTKFile>' \
+        > "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_16_comment.vtu"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/vtu-point-data.txt")" "VTU_EVIDENCE=INCOMPLETE" \
+        "S27: the review input alone gives INCOMPLETE VTU evidence"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S27: the review input alone gives an incomplete required-field verdict"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S27: a source mismatch alone keeps a complete capture"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -2029,6 +2112,7 @@ AB_OBSERVATIONS=(
     s24_summary_shows_the_evidence_verdicts
     s25_vtu_name_text_inside_a_value_is_not_a_name
     s26_convergence_verdict_fails_closed
+    s27_vtu_comment_text_is_not_markup
 )
 
 # One observation runs in this process when the caller names it. The scenario

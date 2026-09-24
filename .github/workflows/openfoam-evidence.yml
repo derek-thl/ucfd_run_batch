@@ -760,7 +760,12 @@ jobs:
           # read in order, so Name text inside the quoted value of another
           # attribute is not a Name attribute. An unquoted value, an attribute
           # that is not well formed, or a second Name attribute gives no name.
-          # No element body and no appended-payload byte is kept.
+          # An XML comment, a CDATA section, or a processing instruction is
+          # skipped as one unit up to its own end ("-->", "]]>", or "?>"), so a
+          # '>' or an apparent tag inside it is not markup. If one of them does
+          # not end, the header is incomplete. Any other "<!" declaration, such as
+          # a document type declaration, is not read, and the header is then
+          # malformed. No element body and no appended-payload byte is kept.
           #
           # Status 0: a complete scan. Status 1: the file cannot be read. Status 2:
           # the header is incomplete or malformed, so the names are not evidence.
@@ -775,7 +780,7 @@ jobs:
               LC_ALL=C awk -v vtu_scan=1 -v sq="'" -v tag_file="$tag_file" -v limit="$limit" \
                            -v require_end="$(( 1 - VTU_MARKER_FOUND ))" '
                   BEGIN {
-                      off = 0; intag = 0; tag = ""; taglen = 0; tagoff = 0; quote = ""
+                      off = 0; intag = 0; tag = ""; taglen = 0; tagoff = 0; quote = ""; skip = ""
                       pd = 0; cd = 0; seen_pd = 0; seen_cd = 0; saw_end = 0; bad = 0
                       used = 0; limit_hit = 0
                   }
@@ -822,7 +827,6 @@ jobs:
                   }
                   function handle(t, o,    second, kind, name, selfclose, ctx, value) {
                       second = substr(t, 2, 1)
-                      if (second == "?" || second == "!") return
                       selfclose = 0
                       if (second == "/") {
                           kind = "end"; name = tag_name(substr(t, 3))
@@ -855,10 +859,21 @@ jobs:
                   {
                       line = $0 "\n"; n = length(line); i = 1
                       while (i <= n) {
+                          if (skip != "") {
+                              j = index(substr(line, i), skip)
+                              if (j == 0) break
+                              i += j - 1 + length(skip); skip = ""
+                              continue
+                          }
                           if (!intag) {
                               j = index(substr(line, i), "<")
                               if (j == 0) break
-                              i += j - 1; intag = 1; tag = ""; taglen = 0; quote = ""
+                              i += j - 1
+                              if (substr(line, i, 4) == "<!--") { skip = "-->"; i += 4; continue }
+                              if (substr(line, i, 9) == "<![CDATA[") { skip = "]]>"; i += 9; continue }
+                              if (substr(line, i, 2) == "<?") { skip = "?>"; i += 2; continue }
+                              if (substr(line, i, 2) == "<!") { bad = 1; exit }
+                              intag = 1; tag = ""; taglen = 0; quote = ""
                               tagoff = off + i - 1
                           }
                           while (i <= n) {
@@ -873,7 +888,7 @@ jobs:
                       off += n
                   }
                   END {
-                      if (intag || pd || cd || bad || (require_end && !saw_end)) exit 2
+                      if (intag || skip != "" || pd || cd || bad || (require_end && !saw_end)) exit 2
                       print "POINTDATA_SEEN\t" seen_pd
                       print "CELLDATA_SEEN\t" seen_cd
                       print "OUTPUT_LIMIT\t" limit_hit
