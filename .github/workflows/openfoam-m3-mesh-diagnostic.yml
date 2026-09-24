@@ -14,11 +14,14 @@ name: openfoam-m3-mesh-diagnostic
 # temporary snappyHexMesh call has no -overwrite, so each active phase writes
 # its own time.
 #
-# Time: the job limit is 20 minutes. The active work ends 15 minutes after the
+# Time: the job limit is 20 minutes. The active work ends 12 minutes after the
 # first step starts. Each command runs under the smaller of its cap and the
-# active time left. The last 5 minutes are for the package, summary, and upload
-# steps (at least 3 minutes) and a job margin (2 minutes). The step timeouts are
-# only final guards.
+# active time left. The package, summary, and upload steps have 1, 1, and 2
+# minutes, so summary and upload keep 3 minutes. Every step has a timeout, and
+# the six step timeouts sum to 18 minutes (1 + 1 + 12 + 1 + 1 + 2), so even the
+# worst case keeps a 2-minute job margin. The diagnostic step timeout equals the
+# active window, so it cannot stop the work before the active-work deadline.
+# The step timeouts are only final guards.
 
 on:
   workflow_dispatch:
@@ -43,6 +46,7 @@ jobs:
       #    derive the environment file from one value.
       # ---------------------------------------------------------------------
       - name: Start the diagnostic clock
+        timeout-minutes: 1
         run: |
           set -euo pipefail
           start="$(date +%s)"
@@ -51,7 +55,7 @@ jobs:
           {
             echo "DIAG_DIR=${dir}"
             echo "DIAG_CLOCK_START=${start}"
-            echo "DIAG_ACTIVE_DEADLINE=$(( start + 900 ))"
+            echo "DIAG_ACTIVE_DEADLINE=$(( start + 720 ))"
             echo "OPENFOAM_ROOT=/usr/lib/openfoam"
           } >> "$GITHUB_ENV"
           # An early result, so a stop before the diagnostic step still
@@ -60,14 +64,14 @@ jobs:
             echo "DIAG_RESULT=INCONCLUSIVE_DIAGNOSTIC_NOT_STARTED"
             echo "DIAG_REASON=the diagnostic step did not start"
             echo "DIAG_CLOCK_START=${start}"
-            echo "DIAG_ACTIVE_DEADLINE=$(( start + 900 ))"
+            echo "DIAG_ACTIVE_DEADLINE=$(( start + 720 ))"
           } > "${dir}/evidence/result.env"
           echo "clock start          : ${start}"
-          echo "active-work deadline : $(( start + 900 ))"
+          echo "active-work deadline : $(( start + 720 ))"
 
       - name: Check out the repository
         id: checkout
-        timeout-minutes: 2
+        timeout-minutes: 1
         continue-on-error: true
         uses: actions/checkout@v5
 
@@ -78,7 +82,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Run the mesh diagnostic
         if: always()
-        timeout-minutes: 15
+        timeout-minutes: 12
         env:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
         run: |
@@ -638,18 +642,33 @@ jobs:
           if [[ ! "$phase_time" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
               stop PHASE_MAP "the phase time '${phase_time}' is not a time name" phase-map
           fi
+          # Every processor directory counts, not only processor0: exactly
+          # processor0 to processor<RANKS-1>, each with the phase mesh, and no
+          # directory other than constant, 0, and the phase time.
           directories=0
           for (( n = 0; n < RANKS; n++ )); do
               [[ -d "processor${n}/${phase_time}/polyMesh" ]] && directories=$(( directories + 1 ))
           done
-          extra_times="$(find processor0 -mindepth 1 -maxdepth 1 -type d ! -name constant ! -name 0 \
-                            ! -name "$phase_time" -printf '%f ' 2>/dev/null)"
+          processor_dirs="$(find . -mindepth 1 -maxdepth 1 -type d -name 'processor*' -printf '%f\n' 2>/dev/null |
+                            sort -V | tr '\n' ' ')"
+          other_processors=""
+          extra_times=""
+          for processor in $processor_dirs; do
+              if [[ ! "$processor" =~ ^processor(0|[1-9][0-9]*)$ ]] || (( ${processor#processor} >= RANKS )); then
+                  other_processors="${other_processors}${processor} "
+                  continue
+              fi
+              extra_times="${extra_times}$(find "$processor" -mindepth 1 -maxdepth 1 -type d \
+                  ! -name constant ! -name 0 ! -name "$phase_time" -printf "${processor}/%f " 2>/dev/null)"
+          done
           {
             echo "PHASE_1_PROCESSOR_DIRECTORIES=${directories}"
+            echo "PHASE_1_PROCESSOR_DIRECTORY_NAMES=${processor_dirs:-NONE}"
+            echo "PHASE_1_OTHER_PROCESSOR_DIRECTORIES=${other_processors:-NONE}"
             echo "PHASE_1_OTHER_PROCESSOR_TIMES=${extra_times:-NONE}"
           } >> "${EVIDENCE}/phase-map.txt"
-          if (( directories != RANKS )) || [[ -n "$extra_times" ]]; then
-              stop PHASE_MAP "the processor meshes do not match the phase time ${phase_time}: ${directories} of ${RANKS} directories, other times '${extra_times% }'" phase-map
+          if (( directories != RANKS )) || [[ -n "$other_processors" || -n "$extra_times" ]]; then
+              stop PHASE_MAP "the processor meshes do not match the phase time ${phase_time}: ${directories} of ${RANKS} directories, other processor directories '${other_processors% }', other times '${extra_times% }'" phase-map
           fi
           echo "PHASE_MAP_RESULT=COMPLETE" >> "${EVIDENCE}/phase-map.txt"
 
