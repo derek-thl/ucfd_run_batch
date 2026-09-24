@@ -29,7 +29,10 @@
 # logs, and the committed Case controls. They prove the per-file required-field
 # verdict, the retained original tags with offsets and checksums, the tag output
 # limits, the scan timeout, the mesh-quality verdict, the convergence verdict,
-# and the job summary rows.
+# and the job summary rows. S25 and S26 cover PR #89 review 5298374123: Name
+# text inside another attribute value is not a field name, and the convergence
+# verdict fails closed on changed controls, missing final records, and a stale
+# or wrong solver marker.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -1661,28 +1664,47 @@ s22_mesh_quality_evidence() {
         "S22: a mesh verdict does not change the capture result"
 }
 
-# ab_simplefoam_log <file> <mode> - a simpleFoam log. mode: converged | endtime
+# ab_simplefoam_log <file> <mode> - a simpleFoam log. mode: converged | endtime |
+# stale (the marker comes before the final Time block) | wrong_time (the marker
+# after the final Time block names an earlier time) | no_final_continuity |
+# no_final_residuals (the final Time block has no p record and no k record).
 ab_simplefoam_log() {
-    local file="$1" mode="$2" time
+    local file="$1" mode="$2" time final
     mkdir -p "$(dirname -- "$file")"
     {
         printf 'Exec   : simpleFoam -parallel\nnProcs : 8\n\nStarting time loop\n\n'
         for time in 2999 3000; do
+            final=0
+            [[ "$time" == 3000 ]] && final=1
             printf 'Time = %s\n\n' "$time"
             printf 'smoothSolver:  Solving for Ux, Initial residual = %s, Final residual = 3e-07, No Iterations 1\n' \
                 "$([[ $time == 3000 ]] && echo 1.06518e-05 || echo 2e-05)"
             printf 'smoothSolver:  Solving for Uy, Initial residual = 0.000174519, Final residual = 5e-06, No Iterations 1\n'
             printf 'smoothSolver:  Solving for Uz, Initial residual = 9.66882e-05, Final residual = 3e-06, No Iterations 1\n'
-            printf 'GAMG:  Solving for p, Initial residual = 0.00136639, Final residual = 0.0001, No Iterations 1\n'
-            printf 'time step continuity errors : sum local = 1e-08, global = -2e-10, cumulative = -%s\n' "$time"
-            printf 'GAMG:  Solving for p, Initial residual = 0.000146973, Final residual = 8e-06, No Iterations 2\n'
+            if ! (( final )) || [[ "$mode" != no_final_residuals ]]; then
+                printf 'GAMG:  Solving for p, Initial residual = 0.00136639, Final residual = 0.0001, No Iterations 1\n'
+            fi
+            if ! (( final )) || [[ "$mode" != no_final_continuity ]]; then
+                printf 'time step continuity errors : sum local = 1e-08, global = -2e-10, cumulative = -%s\n' "$time"
+            fi
+            if ! (( final )) || [[ "$mode" != no_final_residuals ]]; then
+                printf 'GAMG:  Solving for p, Initial residual = 0.000146973, Final residual = 8e-06, No Iterations 2\n'
+            fi
             printf 'smoothSolver:  Solving for epsilon, Initial residual = 1.2842e-05, Final residual = 3e-07, No Iterations 1\n'
-            printf 'smoothSolver:  Solving for k, Initial residual = 2.43816e-05, Final residual = 6e-07, No Iterations 1\n'
+            if ! (( final )) || [[ "$mode" != no_final_residuals ]]; then
+                printf 'smoothSolver:  Solving for k, Initial residual = 2.43816e-05, Final residual = 6e-07, No Iterations 1\n'
+            fi
             printf 'ExecutionTime = 1 s  ClockTime = 1 s\n\n'
+            if ! (( final )) && [[ "$mode" == stale ]]; then
+                printf '\nSIMPLE solution converged in 2999 iterations\n\n'
+            fi
         done
-        if [[ "$mode" == converged ]]; then
-            printf '\nSIMPLE solution converged in 3000 iterations\n\n'
-        fi
+        case "$mode" in
+            converged|no_final_continuity|no_final_residuals)
+                printf '\nSIMPLE solution converged in 3000 iterations\n\n' ;;
+            wrong_time)
+                printf '\nSIMPLE solution converged in 2999 iterations\n\n' ;;
+        esac
         printf 'End\n\n'
     } > "$file"
 }
@@ -1790,6 +1812,179 @@ s24_summary_shows_the_evidence_verdicts() {
         "S24: the job summary keeps the capture result"
 }
 
+# ---- S25 and S26: the PR #89 review corrections (review 5298374123) ----------
+
+s25_vtu_name_text_inside_a_value_is_not_a_name() {
+    local workspace evidence vtk file checked
+    workspace="$(new_workspace s25_vtu_attribute_boundaries)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+
+    # Name text inside a single-quoted value of another attribute.
+    ab_vtu_appended "${vtk}/flow_latest_11_text_single.vtu" \
+        "$(printf "<PointData>\n<DataArray Note=' Name=\"U\" '/>\n<DataArray type=\"Float32\" Name=\"p\"/>\n</PointData>")"
+    # Name text inside a double-quoted value of another attribute.
+    ab_vtu_appended "${vtk}/flow_latest_12_text_double.vtu" \
+        "$(printf "<PointData>\n<DataArray Name=\"p\"/>\n<DataArray format=\"ascii\" Note=\"a Name='U' b\"/>\n</PointData>")"
+    # A real Name attribute after a value that holds Name text and a '>'
+    # character, with spaces around '=' and a tab before the attribute.
+    ab_vtu_appended "${vtk}/flow_latest_13_after_text.vtu" \
+        "$(printf "<PointData>\n<DataArray Note='a > Name=\"x\"' Name = \"U\"/>\n<DataArray\tName='p'/>\n</PointData>")"
+    # Two Name attributes in one tag are not well formed, so no name counts.
+    ab_vtu_appended "${vtk}/flow_latest_14_two_names.vtu" \
+        "$(printf '<PointData>\n<DataArray Name="U" Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
+    # A quoted Name after an unquoted attribute value does not count.
+    ab_vtu_appended "${vtk}/flow_latest_15_unquoted_first.vtu" \
+        "$(printf '<PointData>\n<DataArray format=ascii Name="U"/>\n<DataArray Name="p"/>\n</PointData>')"
+
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+
+    for file in case_7/vtk/flow_latest_11_text_single.vtu case_7/vtk/flow_latest_12_text_double.vtu \
+            case_7/vtk/flow_latest_14_two_names.vtu case_7/vtk/flow_latest_15_unquoted_first.vtu; do
+        assert_eq "MISSING_REQUIRED_FIELDS" \
+            "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+            "S25: ${file}: a Name outside a well-formed attribute list is not a field"
+        assert_eq "p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+            "S25: ${file}: only the real Name attribute is observed"
+        assert_eq "U" "$(ab_vtu_result "$workspace" "$file" VTU_MISSING_REQUIRED_FIELDS)" \
+            "S25: ${file}: the missing required field is named"
+        assert_eq "COMPLETE" "$(ab_vtu_result "$workspace" "$file" VTU_TAG_EVIDENCE)" \
+            "S25: ${file}: the tag evidence is complete"
+    done
+    file=case_7/vtk/flow_latest_13_after_text.vtu
+    assert_eq "MATCH" "$(ab_vtu_result "$workspace" "$file" VTU_REQUIRED_FIELDS_RESULT)" \
+        "S25: a real Name attribute after a value with Name text is MATCH"
+    assert_eq "U p" "$(ab_vtu_result "$workspace" "$file" VTU_OBSERVED_FIELDS)" \
+        "S25: the name comes from the attribute, not from the value text"
+    assert_contains "$(ab_tag_section "$workspace" case_7/vtk/flow_latest_11_text_single.vtu)" \
+        "<DataArray Note=' Name=\"U\" '/>" "S25: the tag with Name text is kept as original bytes"
+    checked="$(ab_check_tag_records "$workspace")"
+    assert_contains "$checked" "bad=0" "S25: every retained tag equals its source bytes"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S25: a false field cannot complete the required-field verdict"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S25: a source mismatch alone keeps a complete capture"
+}
+
+# ab_changed_controls <file> - the committed Case controls with 1e-3 in place
+# of each 1e-4 residualControl value.
+ab_changed_controls() {
+    mkdir -p "$(dirname -- "$1")"
+    sed -e '/residualControl/,/}/s/1e-4/1e-3/' \
+        "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" > "$1"
+}
+
+# ab_one_solver_log <workspace> <log-mode> <controls: committed|changed> - run
+# the capture step on a Batch Workspace with one solver log only.
+ab_one_solver_log() {
+    local workspace="$1" batch
+    ab_capture_fixture "$workspace"
+    batch="${workspace}/checkout/src/batch_9"
+    rm -f -- "${batch}/case_7/log.simpleFoam"
+    ab_simplefoam_log "${batch}/case_7/flow/log.simpleFoam" "$2"
+    if [[ "$3" == changed ]]; then
+        ab_changed_controls "${batch}/case_7/flow/system/fvSolution"
+    else
+        mkdir -p "${batch}/case_7/flow/system"
+        cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" \
+            "${batch}/case_7/flow/system/fvSolution"
+    fi
+    ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))" > /dev/null
+}
+
+s26_convergence_verdict_fails_closed() {
+    local workspace run evidence batch conv dir mode label
+    workspace="$(new_workspace s26_convergence_fail_closed)"
+    ab_capture_fixture "$workspace"
+    evidence="${workspace}/runner_temp/evidence"
+    batch="${workspace}/checkout/src/batch_9"
+    for mode in converged stale wrong_time no_final_continuity no_final_residuals; do
+        dir="${batch}/case_7/conv_${mode}"
+        ab_simplefoam_log "${dir}/log.simpleFoam" "$mode"
+        mkdir -p "${dir}/system"
+        cp -- "${MASTER_SRC_DIR}/simpleFoam_files/system/fvSolution" "${dir}/system/fvSolution"
+    done
+    ab_simplefoam_log "${batch}/case_7/conv_changed/log.simpleFoam" converged
+    ab_changed_controls "${batch}/case_7/conv_changed/system/fvSolution"
+
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+
+    assert_contains "$run" "status=0" "S26: the capture step ends with status 0"
+    conv="${evidence}/convergence.txt"
+
+    label=case_7/conv_converged/log.simpleFoam
+    assert_eq "CONVERGED" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker after the final Time block with every record is CONVERGED"
+    assert_eq "AFTER_FINAL_TIME" \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" SOLVER_CONVERGENCE_MARKER_POSITION)" \
+        "S26: the marker position is recorded"
+    assert_eq "NONE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_REQUIRED_RECORDS_MISSING)" \
+        "S26: a complete final Time block misses no required record"
+
+    label=case_7/conv_changed/log.simpleFoam
+    assert_eq 'U 1e-3; p 1e-3; "(k|omega|epsilon)" 1e-3' \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" RESIDUAL_CONTROL)" \
+        "S26: the changed controls are recorded as they are"
+    assert_eq "false" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" RESIDUAL_CONTROL_REFERENCE_MATCH)" \
+        "S26: the changed controls do not match the M3 reference"
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker under changed controls is not CONVERGED"
+    assert_contains "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_REASON)" \
+        "M3 reference" "S26: the reason names the M3 reference"
+
+    label=case_7/conv_no_final_residuals/log.simpleFoam
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker with missing final residuals is not CONVERGED"
+    assert_eq "p k" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_REQUIRED_RECORDS_MISSING)" \
+        "S26: the missing final residual records are named"
+    assert_eq "" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_INITIAL_RESIDUAL_p)" \
+        "S26: no earlier p residual is reported as final"
+
+    label=case_7/conv_no_final_continuity/log.simpleFoam
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker with no final continuity record is not CONVERGED"
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_CONTINUITY)" \
+        "S26: an earlier continuity record is not reported as final"
+    assert_eq "continuity" \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_REQUIRED_RECORDS_MISSING)" \
+        "S26: the missing continuity record is named"
+
+    label=case_7/conv_stale/log.simpleFoam
+    assert_eq "NOT_CONVERGED" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker followed by a later Time block is NOT_CONVERGED"
+    assert_eq "BEFORE_FINAL_TIME" \
+        "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" SOLVER_CONVERGENCE_MARKER_POSITION)" \
+        "S26: the stale marker position is recorded"
+    assert_eq "3000" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" FINAL_TIME)" \
+        "S26: the final time is the later Time block"
+
+    label=case_7/conv_wrong_time/log.simpleFoam
+    assert_eq "UNAVAILABLE" "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_VERDICT)" \
+        "S26: a marker that names an earlier time is not CONVERGED"
+    assert_contains "$(ab_block_value "$conv" CONVERGENCE_LOG "$label" CONVERGENCE_LOG_REASON)" \
+        "Time = 3000" "S26: the reason names the final time"
+
+    assert_not_contains "$(cat "$conv")" "CONVERGENCE_VERDICT=CONVERGED" \
+        "S26: the aggregate verdict is not CONVERGED"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        "S26: a convergence verdict does not change the capture result"
+
+    # One log alone, so the aggregate verdict and GITHUB_ENV show each case.
+    workspace="$(new_workspace s26_changed_only)"
+    ab_one_solver_log "$workspace" converged changed
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        "S26: changed controls alone give no CONVERGED verdict"
+    workspace="$(new_workspace s26_stale_only)"
+    ab_one_solver_log "$workspace" stale committed
+    assert_eq "NOT_CONVERGED" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        "S26: a stale marker alone gives a NOT_CONVERGED verdict"
+    workspace="$(new_workspace s26_no_records_only)"
+    ab_one_solver_log "$workspace" no_final_residuals committed
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        "S26: missing final records alone give no CONVERGED verdict"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -1832,6 +2027,8 @@ AB_OBSERVATIONS=(
     s22_mesh_quality_evidence
     s23_flow_convergence_evidence
     s24_summary_shows_the_evidence_verdicts
+    s25_vtu_name_text_inside_a_value_is_not_a_name
+    s26_convergence_verdict_fails_closed
 )
 
 # One observation runs in this process when the caller names it. The scenario
