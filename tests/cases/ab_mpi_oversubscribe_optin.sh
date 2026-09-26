@@ -3327,7 +3327,7 @@ s43_spatial_capture_discovery_faults() {
         ab_diag_fixture "$workspace"
         run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK="$mode")"
         dir="$(ab_diag_dir "$workspace")"
-        assert_eq "$cause" "$(ab_diag_value "$workspace" DIAG_RESULT)" "S43: a ${mode} VTP file is ${cause}"
+        assert_eq "$cause" "$(ab_diag_value "$workspace" DIAG_RESULT)" "S43: the ${mode} VTP fault is ${cause}"
         assert_eq "$cause" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "S43: the result shows the ${mode} capture"
         assert_eq "$cause" "$(ab_diag_manifest "$workspace" SPATIAL_CAPTURE)" \
             "S43: the manifest shows the ${mode} capture"
@@ -3335,20 +3335,20 @@ s43_spatial_capture_discovery_faults() {
             "S43: the ${mode} capture stops the run"
         assert_eq "23913" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" \
             "S43: the refined check evidence is kept after the ${mode} capture"
-        assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S43: a ${mode} VTP file is not copied"
+        assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S43: no VTP file is copied after the ${mode} fault"
         archive="$(ab_diag_archive_list "$workspace")"
         if grep -Eq '\.(vtk|vtp)$' <<< "$archive"; then
-            _fail "S43: the archive must hold no set geometry after a ${mode} capture"
+            _fail "S43: the archive must hold no set geometry after the ${mode} capture"
         fi
         assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
-            "S43: no reconstruction runs after a ${mode} capture"
+            "S43: no reconstruction runs after the ${mode} capture"
         # A failed capture keeps the summary and the upload eligible.
-        assert_contains "$run" "package=0 " "S43: the package step ends with status 0 after a ${mode} capture"
-        assert_contains "$run" "summary=0" "S43: the summary step ends with status 0 after a ${mode} capture"
-        assert_file_exists "${dir}/upload/result.env" "S43: the upload holds the result after a ${mode} capture"
-        assert_file_exists "${dir}/upload/inventory.txt" "S43: the upload holds the inventory after a ${mode} capture"
+        assert_contains "$run" "package=0 " "S43: the package step ends with status 0 after the ${mode} capture"
+        assert_contains "$run" "summary=0" "S43: the summary step ends with status 0 after the ${mode} capture"
+        assert_file_exists "${dir}/upload/result.env" "S43: the upload holds the result after the ${mode} capture"
+        assert_file_exists "${dir}/upload/inventory.txt" "S43: the upload holds the inventory after the ${mode} capture"
         assert_contains "$archive" "evidence/spatial/manifest.env" \
-            "S43: the archive holds the manifest after a ${mode} capture"
+            "S43: the archive holds the manifest after the ${mode} capture"
         assert_contains "$(cat "${workspace}/step_summary")" "| Spatial capture | \`${cause}\` |" \
             "S43: the job summary shows the ${mode} capture"
     done
