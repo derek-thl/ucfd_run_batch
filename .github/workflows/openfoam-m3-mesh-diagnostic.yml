@@ -29,8 +29,9 @@ name: openfoam-m3-mesh-diagnostic
 # postProcessing/<T>/concaveCells/concaveCells.vtp. No entry of that name may
 # exist before the refined check. A missing, duplicate, wrong-path, legacy,
 # irregular, unreadable, empty, or oversized file gives an explicit
-# INCONCLUSIVE result and is not copied. That one VTP file is the only set
-# geometry in the upload.
+# INCONCLUSIVE result and is not copied. Every readable regular candidate above
+# 20 MiB gets an excluded.tsv row before the stop, and the primary cause stays.
+# That one VTP file is the only set geometry in the upload.
 
 on:
   workflow_dispatch:
@@ -155,6 +156,7 @@ jobs:
           VTK_CANDIDATES_BEFORE_CHECK=UNAVAILABLE
           VTK_CANDIDATES_AFTER_CHECK=UNAVAILABLE
           VTK_CANDIDATE_PATHS=NONE
+          VTK_OVERSIZED_CANDIDATES=0
 
           # ---- result record ----------------------------------------------
 
@@ -220,6 +222,7 @@ jobs:
                 echo "VTK_CANDIDATES_BEFORE_CHECK=${VTK_CANDIDATES_BEFORE_CHECK}"
                 echo "VTK_CANDIDATES_AFTER_CHECK=${VTK_CANDIDATES_AFTER_CHECK}"
                 echo "VTK_CANDIDATE_PATHS=${VTK_CANDIDATE_PATHS}"
+                echo "VTK_OVERSIZED_CANDIDATES=${VTK_OVERSIZED_CANDIDATES}"
               } > "${EVIDENCE}/spatial/manifest.env.tmp"
               mv -f -- "${EVIDENCE}/spatial/manifest.env.tmp" "${EVIDENCE}/spatial/manifest.env"
           }
@@ -803,6 +806,22 @@ jobs:
               VTK_CANDIDATE_PATHS="${paths% }"
               [[ -n "$VTK_CANDIDATE_PATHS" ]] || VTK_CANDIDATE_PATHS=NONE
           }
+          # exclude_oversized_candidates <list> - before any stop, one
+          # excluded.tsv row with the path, byte count, and SHA-256 of each
+          # readable regular candidate above VTK_LIMIT bytes (PR #92 review
+          # 5394488889). A symbolic link is not followed. No candidate is
+          # copied or cut here, and the primary cause does not change.
+          exclude_oversized_candidates() {
+              local path bytes
+              while IFS= read -r path; do
+                  [[ -n "$path" && ! -L "$path" && -f "$path" && -r "$path" ]] || continue
+                  bytes="$(stat -c %s -- "$path")"
+                  (( bytes > VTK_LIMIT )) || continue
+                  printf '%s\t%s\t%s\t%s\n' "${FLOW_DIR}/${path}" "$bytes" "$(sha256_of "$path")" \
+                      "the VTK file is above ${VTK_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
+                  VTK_OVERSIZED_CANDIDATES=$(( VTK_OVERSIZED_CANDIDATES + 1 ))
+              done <<< "$1"
+          }
           spatial_stop() {
               SPATIAL_CAPTURE="INCONCLUSIVE_SPATIAL_VTK_$1"
               SPATIAL_REASON="$2"
@@ -813,8 +832,10 @@ jobs:
           # and the capture reads one file of at most VTK_LIMIT bytes, so the
           # capture stays inside the active-work window.
           capture_vtp() {
-              local path bytes sha
-              record_candidates "$(vtk_candidates)" AFTER
+              local candidates path bytes sha
+              candidates="$(vtk_candidates)"
+              record_candidates "$candidates" AFTER
+              exclude_oversized_candidates "$candidates"
               if [[ ! "$REFINED_CONCAVE_CELLS" =~ ^[0-9]+$ ]]; then
                   SPATIAL_CAPTURE=INCONCLUSIVE_SPATIAL_COUNT_UNAVAILABLE
                   SPATIAL_REASON="the refined concave count is ${REFINED_CONCAVE_CELLS}, so no VTP file is a validated capture"
@@ -856,10 +877,9 @@ jobs:
               fi
               sha="$(sha256_of "$path")"
               VTK_SHA256="$sha"
+              # exclude_oversized_candidates already wrote the exclusion row.
               if (( bytes > VTK_LIMIT )); then
                   VTK_DESTINATION=EXCLUDED
-                  printf '%s\t%s\t%s\t%s\n' "$VTK_SOURCE" "$bytes" "$sha" "the VTP file is above ${VTK_LIMIT} bytes" \
-                      >> "${EVIDENCE}/excluded.tsv"
                   spatial_stop OUTPUT_LIMIT "the file ${VTK_SOURCE} has ${bytes} bytes, above ${VTK_LIMIT}"
               fi
               cp -- "$path" "${EVIDENCE}/spatial/concaveCells.vtp"
@@ -870,7 +890,9 @@ jobs:
 
           # Provenance: no candidate may exist before the refined check, so a
           # later file comes from that check.
-          record_candidates "$(vtk_candidates)" BEFORE
+          candidates="$(vtk_candidates)"
+          record_candidates "$candidates" BEFORE
+          exclude_oversized_candidates "$candidates"
           if (( VTK_CANDIDATES_BEFORE_CHECK > 0 )); then
               spatial_stop PROVENANCE "the flow Case holds ${VTK_CANDIDATES_BEFORE_CHECK} concaveCells VTK entries before the refined check: ${VTK_CANDIDATE_PATHS}"
           fi

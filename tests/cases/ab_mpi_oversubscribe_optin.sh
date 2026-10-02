@@ -3433,6 +3433,8 @@ s44_spatial_capture_vtp_size_limit() {
         assert_contains "$rows" "$expected" "S44: excluded.tsv records the ${mode} path, size, and hash"
         assert_eq "1" "$(awk 'NF' <<< "$rows" | wc -l | tr -d ' ')" \
             "S44: excluded.tsv has one row for the ${mode} candidates"
+        assert_eq "1" "$(ab_diag_manifest "$workspace" VTK_OVERSIZED_CANDIDATES)" \
+            "S44: the manifest counts one oversized ${mode} candidate"
         assert_contains "$(cat "${dir}/upload/inventory.txt")" \
             "EXCLUDED	20971521	$(ab_sha "$source")	${AB_DIAG_FLOW}/${big}" \
             "S44: the inventory names the excluded ${mode} candidate"
