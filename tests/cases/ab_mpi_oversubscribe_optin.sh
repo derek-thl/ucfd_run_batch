@@ -2466,6 +2466,15 @@ case "$name" in
                 directory) mkdir -p "$file" ;;
                 symlink) printf 'concave cells\n' > "${base}/concaveCells/target.dat"; ln -s target.dat "$file" ;;
                 size:*) head -c "${FAKE_VTK#size:}" /dev/zero > "$file" ;;
+                # Oversized rejected candidates (PR #92 review 5394488889).
+                big_wrong_path)
+                    mkdir -p "postProcessing/checkMesh/${time}"
+                    head -c 20971521 /dev/zero > "postProcessing/checkMesh/${time}/concaveCells.vtp" ;;
+                big_legacy) head -c 20971521 /dev/zero > "${base}/concaveCells/concaveCells.vtk" ;;
+                big_duplicate)
+                    head -c 20971521 /dev/zero > "$file"
+                    printf 'concave cells\n' > "${base}/concaveCells.vtp"
+                    ln -s concaveCells.vtp "${base}/concaveCells/concaveCells.vtk" ;;
             esac
         }
         echo "Exec   : checkMesh $*"
@@ -2559,6 +2568,9 @@ case "${FAKE_SETUP_LOG:-ok}" in
         mkdir -p "${flow}/postProcessing/1/concaveCells"
         printf 'stale\n' > "${flow}/postProcessing/1/concaveCells/concaveCells.vtp" ;;
     stale_vtk) printf 'stale\n' > "${flow}/constant/concaveCells.vtk" ;;
+    stale_big_vtp)
+        mkdir -p "${flow}/postProcessing/1/concaveCells"
+        head -c 20971521 /dev/zero > "${flow}/postProcessing/1/concaveCells/concaveCells.vtp" ;;
 esac
 row() {
     printf '"%s","2","%s","%s","180.000","5.0","5.0","%s","%s","%s"\n' \
@@ -3377,6 +3389,8 @@ s44_spatial_capture_vtp_size_limit() {
     assert_contains "$(cat "${dir}/evidence/excluded.tsv")" \
         "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp	20971521	$(ab_sha "$source")	" \
         "S44: excluded.tsv records the path, the size, and the hash"
+    assert_eq "1" "$(tail -n +2 "${dir}/evidence/excluded.tsv" | wc -l | tr -d ' ')" \
+        "S44: excluded.tsv has one row for the one oversized file"
     assert_contains "$(cat "${dir}/upload/inventory.txt")" \
         "EXCLUDED	20971521	$(ab_sha "$source")	${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" \
         "S44: the inventory names the excluded VTP file"
@@ -3398,10 +3412,51 @@ s44_spatial_capture_vtp_size_limit() {
         "S44: the diagnostic class stands with a VTP file at the limit"
     size="$(stat -c %s -- "${dir}/upload/m3-mesh-diagnostic-evidence.tar.gz")"
     (( size <= 47185920 )) || _fail "S44: the archive must stay inside 45 MiB" "bytes: ${size}"
+
+    # Every oversized readable regular candidate gets an exclusion row before
+    # the stop, and the primary cause stays (PR #92 review 5394488889). A
+    # symbolic link is not followed, and no rejected file is copied.
+    local entry mode cause big rows expected
+    for entry in "big_wrong_path:WRONG_PATH:postProcessing/checkMesh/1/concaveCells.vtp" \
+                 "big_legacy:LEGACY_FORMAT:postProcessing/1/concaveCells/concaveCells.vtk" \
+                 "big_duplicate:DUPLICATE:postProcessing/1/concaveCells/concaveCells.vtp"; do
+        IFS=: read -r mode cause big <<< "$entry"
+        workspace="$(new_workspace "s44_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK="$mode" > /dev/null
+        dir="$(ab_diag_dir "$workspace")"
+        source="${workspace}/checkout/${AB_DIAG_FLOW}/${big}"
+        assert_eq "INCONCLUSIVE_SPATIAL_VTK_${cause}" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S44: an oversized ${mode} candidate keeps the primary cause ${cause}"
+        rows="$(tail -n +2 "${dir}/evidence/excluded.tsv")"
+        expected="${AB_DIAG_FLOW}/${big}	20971521	$(ab_sha "$source")	"
+        assert_contains "$rows" "$expected" "S44: excluded.tsv records the ${mode} path, size, and hash"
+        assert_eq "1" "$(awk 'NF' <<< "$rows" | wc -l | tr -d ' ')" \
+            "S44: excluded.tsv has one row for the ${mode} candidates"
+        assert_contains "$(cat "${dir}/upload/inventory.txt")" \
+            "EXCLUDED	20971521	$(ab_sha "$source")	${AB_DIAG_FLOW}/${big}" \
+            "S44: the inventory names the excluded ${mode} candidate"
+        assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S44: no file is copied after ${mode}"
+        if ab_diag_archive_list "$workspace" | grep -Eq '\.(vtk|vtp)$'; then
+            _fail "S44: the archive must hold no set geometry after ${mode}"
+        fi
+        size="$(du -cb "${dir}/upload" | tail -n 1 | cut -f1)"
+        (( size < 1048576 )) || _fail "S44: the upload must not hold the ${mode} candidate" "bytes: ${size}"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+            "S44: no reconstruction runs after ${mode}"
+    done
+    # In the duplicate set, the small file and the symbolic link to the large
+    # file have no exclusion row.
+    assert_not_contains "$rows" "${AB_DIAG_FLOW}/postProcessing/1/concaveCells.vtp	" \
+        "S44: the small duplicate has no exclusion row"
+    assert_not_contains "$rows" "concaveCells/concaveCells.vtk" \
+        "S44: the symbolic link to the large file is not followed"
+    assert_eq "3" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+        "S44: the manifest counts the three duplicate entries"
 }
 
 s45_spatial_capture_provenance_and_zero_count() {
-    local workspace mode dir
+    local workspace mode dir stale
     # An entry before the refined check cannot prove its origin.
     for mode in stale_vtp stale_vtk; do
         workspace="$(new_workspace "s45_${mode}")"
@@ -3416,6 +3471,18 @@ s45_spatial_capture_provenance_and_zero_count() {
         assert_file_missing "$(ab_diag_dir "$workspace")/evidence/spatial/concaveCells.vtp" \
             "S45: a ${mode} entry is not copied"
     done
+    # An oversized stale entry also gets its exclusion row (PR #92 review
+    # 5394488889), and the primary cause stays.
+    workspace="$(new_workspace s45_stale_big_vtp)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SETUP_LOG=stale_big_vtp > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    stale="${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp"
+    assert_eq "INCONCLUSIVE_SPATIAL_VTK_PROVENANCE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: an oversized stale entry keeps the provenance cause"
+    assert_contains "$(cat "${dir}/evidence/excluded.tsv")" \
+        "${stale}	20971521	$(ab_sha "${workspace}/checkout/${stale}")	" \
+        "S45: excluded.tsv records the oversized stale entry"
 
     # An exact zero count and no entry: nothing to locate, and the existing
     # classifier decides.
