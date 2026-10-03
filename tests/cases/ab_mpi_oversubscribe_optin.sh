@@ -48,6 +48,14 @@
 # check evidence, the stop rules, the timeouts, the output limits, and that no
 # solver, flow Stage, post-processing Stage, or dispatch runs.
 #
+# Checks S42 to S47 cover the capture-only spatial test of the same workflow
+# (Issue #80, corrected contract 5847967745). They run the same extracted steps.
+# They prove the copy of the refined concaveCells VTP file from its exact v2512
+# path at the dynamic phase time, the provenance check before the refined check,
+# the discovery faults, the 20 MiB VTP limit, the zero-concavity rule, the two
+# setup logs and their 1 MiB limit, the final-inventory rule, and the permitted
+# archive content.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -2396,6 +2404,7 @@ case "$name" in
         echo "Exec   : snappyHexMesh $*"
         case "${FAKE_SNAPPY:-ok}" in
             ok) phase Refined 1 ;;
+            time3) phase Refined 3 ;;
             missing) echo "Refined mesh : cells:1175333" ;;
             duplicate) phase Refined 1; phase Refined 1 ;;
             unlabelled) echo "Writing mesh to time 1"; phase_dirs 1 ;;
@@ -2429,10 +2438,44 @@ case "$name" in
                 mkdir -p "$dir"
                 printf 'FoamFile { class cellSet; object concaveCells; }\n%s\n(\n)\n' "$count" > "${dir}/concaveCells"
             done
-            if (( write_geometry )); then
-                mkdir -p "postProcessing/checkMesh/${time}"
-                printf 'fake set geometry\n' > "postProcessing/checkMesh/${time}/concaveCells.vtk"
-            fi
+        }
+        # -writeSets vtk writes each written set as VTK XML geometry at
+        # postProcessing/<time>/<set>/<set>.vtp (v2512 checkTools.C). The
+        # concaveCells geometry exists only for a concave count; the nearPoints
+        # geometry is another set. FAKE_VTK selects a fault, and force writes
+        # the concaveCells geometry for any count.
+        write_vtp() {
+            local base="postProcessing/${time}" file
+            file="${base}/concaveCells/concaveCells.vtp"
+            mkdir -p "$base"
+            printf '<?xml version="1.0"?>\n<VTKFile type="PolyData">near points</VTKFile>\n' > "${base}/nearPoints.vtp"
+            [[ "$1" == concave:* || "${FAKE_VTK:-ok}" == force ]] || return 0
+            mkdir -p "${base}/concaveCells"
+            case "${FAKE_VTK:-ok}" in
+                ok|force)
+                    printf '<?xml version="1.0"?>\n<VTKFile type="PolyData">concave cells at time %s</VTKFile>\n' \
+                        "$time" > "$file" ;;
+                missing) ;;
+                wrong_path)
+                    mkdir -p "postProcessing/checkMesh/${time}"
+                    printf 'concave cells\n' > "postProcessing/checkMesh/${time}/concaveCells.vtp" ;;
+                legacy) printf '# vtk DataFile Version 2.0\n' > "${base}/concaveCells/concaveCells.vtk" ;;
+                duplicate) printf 'concave cells\n' > "$file"; printf 'concave cells\n' > "${base}/concaveCells.vtp" ;;
+                empty) : > "$file" ;;
+                unreadable) printf 'concave cells\n' > "$file"; chmod 000 "$file" ;;
+                directory) mkdir -p "$file" ;;
+                symlink) printf 'concave cells\n' > "${base}/concaveCells/target.dat"; ln -s target.dat "$file" ;;
+                size:*) head -c "${FAKE_VTK#size:}" /dev/zero > "$file" ;;
+                # Oversized rejected candidates (PR #92 review 5394488889).
+                big_wrong_path)
+                    mkdir -p "postProcessing/checkMesh/${time}"
+                    head -c 20971521 /dev/zero > "postProcessing/checkMesh/${time}/concaveCells.vtp" ;;
+                big_legacy) head -c 20971521 /dev/zero > "${base}/concaveCells/concaveCells.vtk" ;;
+                big_duplicate)
+                    head -c 20971521 /dev/zero > "$file"
+                    printf 'concave cells\n' > "${base}/concaveCells.vtp"
+                    ln -s concaveCells.vtp "${base}/concaveCells/concaveCells.vtk" ;;
+            esac
         }
         echo "Exec   : checkMesh $*"
         echo "Time = ${time}"
@@ -2458,6 +2501,7 @@ case "$name" in
             noresult)
                 : ;;
         esac
+        (( write_geometry )) && write_vtp "$mode"
         echo "End" ;;
     reconstructParMesh)
         time="$(after -time "$@" || true)"
@@ -2505,6 +2549,29 @@ esac
 sed -i -e "s#<snap_ctrl>#${snap}#" -e "s#^addLayers[[:space:]]*on;#addLayers       ${layers};#" \
     "${flow}/system/snappyHexMeshDict"
 sed -i -e "s#<np>#${np}#" "${flow}/system/decomposeParDict"
+# The real setup Stage writes these two logs when it rotates the STL files
+# (setup_cases.sh). FAKE_SETUP_LOG selects a fault, or a stale set geometry
+# file before any mesh command.
+transform="${flow}/log.surfaceTransformPoints"
+check="${flow}/log.surfaceCheck"
+printf 'Set centre of rotation to (297.57 -836.476 42.985)\n' > "$transform"
+printf 'Bounding Box : (-2.43 -1036.48 0) (597.57 -636.476 85.97)\n' > "$check"
+case "${FAKE_SETUP_LOG:-ok}" in
+    missing_transform) rm -f "$transform" ;;
+    missing_check) rm -f "$check" ;;
+    big_transform) head -c 1048577 /dev/zero | tr '\0' 'x' > "$transform" ;;
+    big_check) head -c 1048577 /dev/zero | tr '\0' 'x' > "$check" ;;
+    limit_check) head -c 1048576 /dev/zero | tr '\0' 'x' > "$check" ;;
+    directory_check) rm -f "$check"; mkdir "$check" ;;
+    unreadable_check) chmod 000 "$check" ;;
+    stale_vtp)
+        mkdir -p "${flow}/postProcessing/1/concaveCells"
+        printf 'stale\n' > "${flow}/postProcessing/1/concaveCells/concaveCells.vtp" ;;
+    stale_vtk) printf 'stale\n' > "${flow}/constant/concaveCells.vtk" ;;
+    stale_big_vtp)
+        mkdir -p "${flow}/postProcessing/1/concaveCells"
+        head -c 20971521 /dev/zero > "${flow}/postProcessing/1/concaveCells/concaveCells.vtp" ;;
+esac
 row() {
     printf '"%s","2","%s","%s","180.000","5.0","5.0","%s","%s","%s"\n' \
         "${PWD}/${batch}/output_batch_9.csv" "$1" "$2" "${PWD}/${batch}/$2" "$3" "$4"
@@ -2629,6 +2696,23 @@ ab_diag_calls() {
 # ab_diag_archive_list <workspace> - the member names of the uploaded archive.
 ab_diag_archive_list() {
     tar -tzf "$(ab_diag_dir "$1")/upload/m3-mesh-diagnostic-evidence.tar.gz"
+}
+
+# ab_diag_manifest <workspace> <key> - one value of the spatial-capture manifest.
+ab_diag_manifest() {
+    ab_file_value "$(ab_diag_dir "$1")/evidence/spatial/manifest.env" "$2" 2>/dev/null
+}
+
+# ab_diag_inventory_sha <workspace> <path> - the checksum of one FILE row of the
+# uploaded inventory, or nothing.
+ab_diag_inventory_sha() {
+    awk -F '\t' -v p="$2" '$1 == "FILE" && $4 == p { print $3 }' \
+        "$(ab_diag_dir "$1")/upload/inventory.txt"
+}
+
+# ab_sha <file> - the SHA-256 of one file.
+ab_sha() {
+    sha256sum < "$1" | cut -d' ' -f1
 }
 
 s30_diagnostic_workflow_interface() {
@@ -3116,6 +3200,8 @@ s40_diagnostic_never_solves_or_dispatches() {
     workspace="$(new_workspace s40_no_solver)"
     ab_diag_fixture "$workspace"
     ab_diag_run "$workspace" FAKE_CHECK_PHASE=concave:23912 FAKE_CHECK_FINAL=concave:23912 > /dev/null
+    # This run includes the spatial capture (Issue #80, contract 5847967745).
+    assert_eq "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "S40: the run includes the spatial capture"
     calls="$(ab_diag_calls "$workspace")"
     assert_not_contains "$calls" "simpleFoam" "S40: no solver runs"
     assert_not_contains "$calls" "foamToVTK" "S40: no post-processing runs"
@@ -3142,6 +3228,412 @@ s41_diagnostic_checkout_failure_and_summary() {
         "S41: the job summary shows the checkout stop"
     assert_contains "$(cat "${workspace}/step_summary")" "| Active elapsed seconds |" \
         "S41: the job summary shows the elapsed time"
+}
+
+# ---- S42 to S47: the capture-only spatial test (Issue #80) -----------------
+
+# The concave-cell run of S42 to S47: a clean background and 23913 concave
+# cells in the refined and final meshes.
+AB_DIAG_CONCAVE=(FAKE_CHECK_PHASE=concave:23913 FAKE_CHECK_FINAL=concave:23913)
+
+s42_spatial_capture_copies_the_refined_vtp() {
+    local workspace run dir flow source copy archive name prefix
+    workspace="$(new_workspace s42_spatial_complete)"
+    ab_diag_fixture "$workspace"
+    # The phase time 3 proves that the path comes from the phase map.
+    run="$(ab_diag_run "$workspace" FAKE_SNAPPY=time3 "${AB_DIAG_CONCAVE[@]}")"
+    dir="$(ab_diag_dir "$workspace")"
+    flow="${workspace}/checkout/${AB_DIAG_FLOW}"
+    source="${flow}/postProcessing/3/concaveCells/concaveCells.vtp"
+    copy="${dir}/evidence/spatial/concaveCells.vtp"
+
+    assert_contains "$run" "package=0 " "S42: the package step ends with status 0"
+    assert_contains "$run" "summary=0" "S42: the summary step ends with status 0"
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S42: a complete capture keeps the diagnostic class"
+    assert_eq "3" "$(ab_diag_value "$workspace" REFINED_TIME)" "S42: the refined time is the phase time"
+    assert_eq "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "S42: the result shows a complete capture"
+    assert_eq "CAPTURED" "$(ab_diag_value "$workspace" SETUP_LOGS)" "S42: the result shows the setup logs"
+    assert_eq "COMPLETE" "$(ab_diag_manifest "$workspace" SPATIAL_CAPTURE)" \
+        "S42: the manifest shows a complete capture"
+
+    # The VTP file: the exact source path, the bytes, the size, and the hash.
+    assert_file_exists "$copy" "S42: the VTP file is copied"
+    cmp -s -- "$source" "$copy" || _fail "S42: the copy must have the bytes of the source"
+    assert_eq "${AB_DIAG_FLOW}/postProcessing/3/concaveCells/concaveCells.vtp" \
+        "$(ab_diag_manifest "$workspace" VTK_SOURCE)" "S42: the manifest records the exact source path"
+    assert_eq "spatial/concaveCells.vtp" "$(ab_diag_manifest "$workspace" VTK_DESTINATION)" \
+        "S42: the manifest records the destination"
+    assert_eq "$(stat -c %s -- "$source")" "$(ab_diag_manifest "$workspace" VTK_BYTES)" \
+        "S42: the manifest records the byte count"
+    assert_eq "$(ab_sha "$source")" "$(ab_diag_manifest "$workspace" VTK_SHA256)" \
+        "S42: the manifest records the SHA-256"
+    assert_eq "0" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_BEFORE_CHECK)" \
+        "S42: no set geometry exists before the refined check"
+    assert_eq "1" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+        "S42: the refined check writes one set geometry file"
+    # The phase time, the command, the Case, the main SHA, and the run ID.
+    assert_eq "3" "$(ab_diag_manifest "$workspace" REFINED_TIME)" "S42: the manifest records the phase time"
+    assert_eq "23913" "$(ab_diag_manifest "$workspace" REFINED_CONCAVE_CELLS)" \
+        "S42: the manifest records the refined concave count"
+    assert_eq "mpirun --oversubscribe -np 8 checkMesh -parallel -allGeometry -allTopology -time 3 -writeSets vtk" \
+        "$(ab_diag_manifest "$workspace" REFINED_CHECK_VECTOR)" "S42: the manifest records the exact command vector"
+    assert_eq "7" "$(ab_diag_manifest "$workspace" CASE_ID)" "S42: the manifest records the Case"
+    assert_eq "6f198977b700a2bcb664bcc704a3d506eefb67ab" "$(ab_diag_manifest "$workspace" MAIN_SHA)" \
+        "S42: the manifest records the main SHA"
+    assert_eq "4242" "$(ab_diag_manifest "$workspace" RUN_ID)" "S42: the manifest records the run ID"
+
+    # The two setup logs: source, destination, size, hash, and bytes.
+    for name in surfaceTransformPoints surfaceCheck; do
+        case "$name" in
+            surfaceTransformPoints) prefix=TRANSFORM_LOG ;;
+            surfaceCheck) prefix=CHECK_LOG ;;
+        esac
+        assert_eq "${AB_DIAG_FLOW}/log.${name}" "$(ab_diag_manifest "$workspace" "${prefix}_SOURCE")" \
+            "S42: the manifest records the ${name} log source"
+        assert_eq "logs/setup-${name}.log" "$(ab_diag_manifest "$workspace" "${prefix}_DESTINATION")" \
+            "S42: the manifest records the ${name} log destination"
+        assert_eq "$(stat -c %s -- "${flow}/log.${name}")" "$(ab_diag_manifest "$workspace" "${prefix}_BYTES")" \
+            "S42: the manifest records the ${name} log size"
+        assert_eq "$(ab_sha "${flow}/log.${name}")" "$(ab_diag_manifest "$workspace" "${prefix}_SHA256")" \
+            "S42: the manifest records the ${name} log SHA-256"
+        cmp -s -- "${flow}/log.${name}" "${dir}/evidence/logs/setup-${name}.log" ||
+            _fail "S42: the ${name} log copy must have the bytes of the source"
+        assert_eq "$(ab_sha "${flow}/log.${name}")" "$(ab_diag_inventory_sha "$workspace" "logs/setup-${name}.log")" \
+            "S42: the final inventory shows the ${name} log"
+    done
+    assert_eq "$(ab_sha "$source")" "$(ab_diag_inventory_sha "$workspace" spatial/concaveCells.vtp)" \
+        "S42: the final inventory shows the VTP file"
+
+    # The spatial additions are the VTP file, the two setup logs, and the
+    # manifest. No mesh, other set, field, VTU, STL, or source archive.
+    archive="$(ab_diag_archive_list "$workspace")"
+    assert_eq "evidence/spatial/concaveCells.vtp" \
+        "$(grep -E '\.(vtk|vtp|vtu|vtm|pvd|stl|obj|gz|tgz|zip)$' <<< "$archive" || true)" \
+        "S42: the only geometry file in the archive is the refined concaveCells VTP file"
+    for name in evidence/logs/setup-surfaceTransformPoints.log evidence/logs/setup-surfaceCheck.log \
+                evidence/spatial/manifest.env; do
+        assert_contains "$archive" "$name" "S42: the archive holds ${name}"
+    done
+    for name in polyMesh processor postProcessing nearPoints triSurface; do
+        assert_not_contains "$archive" "$name" "S42: the archive holds no ${name} file"
+    done
+    assert_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time 3" \
+        "S42: the diagnostic continues after a complete capture"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Spatial capture | `COMPLETE` |' \
+        "S42: the job summary shows the spatial capture"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Setup logs | `CAPTURED` |' \
+        "S42: the job summary shows the setup logs"
+}
+
+s43_spatial_capture_discovery_faults() {
+    local workspace run dir entry mode cause archive
+    local entries=("missing:MISSING" "wrong_path:WRONG_PATH" "legacy:LEGACY_FORMAT" "duplicate:DUPLICATE"
+                   "empty:EMPTY" "directory:NOT_REGULAR_FILE" "symlink:NOT_REGULAR_FILE")
+    # A root process can read a file without read permission.
+    (( EUID != 0 )) && entries+=("unreadable:UNREADABLE")
+    for entry in "${entries[@]}"; do
+        mode="${entry%%:*}"
+        cause="INCONCLUSIVE_SPATIAL_VTK_${entry#*:}"
+        workspace="$(new_workspace "s43_${mode}")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK="$mode")"
+        dir="$(ab_diag_dir "$workspace")"
+        assert_eq "$cause" "$(ab_diag_value "$workspace" DIAG_RESULT)" "S43: the ${mode} VTP fault is ${cause}"
+        assert_eq "$cause" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "S43: the result shows the ${mode} capture"
+        assert_eq "$cause" "$(ab_diag_manifest "$workspace" SPATIAL_CAPTURE)" \
+            "S43: the manifest shows the ${mode} capture"
+        assert_eq "spatial-capture" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" \
+            "S43: the ${mode} capture stops the run"
+        assert_eq "23913" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" \
+            "S43: the refined check evidence is kept after the ${mode} capture"
+        assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S43: no VTP file is copied after the ${mode} fault"
+        archive="$(ab_diag_archive_list "$workspace")"
+        if grep -Eq '\.(vtk|vtp)$' <<< "$archive"; then
+            _fail "S43: the archive must hold no set geometry after the ${mode} capture"
+        fi
+        assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+            "S43: no reconstruction runs after the ${mode} capture"
+        # A failed capture keeps the summary and the upload eligible.
+        assert_contains "$run" "package=0 " "S43: the package step ends with status 0 after the ${mode} capture"
+        assert_contains "$run" "summary=0" "S43: the summary step ends with status 0 after the ${mode} capture"
+        assert_file_exists "${dir}/upload/result.env" "S43: the upload holds the result after the ${mode} capture"
+        assert_file_exists "${dir}/upload/inventory.txt" "S43: the upload holds the inventory after the ${mode} capture"
+        assert_contains "$archive" "evidence/spatial/manifest.env" \
+            "S43: the archive holds the manifest after the ${mode} capture"
+        assert_contains "$(cat "${workspace}/step_summary")" "| Spatial capture | \`${cause}\` |" \
+            "S43: the job summary shows the ${mode} capture"
+    done
+    # Both entries of a duplicate are named, and neither is copied.
+    workspace="$(new_workspace s43_duplicate_names)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK=duplicate > /dev/null
+    assert_eq "2" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" "S43: the manifest counts both entries"
+    assert_contains "$(ab_diag_manifest "$workspace" VTK_CANDIDATE_PATHS)" \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells.vtp" "S43: the manifest names the other entry"
+    assert_contains "$(ab_diag_manifest "$workspace" VTK_CANDIDATE_PATHS)" \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" "S43: the manifest names the expected entry"
+}
+
+s44_spatial_capture_vtp_size_limit() {
+    local workspace dir source size
+    # One byte above 20 MiB: the file is excluded with its path, size, and
+    # hash, and the result is an output limit.
+    workspace="$(new_workspace s44_above_limit)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK=size:20971521 > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    source="${workspace}/checkout/${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp"
+    assert_eq "INCONCLUSIVE_SPATIAL_VTK_OUTPUT_LIMIT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S44: a VTP file above 20971520 bytes is INCONCLUSIVE_SPATIAL_VTK_OUTPUT_LIMIT"
+    assert_contains "$(cat "${dir}/evidence/excluded.tsv")" \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp	20971521	$(ab_sha "$source")	" \
+        "S44: excluded.tsv records the path, the size, and the hash"
+    assert_eq "1" "$(tail -n +2 "${dir}/evidence/excluded.tsv" | wc -l | tr -d ' ')" \
+        "S44: excluded.tsv has one row for the one oversized file"
+    assert_contains "$(cat "${dir}/upload/inventory.txt")" \
+        "EXCLUDED	20971521	$(ab_sha "$source")	${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" \
+        "S44: the inventory names the excluded VTP file"
+    assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S44: the large VTP file is not copied"
+    size="$(du -cb "${dir}/upload" | tail -n 1 | cut -f1)"
+    (( size < 1048576 )) || _fail "S44: the upload must not hold the large VTP file" "bytes: ${size}"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+        "S44: no reconstruction runs after the VTP limit"
+
+    # Exactly 20 MiB is inside the limit.
+    workspace="$(new_workspace s44_at_limit)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK=size:20971520 > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    assert_eq "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "S44: a 20971520-byte VTP file is captured"
+    assert_eq "20971520" "$(stat -c %s -- "${dir}/evidence/spatial/concaveCells.vtp" 2>/dev/null)" \
+        "S44: the copy has all 20971520 bytes"
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S44: the diagnostic class stands with a VTP file at the limit"
+    size="$(stat -c %s -- "${dir}/upload/m3-mesh-diagnostic-evidence.tar.gz")"
+    (( size <= 47185920 )) || _fail "S44: the archive must stay inside 45 MiB" "bytes: ${size}"
+
+    # Every oversized readable regular candidate gets an exclusion row before
+    # the stop, and the primary cause stays (PR #92 review 5394488889). A
+    # symbolic link is not followed, and no rejected file is copied.
+    local entry mode cause big rows expected
+    for entry in "big_wrong_path:WRONG_PATH:postProcessing/checkMesh/1/concaveCells.vtp" \
+                 "big_legacy:LEGACY_FORMAT:postProcessing/1/concaveCells/concaveCells.vtk" \
+                 "big_duplicate:DUPLICATE:postProcessing/1/concaveCells/concaveCells.vtp"; do
+        IFS=: read -r mode cause big <<< "$entry"
+        workspace="$(new_workspace "s44_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_VTK="$mode" > /dev/null
+        dir="$(ab_diag_dir "$workspace")"
+        source="${workspace}/checkout/${AB_DIAG_FLOW}/${big}"
+        assert_eq "INCONCLUSIVE_SPATIAL_VTK_${cause}" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S44: an oversized ${mode} candidate keeps the primary cause ${cause}"
+        rows="$(tail -n +2 "${dir}/evidence/excluded.tsv")"
+        expected="${AB_DIAG_FLOW}/${big}	20971521	$(ab_sha "$source")	"
+        assert_contains "$rows" "$expected" "S44: excluded.tsv records the ${mode} path, size, and hash"
+        assert_eq "1" "$(awk 'NF' <<< "$rows" | wc -l | tr -d ' ')" \
+            "S44: excluded.tsv has one row for the ${mode} candidates"
+        assert_eq "1" "$(ab_diag_manifest "$workspace" VTK_OVERSIZED_CANDIDATES)" \
+            "S44: the manifest counts one oversized ${mode} candidate"
+        assert_contains "$(cat "${dir}/upload/inventory.txt")" \
+            "EXCLUDED	20971521	$(ab_sha "$source")	${AB_DIAG_FLOW}/${big}" \
+            "S44: the inventory names the excluded ${mode} candidate"
+        assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S44: no file is copied after ${mode}"
+        if ab_diag_archive_list "$workspace" | grep -Eq '\.(vtk|vtp)$'; then
+            _fail "S44: the archive must hold no set geometry after ${mode}"
+        fi
+        size="$(du -cb "${dir}/upload" | tail -n 1 | cut -f1)"
+        (( size < 1048576 )) || _fail "S44: the upload must not hold the ${mode} candidate" "bytes: ${size}"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+            "S44: no reconstruction runs after ${mode}"
+    done
+    # In the duplicate set, the small file and the symbolic link to the large
+    # file have no exclusion row.
+    assert_not_contains "$rows" "${AB_DIAG_FLOW}/postProcessing/1/concaveCells.vtp	" \
+        "S44: the small duplicate has no exclusion row"
+    assert_not_contains "$rows" "concaveCells/concaveCells.vtk" \
+        "S44: the symbolic link to the large file is not followed"
+    assert_eq "3" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+        "S44: the manifest counts the three duplicate entries"
+}
+
+s45_spatial_capture_provenance_and_zero_count() {
+    local workspace mode dir stale
+    # An entry before the refined check cannot prove its origin.
+    for mode in stale_vtp stale_vtk; do
+        workspace="$(new_workspace "s45_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SETUP_LOG="$mode" > /dev/null
+        assert_eq "INCONCLUSIVE_SPATIAL_VTK_PROVENANCE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S45: a ${mode} entry before the refined check is INCONCLUSIVE_SPATIAL_VTK_PROVENANCE"
+        assert_eq "1" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_BEFORE_CHECK)" \
+            "S45: the manifest counts the ${mode} entry"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "checkMesh -parallel" \
+            "S45: the refined check does not run after a ${mode} entry"
+        assert_file_missing "$(ab_diag_dir "$workspace")/evidence/spatial/concaveCells.vtp" \
+            "S45: a ${mode} entry is not copied"
+    done
+    # An oversized stale entry also gets its exclusion row (PR #92 review
+    # 5394488889), and the primary cause stays.
+    workspace="$(new_workspace s45_stale_big_vtp)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SETUP_LOG=stale_big_vtp > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    stale="${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp"
+    assert_eq "INCONCLUSIVE_SPATIAL_VTK_PROVENANCE" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: an oversized stale entry keeps the provenance cause"
+    assert_contains "$(cat "${dir}/evidence/excluded.tsv")" \
+        "${stale}	20971521	$(ab_sha "${workspace}/checkout/${stale}")	" \
+        "S45: excluded.tsv records the oversized stale entry"
+
+    # An exact zero count and no entry: nothing to locate, and the existing
+    # classifier decides.
+    workspace="$(new_workspace s45_zero_clean)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    assert_eq "NOT_APPLICABLE_NO_REFINED_CONCAVITY" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" \
+        "S45: a zero refined count gives NOT_APPLICABLE_NO_REFINED_CONCAVITY in the result"
+    assert_eq "NOT_APPLICABLE_NO_REFINED_CONCAVITY" "$(ab_diag_manifest "$workspace" SPATIAL_CAPTURE)" \
+        "S45: a zero refined count gives NOT_APPLICABLE_NO_REFINED_CONCAVITY in the manifest"
+    assert_eq "NO_CONCAVITY_REPRODUCED" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: the existing classifier decides a zero refined count"
+    assert_not_contains "$(cat "${dir}/upload/result.env")" "SPATIAL_VTK_MISSING" \
+        "S45: a zero refined count is no missing VTP file"
+    assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "S45: no VTP file is copied for a zero count"
+    assert_eq "" "$(ab_diag_inventory_sha "$workspace" spatial/concaveCells.vtp)" \
+        "S45: the inventory has no VTP row for a zero count"
+    assert_ne "" "$(ab_diag_inventory_sha "$workspace" logs/setup-surfaceCheck.log)" \
+        "S45: the inventory shows the setup logs for a zero count"
+    workspace="$(new_workspace s45_zero_final_fails)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_FINAL=concave:5 > /dev/null
+    assert_eq "NO_PHASE_CONCAVITY_BUT_FINAL_CHECK_FAILS" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: a zero refined count keeps the final-check class"
+    assert_eq "NOT_APPLICABLE_NO_REFINED_CONCAVITY" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" \
+        "S45: the final-check class has no spatial capture"
+
+    # An exact zero count with an entry, and an unavailable count.
+    workspace="$(new_workspace s45_zero_unexpected)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_VTK=force > /dev/null
+    assert_eq "INCONCLUSIVE_SPATIAL_VTK_UNEXPECTED" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: a VTP file with a zero refined count is INCONCLUSIVE_SPATIAL_VTK_UNEXPECTED"
+    assert_file_missing "$(ab_diag_dir "$workspace")/evidence/spatial/concaveCells.vtp" \
+        "S45: an unexpected VTP file is not copied"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+        "S45: no reconstruction runs after an unexpected VTP file"
+    workspace="$(new_workspace s45_count_unavailable)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_CHECK_PHASE=failed_nocount FAKE_CHECK_FINAL=concave:9 FAKE_VTK=force > /dev/null
+    assert_eq "INCONCLUSIVE_CONCAVE_COUNT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S45: an unavailable refined count keeps its first cause"
+    assert_eq "INCONCLUSIVE_SPATIAL_COUNT_UNAVAILABLE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" \
+        "S45: an unavailable refined count gives an explicit spatial-count state"
+    assert_file_missing "$(ab_diag_dir "$workspace")/evidence/spatial/concaveCells.vtp" \
+        "S45: a VTP file without an exact count is not a validated capture"
+}
+
+s46_spatial_capture_setup_logs() {
+    local workspace dir entry mode cause source
+    local entries=("missing_transform:MISSING" "missing_check:MISSING" "directory_check:NOT_REGULAR_FILE")
+    (( EUID != 0 )) && entries+=("unreadable_check:UNREADABLE")
+    for entry in "${entries[@]}"; do
+        mode="${entry%%:*}"
+        cause="INCONCLUSIVE_SETUP_LOG_${entry#*:}"
+        workspace="$(new_workspace "s46_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SETUP_LOG="$mode" > /dev/null
+        assert_eq "$cause" "$(ab_diag_value "$workspace" DIAG_RESULT)" "S46: a ${mode} setup log is ${cause}"
+        assert_eq "$cause" "$(ab_diag_value "$workspace" SETUP_LOGS)" "S46: the result shows the ${mode} setup log"
+        assert_eq "setup-logs" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" \
+            "S46: the ${mode} setup log stops the run"
+        assert_not_contains "$(ab_diag_calls "$workspace")" "surfaceFeatureExtract" \
+            "S46: no mesh command runs after a ${mode} setup log"
+    done
+
+    # A setup log above 1 MiB is not cut and not uploaded.
+    for mode in big_transform big_check; do
+        workspace="$(new_workspace "s46_${mode}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SETUP_LOG="$mode" > /dev/null
+        dir="$(ab_diag_dir "$workspace")"
+        case "$mode" in
+            big_transform) source="${AB_DIAG_FLOW}/log.surfaceTransformPoints" ;;
+            big_check) source="${AB_DIAG_FLOW}/log.surfaceCheck" ;;
+        esac
+        assert_eq "INCONCLUSIVE_SETUP_LOG_OUTPUT_LIMIT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "S46: a ${mode} setup log above 1 MiB is INCONCLUSIVE_SETUP_LOG_OUTPUT_LIMIT"
+        assert_contains "$(cat "${dir}/evidence/excluded.tsv")" \
+            "${source}	1048577	$(ab_sha "${workspace}/checkout/${source}")	" \
+            "S46: excluded.tsv records the ${mode} path, size, and hash"
+        if ab_diag_archive_list "$workspace" | grep -Eq "/setup-${source##*log.}\.log$"; then
+            _fail "S46: the ${mode} setup log must not be uploaded"
+        fi
+        if find "${dir}/evidence" -type f -size +1024k | grep -q .; then
+            _fail "S46: no evidence file may exceed 1 MiB after a ${mode} setup log"
+        fi
+        assert_not_contains "$(ab_diag_calls "$workspace")" "surfaceFeatureExtract" \
+            "S46: no mesh command runs after a ${mode} setup log"
+    done
+
+    # A setup log of exactly 1 MiB is inside the limit.
+    workspace="$(new_workspace s46_limit_check)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" FAKE_SETUP_LOG=limit_check > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    assert_eq "CAPTURED" "$(ab_diag_value "$workspace" SETUP_LOGS)" "S46: a 1048576-byte setup log is captured"
+    assert_eq "1048576" "$(stat -c %s -- "${dir}/evidence/logs/setup-surfaceCheck.log" 2>/dev/null)" \
+        "S46: the setup log copy has all 1048576 bytes"
+    assert_eq "NO_CONCAVITY_REPRODUCED" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S46: the diagnostic continues with a setup log at the limit"
+}
+
+s47_spatial_capture_final_inventory_rule() {
+    local workspace dir
+    # A conclusive class needs the VTP file in the final inventory.
+    workspace="$(new_workspace s47_vtp_removed)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    rm -f -- "${dir}/evidence/spatial/concaveCells.vtp"
+    env RUNNER_TEMP="${workspace}/runner_temp" DIAG_DIR="$dir" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/package_step.sh" > "${workspace}/package2.out" 2>&1 ||
+        _fail "S47: the package step must end with status 0"
+    assert_eq "INCONCLUSIVE_SPATIAL_INVENTORY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S47: a conclusive class without the VTP file in the inventory is INCONCLUSIVE_SPATIAL_INVENTORY"
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_PRIOR_RESULT)" \
+        "S47: the prior result is kept for reference"
+    assert_contains "$(ab_diag_value "$workspace" DIAG_REASON)" "spatial/concaveCells.vtp" \
+        "S47: the reason names the missing VTP file"
+    assert_eq "$(ab_sha "${dir}/evidence/result.env")" "$(ab_diag_inventory_sha "$workspace" result.env)" \
+        "S47: the inventory shows the changed result file"
+
+    # A changed copy does not match the manifest hash.
+    workspace="$(new_workspace s47_vtp_changed)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    printf 'x' >> "${dir}/evidence/spatial/concaveCells.vtp"
+    env RUNNER_TEMP="${workspace}/runner_temp" DIAG_DIR="$dir" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/package_step.sh" > "${workspace}/package2.out" 2>&1 ||
+        _fail "S47: the package step must end with status 0"
+    assert_eq "INCONCLUSIVE_SPATIAL_INVENTORY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S47: a VTP file with another hash is INCONCLUSIVE_SPATIAL_INVENTORY"
+
+    # A zero count needs both setup logs in the final inventory.
+    workspace="$(new_workspace s47_log_removed)"
+    ab_diag_fixture "$workspace"
+    ab_diag_run "$workspace" > /dev/null
+    dir="$(ab_diag_dir "$workspace")"
+    rm -f -- "${dir}/evidence/logs/setup-surfaceCheck.log"
+    env RUNNER_TEMP="${workspace}/runner_temp" DIAG_DIR="$dir" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/package_step.sh" > "${workspace}/package2.out" 2>&1 ||
+        _fail "S47: the package step must end with status 0"
+    assert_eq "INCONCLUSIVE_SPATIAL_INVENTORY" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S47: a conclusive class without a setup log in the inventory is INCONCLUSIVE_SPATIAL_INVENTORY"
+    assert_eq "NO_CONCAVITY_REPRODUCED" "$(ab_diag_value "$workspace" DIAG_PRIOR_RESULT)" \
+        "S47: the prior zero-count result is kept for reference"
 }
 
 # ---- the observation list ---------------------------------------------------
@@ -3203,6 +3695,12 @@ AB_OBSERVATIONS=(
     s39_diagnostic_output_limits
     s40_diagnostic_never_solves_or_dispatches
     s41_diagnostic_checkout_failure_and_summary
+    s42_spatial_capture_copies_the_refined_vtp
+    s43_spatial_capture_discovery_faults
+    s44_spatial_capture_vtp_size_limit
+    s45_spatial_capture_provenance_and_zero_count
+    s46_spatial_capture_setup_logs
+    s47_spatial_capture_final_inventory_rule
 )
 
 # One observation runs in this process when the caller names it. The scenario

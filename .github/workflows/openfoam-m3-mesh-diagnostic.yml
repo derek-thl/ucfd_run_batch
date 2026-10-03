@@ -22,6 +22,16 @@ name: openfoam-m3-mesh-diagnostic
 # worst case keeps a 2-minute job margin. The diagnostic step timeout equals the
 # active window, so it cannot stop the work before the active-work deadline.
 # The step timeouts are only final guards.
+#
+# Spatial capture (Issue #80, contract 5847967745): the run also keeps the two
+# setup geometry logs and the refined concaveCells set geometry. The refined
+# checkMesh -writeSets vtk writes that geometry as VTK XML at
+# postProcessing/<T>/concaveCells/concaveCells.vtp. No entry of that name may
+# exist before the refined check. A missing, duplicate, wrong-path, legacy,
+# irregular, unreadable, empty, or oversized file gives an explicit
+# INCONCLUSIVE result and is not copied. Every readable regular candidate above
+# 20 MiB gets an excluded.tsv row before the stop, and the primary cause stays.
+# That one VTP file is the only set geometry in the upload.
 
 on:
   workflow_dispatch:
@@ -101,11 +111,12 @@ jobs:
           FLOW_DIR="src/batch_9/case_7/flow"
           RANKS=8
           LOG_LIMIT=1048576
+          VTK_LIMIT=20971520
           KILL_GRACE=5
           EVIDENCE="${DIAG_DIR}/evidence"
           EXCLUDED="${DIAG_DIR}/excluded"
 
-          mkdir -p "${EVIDENCE}/logs" "${EVIDENCE}/help" "${EVIDENCE}/dictionaries" "$EXCLUDED"
+          mkdir -p "${EVIDENCE}/logs" "${EVIDENCE}/help" "${EVIDENCE}/dictionaries" "${EVIDENCE}/spatial" "$EXCLUDED"
           : > "${EVIDENCE}/identity.txt"
           : > "${EVIDENCE}/help-checks.txt"
           printf 'seq\tlabel\tcap_seconds\tlimit_seconds\tstart\tend\tstatus\toutcome\tlog\tvector\n' \
@@ -128,6 +139,24 @@ jobs:
           done
           BACKGROUND_TIME=0
           FINAL_COMPARISON=UNAVAILABLE
+          # The spatial capture: the setup logs, the refined VTP file, and their
+          # provenance.
+          SETUP_LOGS=NOT_RUN
+          SPATIAL_CAPTURE=NOT_RUN
+          SPATIAL_REASON="the spatial capture did not run"
+          RUN_VECTOR=UNAVAILABLE
+          SETUP_VECTOR=UNAVAILABLE
+          REFINED_CHECK_VECTOR=UNAVAILABLE
+          for prefix in TRANSFORM_LOG CHECK_LOG VTK; do
+              for key in SOURCE DESTINATION BYTES SHA256; do
+                  printf -v "${prefix}_${key}" '%s' UNAVAILABLE
+              done
+          done
+          VTK_EXPECTED_SOURCE=UNAVAILABLE
+          VTK_CANDIDATES_BEFORE_CHECK=UNAVAILABLE
+          VTK_CANDIDATES_AFTER_CHECK=UNAVAILABLE
+          VTK_CANDIDATE_PATHS=NONE
+          VTK_OVERSIZED_CANDIDATES=0
 
           # ---- result record ----------------------------------------------
 
@@ -155,12 +184,47 @@ jobs:
                     done
                 done
                 echo "FINAL_COMPARISON=${FINAL_COMPARISON}"
+                echo "SETUP_LOGS=${SETUP_LOGS}"
+                echo "SPATIAL_CAPTURE=${SPATIAL_CAPTURE}"
                 echo "DIAG_CLOCK_START=${DIAG_CLOCK_START}"
                 echo "DIAG_ACTIVE_DEADLINE=${DIAG_ACTIVE_DEADLINE}"
                 echo "DIAG_ACTIVE_END=${end}"
                 echo "DIAG_ACTIVE_ELAPSED_SECONDS=$(( end - DIAG_CLOCK_START ))"
               } > "${EVIDENCE}/result.env.tmp"
               mv -f -- "${EVIDENCE}/result.env.tmp" "${EVIDENCE}/result.env"
+              write_manifest
+          }
+
+          # write_manifest - the spatial-capture manifest: for each setup log
+          # and the refined VTP file, the source path relative to the checkout,
+          # the evidence destination, the byte count, and the SHA-256, with the
+          # Case, the commit, the run, the phase time, and the command vectors.
+          write_manifest() {
+              local prefix key name
+              {
+                echo "SETUP_LOGS=${SETUP_LOGS}"
+                echo "SPATIAL_CAPTURE=${SPATIAL_CAPTURE}"
+                echo "SPATIAL_REASON=${SPATIAL_REASON}"
+                echo "CASE_ID=${CASE_ID}"
+                echo "MAIN_SHA=${GITHUB_SHA:-UNAVAILABLE}"
+                echo "RUN_ID=${GITHUB_RUN_ID:-UNAVAILABLE}"
+                echo "SETUP_VECTOR=${SETUP_VECTOR}"
+                for prefix in TRANSFORM_LOG CHECK_LOG VTK; do
+                    for key in SOURCE DESTINATION BYTES SHA256; do
+                        name="${prefix}_${key}"
+                        echo "${name}=${!name}"
+                    done
+                done
+                echo "REFINED_TIME=${REFINED_TIME}"
+                echo "REFINED_CONCAVE_CELLS=${REFINED_CONCAVE_CELLS}"
+                echo "REFINED_CHECK_VECTOR=${REFINED_CHECK_VECTOR}"
+                echo "VTK_EXPECTED_SOURCE=${VTK_EXPECTED_SOURCE}"
+                echo "VTK_CANDIDATES_BEFORE_CHECK=${VTK_CANDIDATES_BEFORE_CHECK}"
+                echo "VTK_CANDIDATES_AFTER_CHECK=${VTK_CANDIDATES_AFTER_CHECK}"
+                echo "VTK_CANDIDATE_PATHS=${VTK_CANDIDATE_PATHS}"
+                echo "VTK_OVERSIZED_CANDIDATES=${VTK_OVERSIZED_CANDIDATES}"
+              } > "${EVIDENCE}/spatial/manifest.env.tmp"
+              mv -f -- "${EVIDENCE}/spatial/manifest.env.tmp" "${EVIDENCE}/spatial/manifest.env"
           }
 
           finish() {
@@ -200,7 +264,8 @@ jobs:
           # runs into the reserve for the package, summary, and upload steps.
           # timeout stops the command and its process group. A log above
           # LOG_LIMIT bytes is not cut: it leaves the evidence, and its size and
-          # checksum are recorded. Sets RUN_STATUS, RUN_OUTCOME, and RUN_LOG.
+          # checksum are recorded. Sets RUN_STATUS, RUN_OUTCOME, RUN_LOG, and
+          # RUN_VECTOR.
           run_bounded() {
               local label="$1" cap="$2" now left limit start end vector log_ref bytes
               shift 2
@@ -209,6 +274,7 @@ jobs:
               log_ref="${RUN_LOG#"${EVIDENCE}/"}"
               vector="$(printf '%q ' "$@")"
               vector="${vector% }"
+              RUN_VECTOR="$vector"
               now="$(date +%s)"
               left=$(( DIAG_ACTIVE_DEADLINE - now - KILL_GRACE ))
               limit="$cap"
@@ -517,6 +583,7 @@ jobs:
           # ---- 5. the existing setup Stage --------------------------------
 
           run_preparation setup 90 bash src/run_batch.sh --stage setup -j 1 "$RUN_CSV"
+          SETUP_VECTOR="$RUN_VECTOR"
           summary="${BATCH_DIR}/setup_cases_summary.csv"
           [[ -f "$summary" ]] || stop CASE_IDENTITY "the setup Stage wrote no ${summary}" setup
           cp -- "$summary" "${EVIDENCE}/setup_cases_summary.csv"
@@ -540,6 +607,46 @@ jobs:
               stop CASE_IDENTITY "the Batch Workspace holds ${other_dirs} other Case directories" setup
           fi
           [[ -d "$FLOW_DIR" ]] || stop CASE_IDENTITY "the setup Stage wrote no ${FLOW_DIR}" setup
+
+          # ---- 5b. the setup geometry logs --------------------------------
+
+          # The setup Stage writes these two logs when it rotates the STL files.
+          # Each must be a readable regular file of at most LOG_LIMIT bytes. A
+          # larger log is not cut: its size and checksum are recorded, and the
+          # run stops before any mesh command.
+          setup_log_stop() {
+              SETUP_LOGS="INCONCLUSIVE_SETUP_LOG_$1"
+              stop "SETUP_LOG_$1" "$2" setup-logs
+          }
+          # capture_setup_log <prefix> <name> - check and copy one setup log.
+          capture_setup_log() {
+              local prefix="$1" src="${FLOW_DIR}/$2" destination="logs/setup-${2#log.}.log" bytes sha
+              printf -v "${prefix}_SOURCE" '%s' "$src"
+              if [[ ! -e "$src" && ! -L "$src" ]]; then
+                  setup_log_stop MISSING "the setup Stage wrote no ${src}"
+              fi
+              if [[ -L "$src" || ! -f "$src" ]]; then
+                  setup_log_stop NOT_REGULAR_FILE "the setup log ${src} is not a regular file"
+              fi
+              if [[ ! -r "$src" ]]; then
+                  setup_log_stop UNREADABLE "the setup log ${src} is not readable"
+              fi
+              bytes="$(stat -c %s -- "$src")"
+              sha="$(sha256_of "$src")"
+              printf -v "${prefix}_BYTES" '%s' "$bytes"
+              printf -v "${prefix}_SHA256" '%s' "$sha"
+              if (( bytes > LOG_LIMIT )); then
+                  printf -v "${prefix}_DESTINATION" '%s' EXCLUDED
+                  printf '%s\t%s\t%s\t%s\n' "$src" "$bytes" "$sha" "the setup log is above ${LOG_LIMIT} bytes" \
+                      >> "${EVIDENCE}/excluded.tsv"
+                  setup_log_stop OUTPUT_LIMIT "the setup log ${src} has ${bytes} bytes, above ${LOG_LIMIT}"
+              fi
+              cp -- "$src" "${EVIDENCE}/${destination}"
+              printf -v "${prefix}_DESTINATION" '%s' "$destination"
+          }
+          capture_setup_log TRANSFORM_LOG log.surfaceTransformPoints
+          capture_setup_log CHECK_LOG log.surfaceCheck
+          SETUP_LOGS=CAPTURED
 
           # ---- 6. the generated dictionaries and controls -----------------
 
@@ -672,10 +779,127 @@ jobs:
           fi
           echo "PHASE_MAP_RESULT=COMPLETE" >> "${EVIDENCE}/phase-map.txt"
 
-          # ---- 9. the phase check, reconstruction, and final check --------
+          # ---- 9. the phase check, the spatial capture, reconstruction, and
+          #      final check ----------------------------------------------
 
+          # v2512 checkMesh -writeSets vtk writes a cell set as VTK XML at
+          # postProcessing/<points instance>/<set>/<set>.vtp (checkTools.C and
+          # vtkSurfaceWriter.C), and only for a set that it writes.
+          vtk_expected="postProcessing/${phase_time}/concaveCells/concaveCells.vtp"
+          VTK_EXPECTED_SOURCE="${FLOW_DIR}/${vtk_expected}"
+          # vtk_candidates - every entry named concaveCells.vtp or
+          # concaveCells.vtk in the flow Case, relative to it, sorted.
+          vtk_candidates() {
+              find . \( -name concaveCells.vtp -o -name concaveCells.vtk \) -print 2>/dev/null |
+                  sed -e 's#^\./##' | LC_ALL=C sort
+          }
+          # record_candidates <list> <BEFORE|AFTER> - the count and the paths,
+          # relative to the checkout, of one candidate list.
+          record_candidates() {
+              local count=0 path paths=""
+              while IFS= read -r path; do
+                  [[ -n "$path" ]] || continue
+                  count=$(( count + 1 ))
+                  paths="${paths}${FLOW_DIR}/${path} "
+              done <<< "$1"
+              printf -v "VTK_CANDIDATES_$2_CHECK" '%s' "$count"
+              VTK_CANDIDATE_PATHS="${paths% }"
+              [[ -n "$VTK_CANDIDATE_PATHS" ]] || VTK_CANDIDATE_PATHS=NONE
+          }
+          # exclude_oversized_candidates <list> - before any stop, one
+          # excluded.tsv row with the path, byte count, and SHA-256 of each
+          # readable regular candidate above VTK_LIMIT bytes (PR #92 review
+          # 5394488889). A symbolic link is not followed. No candidate is
+          # copied or cut here, and the primary cause does not change.
+          exclude_oversized_candidates() {
+              local path bytes
+              while IFS= read -r path; do
+                  [[ -n "$path" && ! -L "$path" && -f "$path" && -r "$path" ]] || continue
+                  bytes="$(stat -c %s -- "$path")"
+                  (( bytes > VTK_LIMIT )) || continue
+                  printf '%s\t%s\t%s\t%s\n' "${FLOW_DIR}/${path}" "$bytes" "$(sha256_of "$path")" \
+                      "the VTK file is above ${VTK_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
+                  VTK_OVERSIZED_CANDIDATES=$(( VTK_OVERSIZED_CANDIDATES + 1 ))
+              done <<< "$1"
+          }
+          spatial_stop() {
+              SPATIAL_CAPTURE="INCONCLUSIVE_SPATIAL_VTK_$1"
+              SPATIAL_REASON="$2"
+              stop "SPATIAL_VTK_$1" "$2" spatial-capture
+          }
+          # capture_vtp - check and copy the refined concaveCells VTP file. The
+          # refined check ends at least KILL_GRACE seconds before the deadline,
+          # and the capture reads one file of at most VTK_LIMIT bytes, so the
+          # capture stays inside the active-work window.
+          capture_vtp() {
+              local candidates path bytes sha
+              candidates="$(vtk_candidates)"
+              record_candidates "$candidates" AFTER
+              exclude_oversized_candidates "$candidates"
+              if [[ ! "$REFINED_CONCAVE_CELLS" =~ ^[0-9]+$ ]]; then
+                  SPATIAL_CAPTURE=INCONCLUSIVE_SPATIAL_COUNT_UNAVAILABLE
+                  SPATIAL_REASON="the refined concave count is ${REFINED_CONCAVE_CELLS}, so no VTP file is a validated capture"
+                  inconclusive SPATIAL_COUNT_UNAVAILABLE "$SPATIAL_REASON"
+                  return 0
+              fi
+              if (( REFINED_CONCAVE_CELLS == 0 )); then
+                  if (( VTK_CANDIDATES_AFTER_CHECK == 0 )); then
+                      SPATIAL_CAPTURE=NOT_APPLICABLE_NO_REFINED_CONCAVITY
+                      SPATIAL_REASON="the refined check has exactly 0 concave cells and wrote no concaveCells geometry"
+                      return 0
+                  fi
+                  spatial_stop UNEXPECTED "the refined check has 0 concave cells, but ${VTK_CANDIDATES_AFTER_CHECK} concaveCells VTK entries exist: ${VTK_CANDIDATE_PATHS}"
+              fi
+              if (( VTK_CANDIDATES_AFTER_CHECK == 0 )); then
+                  spatial_stop MISSING "the refined check reports ${REFINED_CONCAVE_CELLS} concave cells, but no concaveCells.vtp or concaveCells.vtk exists in ${FLOW_DIR}"
+              fi
+              if (( VTK_CANDIDATES_AFTER_CHECK > 1 )); then
+                  spatial_stop DUPLICATE "${VTK_CANDIDATES_AFTER_CHECK} concaveCells VTK entries exist: ${VTK_CANDIDATE_PATHS}"
+              fi
+              path="${VTK_CANDIDATE_PATHS#"${FLOW_DIR}/"}"
+              if [[ "$path" == *.vtk ]]; then
+                  spatial_stop LEGACY_FORMAT "the entry ${VTK_CANDIDATE_PATHS} is a legacy .vtk file, not the expected .vtp file"
+              fi
+              if [[ "$path" != "$vtk_expected" ]]; then
+                  spatial_stop WRONG_PATH "the entry is ${VTK_CANDIDATE_PATHS}, not ${VTK_EXPECTED_SOURCE}"
+              fi
+              VTK_SOURCE="$VTK_EXPECTED_SOURCE"
+              if [[ -L "$path" || ! -f "$path" ]]; then
+                  spatial_stop NOT_REGULAR_FILE "the entry ${VTK_SOURCE} is not a regular file"
+              fi
+              if [[ ! -r "$path" ]]; then
+                  spatial_stop UNREADABLE "the file ${VTK_SOURCE} is not readable"
+              fi
+              bytes="$(stat -c %s -- "$path")"
+              VTK_BYTES="$bytes"
+              if (( bytes == 0 )); then
+                  spatial_stop EMPTY "the file ${VTK_SOURCE} has 0 bytes"
+              fi
+              sha="$(sha256_of "$path")"
+              VTK_SHA256="$sha"
+              # exclude_oversized_candidates already wrote the exclusion row.
+              if (( bytes > VTK_LIMIT )); then
+                  VTK_DESTINATION=EXCLUDED
+                  spatial_stop OUTPUT_LIMIT "the file ${VTK_SOURCE} has ${bytes} bytes, above ${VTK_LIMIT}"
+              fi
+              cp -- "$path" "${EVIDENCE}/spatial/concaveCells.vtp"
+              VTK_DESTINATION=spatial/concaveCells.vtp
+              SPATIAL_CAPTURE=COMPLETE
+              SPATIAL_REASON="the refined check at time ${phase_time} wrote one concaveCells VTP file, and the file is copied"
+          }
+
+          # Provenance: no candidate may exist before the refined check, so a
+          # later file comes from that check.
+          candidates="$(vtk_candidates)"
+          record_candidates "$candidates" BEFORE
+          exclude_oversized_candidates "$candidates"
+          if (( VTK_CANDIDATES_BEFORE_CHECK > 0 )); then
+              spatial_stop PROVENANCE "the flow Case holds ${VTK_CANDIDATES_BEFORE_CHECK} concaveCells VTK entries before the refined check: ${VTK_CANDIDATE_PATHS}"
+          fi
           run_check REFINED parallel "$phase_time" mpirun --oversubscribe -np "$RANKS" \
               checkMesh -parallel -allGeometry -allTopology -time "$phase_time" -writeSets vtk
+          REFINED_CHECK_VECTOR="$RUN_VECTOR"
+          capture_vtp
           run_preparation reconstructParMesh 90 reconstructParMesh -time "$phase_time"
           run_check FINAL serial "$phase_time" \
               checkMesh -allGeometry -allTopology -writeAllFields -time "$phase_time"
@@ -788,6 +1012,41 @@ jobs:
           }
           write_inventory
 
+          # A conclusive result needs its spatial evidence in the final
+          # inventory, with the checksum that the manifest records: both setup
+          # logs, and the refined VTP file when the refined check has concave
+          # cells. Otherwise the result is INCONCLUSIVE_SPATIAL_INVENTORY.
+          manifest="${evidence}/spatial/manifest.env"
+          manifest_value() {
+              [[ -f "$manifest" ]] || return 0
+              awk -v key="$1" 'index($0, key "=") == 1 { v = substr($0, length(key) + 2) } END { print v }' "$manifest"
+          }
+          inventory_sha() {
+              awk -F '\t' -v path="$1" '$1 == "FILE" && $4 == path { print $3 }' "${evidence}/inventory.txt"
+          }
+          if [[ "$(value DIAG_RESULT)" != INCONCLUSIVE_* ]]; then
+              required="logs/setup-surfaceTransformPoints.log=TRANSFORM_LOG_SHA256 logs/setup-surfaceCheck.log=CHECK_LOG_SHA256"
+              missing=""
+              case "$(value SPATIAL_CAPTURE)" in
+                  COMPLETE) required="${required} spatial/concaveCells.vtp=VTK_SHA256" ;;
+                  NOT_APPLICABLE_NO_REFINED_CONCAVITY) ;;
+                  *) missing=" the spatial capture state '$(value SPATIAL_CAPTURE)'" ;;
+              esac
+              for entry in $required; do
+                  want="$(manifest_value "${entry#*=}")"
+                  have="$(inventory_sha "${entry%%=*}")"
+                  if [[ -z "$have" || "$have" != "$want" ]]; then
+                      missing="${missing} ${entry%%=*}"
+                  fi
+              done
+              if [[ -n "$missing" ]]; then
+                  set_value DIAG_PRIOR_RESULT "$(value DIAG_RESULT)"
+                  set_value DIAG_RESULT INCONCLUSIVE_SPATIAL_INVENTORY
+                  set_value DIAG_REASON "the final inventory does not show the required spatial evidence:${missing}"
+                  write_inventory
+              fi
+          fi
+
           tar -czf "${upload}/${archive_name}" -C "$dir" evidence
           bytes="$(stat -c %s -- "${upload}/${archive_name}")"
           if (( bytes > archive_limit )); then
@@ -835,6 +1094,8 @@ jobs:
             echo "| Refined phase check | \`$(value REFINED_RESULT)\`, $(value REFINED_FAILED_CHECKS) failed, $(value REFINED_CONCAVE_CELLS) concave |"
             echo "| Final serial check | \`$(value FINAL_RESULT)\`, $(value FINAL_FAILED_CHECKS) failed, $(value FINAL_CONCAVE_CELLS) concave |"
             echo "| Final comparison | \`$(value FINAL_COMPARISON)\` |"
+            echo "| Setup logs | \`$(value SETUP_LOGS)\` |"
+            echo "| Spatial capture | \`$(value SPATIAL_CAPTURE)\` |"
             echo "| Active elapsed seconds | $(value DIAG_ACTIVE_ELAPSED_SECONDS) |"
             echo "| Elapsed seconds at package | $(value DIAG_ELAPSED_AT_PACKAGE_SECONDS) |"
             echo "| Archive bytes | ${archive_bytes} |"
@@ -849,8 +1110,8 @@ jobs:
         with:
           name: m3-mesh-diagnostic-evidence
           # Only the package: one archive, the result, and the inventory. The
-          # archive holds no mesh, solver field, VTU, source archive, or
-          # exported set geometry.
+          # archive holds no mesh, solver field, VTU, STL, or source archive.
+          # Its only set geometry is the refined concaveCells VTP file.
           path: ${{ runner.temp }}/m3-mesh-diagnostic/upload
           if-no-files-found: error
           retention-days: 90
