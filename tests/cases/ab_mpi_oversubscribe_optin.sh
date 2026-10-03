@@ -56,6 +56,18 @@
 # setup logs and their 1 MiB limit, the final-inventory rule, and the permitted
 # archive content.
 #
+# Checks S48 to S52 cover the capture deadline correction of the same workflow
+# (Issue #80, contract 5964418182). They run the same extracted steps. Fake
+# find, sha256sum, cp, and date commands block, fail, or move the clock for one
+# selected capture operation. The checks prove that no capture operation starts
+# without active time, that a slow candidate discovery, hash, or copy stops
+# with its process group before the active-work deadline, that no partial hash,
+# exclusion row, candidate list, or copy is kept, that a failed operation is an
+# explicit capture failure, and that the summary and the upload stay eligible.
+# Check S53 covers PR #93 review 5399027552: the blocked wrapper exits on
+# SIGTERM, and its child ignores SIGTERM. The check proves that the child gets
+# SIGKILL after the kill grace and is gone before the operation returns.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -2475,6 +2487,11 @@ case "$name" in
                     head -c 20971521 /dev/zero > "$file"
                     printf 'concave cells\n' > "${base}/concaveCells.vtp"
                     ln -s concaveCells.vtp "${base}/concaveCells/concaveCells.vtk" ;;
+                # Two oversized candidates with different bytes (contract
+                # 5964418182). The sorted scan hashes the shallow one first.
+                big_two)
+                    head -c 20971521 /dev/zero > "$file"
+                    head -c 20971521 /dev/zero | tr '\0' 'b' > "${base}/concaveCells.vtp" ;;
             esac
         }
         echo "Exec   : checkMesh $*"
@@ -2511,6 +2528,15 @@ case "$name" in
     *)
         echo "End" ;;
 esac
+# FAKE_CLOCK_JUMP selects one command. After it, the fake date reports a time
+# past the active-work deadline (contract 5964418182).
+tag="$name"
+if [[ "$name" == checkMesh ]] && has -parallel "$@"; then
+    tag=checkMesh-parallel
+fi
+if [[ -n "${FAKE_CLOCK_JUMP:-}" && "$FAKE_CLOCK_JUMP" == "$tag" ]]; then
+    : > "$DIAG_FAKE_CLOCK_MARK"
+fi
 exit 0
 DIAG_FAKE
     chmod +x "$1"
@@ -2587,8 +2613,125 @@ row() {
         row case_8 case_8/flow created "flow case created"
     fi
 } > "${batch}/setup_cases_summary.csv"
+if [[ "${FAKE_CLOCK_JUMP:-}" == setup ]]; then
+    : > "$DIAG_FAKE_CLOCK_MARK"
+fi
 echo "setup done"
 DIAG_SETUP
+    chmod +x "$1"
+}
+
+# ab_diag_write_capture_fake <file> - the fake find, sha256sum, cp, and date of
+# the capture deadline checks (Issue #80, contract 5964418182). Each call runs
+# the real command unless a check selects a fault for one capture operation:
+#   FAKE_SLOW_DISCOVERY or FAKE_FAIL_DISCOVERY = before | after - the first or
+#       the second concaveCells discovery blocks or fails;
+#   FAKE_SLOW_HASH or FAKE_FAIL_HASH = <pattern> - the hash of a file whose
+#       absolute path matches the pattern blocks or fails, for a file argument
+#       and for a file on standard input;
+#   FAKE_SLOW_COPY or FAKE_FAIL_COPY = <pattern> - the copy of a matching
+#       source file blocks or fails.
+# A blocked call first writes partial output: a candidate, a wrong hash, or half
+# of the file. It records its process and its child process in DIAG_FAKE_PIDS
+# and waits 30 seconds before the real command. With FAKE_SLOW_SECONDS, the call
+# waits that time and writes no partial output, so its complete output is
+# exact. With FAKE_SLOW_IGNORE_TERM=1, the child process ignores SIGTERM, and
+# the call itself still exits on SIGTERM (PR #93 review 5399027552). If that
+# child is alive when spatial/manifest.env appears, after the operation
+# returned, it writes "<DIAG_FAKE_PIDS>.survivor". It ends after 30 seconds.
+# After the FAKE_CLOCK_JUMP command, date +%s is 100000 seconds later.
+# Each find, sha256sum, and cp call appends one line to DIAG_FAKE_CAPTURE_CALLS:
+# name, target, and each argument, separated by tabs. The target is the
+# absolute file of a hash, the absolute source of a copy, "discovery" for a
+# concaveCells discovery, or "-".
+ab_diag_write_capture_fake() {
+    local name
+    {
+        printf '#!/usr/bin/env bash\n'
+        for name in find sha256sum cp date; do
+            printf 'REAL_%s=%q\n' "${name^^}" "$(command -v "$name")"
+        done
+        cat <<'CAPTURE_FAKE'
+set -u
+name="${0##*/}"
+real_var="REAL_${name^^}"
+real="${!real_var}"
+if [[ "$name" == date ]]; then
+    if [[ "$*" == "+%s" && -n "${DIAG_FAKE_CLOCK_MARK:-}" && -e "$DIAG_FAKE_CLOCK_MARK" ]]; then
+        echo "$(( $("$real" +%s) + 100000 ))"
+        exit 0
+    fi
+    exec "$real" "$@"
+fi
+calls="${DIAG_FAKE_CAPTURE_CALLS:-/dev/null}"
+# absolute <path> - the path from the root. Links are not resolved.
+absolute() {
+    if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$PWD" "$1"; fi
+}
+target="-"
+mode=""
+case "$name" in
+    find)
+        if [[ " $* " == *" concaveCells.vtp "* ]]; then
+            target=discovery
+            count="$(awk -F '\t' '$1 == "find" && $2 == "discovery"' "$calls" 2>/dev/null | wc -l)"
+            when=after
+            (( count == 0 )) && when=before
+            [[ "${FAKE_SLOW_DISCOVERY:-}" == "$when" ]] && mode=slow
+            [[ "${FAKE_FAIL_DISCOVERY:-}" == "$when" ]] && mode=fail
+        fi ;;
+    sha256sum)
+        if (( $# > 0 )); then
+            target="$(absolute "${!#}")"
+        elif [[ -n "${FAKE_SLOW_HASH:-}${FAKE_FAIL_HASH:-}" ]]; then
+            target="$(readlink "/proc/$$/fd/0" 2>/dev/null || echo -)"
+        fi
+        # Each fault value is a pattern, so it is not quoted.
+        [[ -n "${FAKE_SLOW_HASH:-}" && "$target" == $FAKE_SLOW_HASH ]] && mode=slow
+        [[ -n "${FAKE_FAIL_HASH:-}" && "$target" == $FAKE_FAIL_HASH ]] && mode=fail ;;
+    cp)
+        if (( $# >= 2 )); then
+            target="$(absolute "${@: -2:1}")"
+            [[ -n "${FAKE_SLOW_COPY:-}" && "$target" == $FAKE_SLOW_COPY ]] && mode=slow
+            [[ -n "${FAKE_FAIL_COPY:-}" && "$target" == $FAKE_FAIL_COPY ]] && mode=fail
+        fi ;;
+esac
+record="${name}"$'\t'"${target}"
+for argument in "$@"; do record+=$'\t'"${argument}"; done
+printf '%s\n' "$record" >> "$calls"
+if [[ "$mode" == fail ]]; then
+    echo "fake ${name}: forced capture failure" >&2
+    exit 1
+fi
+if [[ "$mode" == slow ]]; then
+    if [[ -z "${FAKE_SLOW_SECONDS:-}" ]]; then
+        case "$name" in
+            find) printf './postProcessing/partial/concaveCells.vtp\n' ;;
+            sha256sum) printf '%064d  partial\n' 0 ;;
+            cp) head -c "$(( $(stat -c %s -- "$target") / 2 ))" -- "$target" > "${!#}" ;;
+        esac
+    fi
+    if [[ "${FAKE_SLOW_IGNORE_TERM:-}" == 1 ]]; then
+        (
+            trap '' TERM
+            manifest="${DIAG_DIR:-/nonexistent}/evidence/spatial/manifest.env"
+            for (( tick = 0; tick < 300; tick++ )); do
+                if [[ -e "$manifest" ]]; then
+                    : > "${DIAG_FAKE_PIDS}.survivor"
+                    exit 0
+                fi
+                sleep 0.1
+            done
+        ) &
+    else
+        sleep "${FAKE_SLOW_SECONDS:-30}" &
+    fi
+    printf '%s\n%s\n' "$$" "$!" >> "${DIAG_FAKE_PIDS:-/dev/null}"
+    wait "$!"
+fi
+exec "$real" "$@"
+CAPTURE_FAKE
+    } > "$1"
     chmod +x "$1"
 }
 
@@ -2603,6 +2746,7 @@ ab_diag_fixture() {
     : > "${workspace}/github_env"
     : > "${workspace}/step_summary"
     : > "${workspace}/calls.tsv"
+    : > "${workspace}/capture_calls.tsv"
     : > "${workspace}/fake_pids"
     cp -- "${REPO_ROOT}/.openfoam-version" "${checkout}/.openfoam-version"
     cp -- "${SRC_DIR}/output_batch_1.csv" "${checkout}/src/output_batch_1.csv"
@@ -2612,6 +2756,10 @@ ab_diag_fixture() {
     ab_diag_write_fake "${workspace}/diag_fake"
     for name in curl sudo apt-get dpkg-query gcc gh; do
         ln -s "${workspace}/diag_fake" "${workspace}/fakebin/${name}"
+    done
+    ab_diag_write_capture_fake "${workspace}/capture_fake"
+    for name in find sha256sum cp date; do
+        ln -s "${workspace}/capture_fake" "${workspace}/fakebin/${name}"
     done
     for name in surfaceFeatureExtract blockMesh checkMesh decomposePar snappyHexMesh \
                 reconstructParMesh mpirun simpleFoam foamToVTK renumberMesh reconstructPar; do
@@ -2648,7 +2796,9 @@ ab_diag_run() {
                 RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env"
                 GITHUB_WORKSPACE="${workspace}/checkout" GITHUB_STEP_SUMMARY="${workspace}/step_summary"
                 GITHUB_SHA=6f198977b700a2bcb664bcc704a3d506eefb67ab GITHUB_RUN_ID=4242
-                DIAG_FAKE_CALLS="${workspace}/calls.tsv" DIAG_FAKE_PIDS="${workspace}/fake_pids")
+                DIAG_FAKE_CALLS="${workspace}/calls.tsv" DIAG_FAKE_PIDS="${workspace}/fake_pids"
+                DIAG_FAKE_CAPTURE_CALLS="${workspace}/capture_calls.tsv"
+                DIAG_FAKE_CLOCK_MARK="${workspace}/clock_jumped")
     env "${base[@]}" bash "${workspace}/clock_step.sh" > "${workspace}/clock.out" 2>&1 ||
         _fail "S30: the clock step must succeed"
     local published=()
@@ -3636,6 +3786,384 @@ s47_spatial_capture_final_inventory_rule() {
         "S47: the prior zero-count result is kept for reference"
 }
 
+# ---- S48 to S52: the capture deadline correction (Issue #80) ---------------
+
+# The active-work window of the blocked-operation checks: the fake work before
+# the capture takes about 1 second, and a blocked operation meets the deadline
+# reserve about 10 seconds after the start.
+AB_CAPTURE_WINDOW=15
+
+# The VTP file of the concave-cell run, as the fake capture commands see it.
+AB_CAPTURE_VTP="*/flow/postProcessing/1/concaveCells/concaveCells.vtp"
+
+# ab_capture_window_run <workspace> [NAME=value ...] - one concave-cell run whose
+# active-work deadline is AB_CAPTURE_WINDOW seconds after the call.
+ab_capture_window_run() {
+    local workspace="$1"
+    shift
+    ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" "$@" \
+        DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + AB_CAPTURE_WINDOW ))"
+}
+
+# ab_capture_targets <workspace> <name> - the targets of the fake capture calls
+# of one command, one per line.
+ab_capture_targets() {
+    awk -F '\t' -v name="$2" '$1 == name { print $2 }' "${1}/capture_calls.tsv"
+}
+
+# ab_assert_capture_stop <workspace> <run> <cause> <state-key> <operation> <path>
+# <label> - the common result of an incomplete capture operation: the explicit
+# cause and stop point, the state, the operation, and its path in the result
+# and the manifest, no complete capture, no partial hash, no temporary output,
+# and an eligible package, summary, and upload.
+ab_assert_capture_stop() {
+    local workspace="$1" run="$2" cause="$3" key="$4" operation="$5" path="$6" label="$7"
+    local dir point timeout name summary
+    dir="$(ab_diag_dir "$workspace")"
+    case "$cause" in
+        INCONCLUSIVE_CAPTURE_TIMEOUT) point=capture-timeout timeout=YES ;;
+        *) point=capture-failure timeout=NO ;;
+    esac
+    assert_eq "$cause" "$(ab_diag_value "$workspace" DIAG_RESULT)" "${label}: the result is ${cause}"
+    assert_eq "$point" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "${label}: the stop point is ${point}"
+    assert_eq "$cause" "$(ab_diag_value "$workspace" "$key")" "${label}: the result shows ${key}=${cause}"
+    assert_eq "$cause" "$(ab_diag_manifest "$workspace" "$key")" "${label}: the manifest shows ${key}=${cause}"
+    assert_eq "$timeout" "$(ab_diag_value "$workspace" CAPTURE_TIMEOUT)" \
+        "${label}: the result shows CAPTURE_TIMEOUT=${timeout}"
+    assert_eq "$timeout" "$(ab_diag_manifest "$workspace" CAPTURE_TIMEOUT)" \
+        "${label}: the manifest shows CAPTURE_TIMEOUT=${timeout}"
+    assert_eq "$operation" "$(ab_diag_value "$workspace" CAPTURE_INCOMPLETE_OPERATION)" \
+        "${label}: the result names the ${operation} operation"
+    assert_eq "$operation" "$(ab_diag_manifest "$workspace" CAPTURE_INCOMPLETE_OPERATION)" \
+        "${label}: the manifest names the ${operation} operation"
+    assert_eq "$path" "$(ab_diag_value "$workspace" CAPTURE_INCOMPLETE_PATH)" \
+        "${label}: the result names the path of the operation"
+    assert_eq "$path" "$(ab_diag_manifest "$workspace" CAPTURE_INCOMPLETE_PATH)" \
+        "${label}: the manifest names the path of the operation"
+    assert_ne "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" \
+        "${label}: the result never shows a complete capture"
+    assert_ne "COMPLETE" "$(ab_diag_manifest "$workspace" SPATIAL_CAPTURE)" \
+        "${label}: the manifest never shows a complete capture"
+    for name in spatial/manifest.env excluded.tsv; do
+        assert_not_contains "$(cat "${dir}/evidence/${name}" 2>/dev/null)" "$(printf '%064d' 0)" \
+            "${label}: ${name} holds no partial hash"
+    done
+    assert_eq "" "$(find "${dir}/capture-tmp" -mindepth 1 2>/dev/null)" \
+        "${label}: no temporary capture output remains"
+    assert_contains "$run" "package=0 " "${label}: the package step ends with status 0"
+    assert_contains "$run" "summary=0" "${label}: the summary step ends with status 0"
+    assert_file_exists "${dir}/upload/result.env" "${label}: the upload holds the result"
+    assert_file_exists "${dir}/upload/inventory.txt" "${label}: the upload holds the inventory"
+    assert_contains "$(ab_diag_archive_list "$workspace")" "evidence/spatial/manifest.env" \
+        "${label}: the archive holds the manifest"
+    summary="$(cat "${workspace}/step_summary")"
+    assert_contains "$summary" "| Result | \`${cause}\` |" "${label}: the job summary shows the result"
+    assert_contains "$summary" "| Capture timeout | \`${timeout}\` |" \
+        "${label}: the job summary shows the capture timeout state"
+    assert_contains "$summary" "| Incomplete capture operation | \`${operation}\` |" \
+        "${label}: the job summary shows the incomplete operation"
+}
+
+# ab_assert_capture_in_window <workspace> <run> <label> - the blocked operation
+# stopped before the active-work deadline, with its process and child process.
+ab_assert_capture_in_window() {
+    local workspace="$1" run="$2" label="$3" end deadline elapsed
+    end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
+    deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end > deadline )); then
+        _fail "${label}: the diagnostic must end before the active-work deadline" "end: ${end}, deadline: ${deadline}"
+    fi
+    (( elapsed <= AB_CAPTURE_WINDOW )) ||
+        _fail "${label}: the blocked operation must stop inside the active-work window" "elapsed: ${elapsed}"
+    ab_assert_fakes_stopped "$workspace" "$label"
+}
+
+s48_capture_deadline_expired_before_an_operation() {
+    local workspace run entry jump operation key path label calls
+    for entry in "setup:setup-log-hash:SETUP_LOGS:${AB_DIAG_FLOW}/log.surfaceTransformPoints" \
+                 "snappyHexMesh:vtk-discovery-before-check:SPATIAL_CAPTURE:${AB_DIAG_FLOW}" \
+                 "checkMesh-parallel:vtk-discovery-after-check:SPATIAL_CAPTURE:${AB_DIAG_FLOW}"; do
+        IFS=: read -r jump operation key path <<< "$entry"
+        label="S48 (${jump})"
+        workspace="$(new_workspace "s48_${jump}")"
+        ab_diag_fixture "$workspace"
+        # The deadline passes after the selected command, so the next capture
+        # operation has no active time left.
+        run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_CLOCK_JUMP="$jump")"
+        ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT "$key" "$operation" "$path" "$label"
+        assert_contains "$(ab_diag_value "$workspace" DIAG_REASON)" "no active time was left" \
+            "${label}: the reason says that no active time was left"
+        calls="$(ab_diag_calls "$workspace")"
+        case "$jump" in
+            setup)
+                assert_not_contains "$(ab_capture_targets "$workspace" sha256sum)" "/log.surfaceTransformPoints" \
+                    "${label}: no hash process starts"
+                assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" TRANSFORM_LOG_SHA256)" \
+                    "${label}: the manifest has no hash"
+                assert_eq "NOT_RUN" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" \
+                    "${label}: the spatial capture does not run"
+                assert_not_contains "$calls" "surfaceFeatureExtract" "${label}: no mesh command runs" ;;
+            snappyHexMesh)
+                assert_eq "0" "$(ab_capture_targets "$workspace" find | grep -c '^discovery$' || true)" \
+                    "${label}: no discovery process starts"
+                assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_BEFORE_CHECK)" \
+                    "${label}: the manifest has no candidate count"
+                assert_not_contains "$calls" "checkMesh -parallel" "${label}: the refined check does not run"
+                assert_eq "CAPTURED" "$(ab_diag_value "$workspace" SETUP_LOGS)" "${label}: the setup logs stay captured"
+                assert_contains "$(ab_diag_archive_list "$workspace")" "evidence/logs/setup-surfaceCheck.log" \
+                    "${label}: the completed setup log copy is uploaded" ;;
+            checkMesh-parallel)
+                assert_eq "1" "$(ab_capture_targets "$workspace" find | grep -c '^discovery$' || true)" \
+                    "${label}: only the discovery before the refined check runs"
+                assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+                    "${label}: the manifest has no candidate count after the check"
+                assert_eq "23913" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" \
+                    "${label}: the refined check evidence is kept"
+                assert_not_contains "$calls" "reconstructParMesh -time" "${label}: no reconstruction runs" ;;
+        esac
+    done
+}
+
+s49_capture_slow_discovery_stops_in_the_window() {
+    local workspace run when label
+    for when in before after; do
+        label="S49 (${when})"
+        workspace="$(new_workspace "s49_${when}")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_capture_window_run "$workspace" FAKE_SLOW_DISCOVERY="$when")"
+        ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE \
+            "vtk-discovery-${when}-check" "$AB_DIAG_FLOW" "$label"
+        ab_assert_capture_in_window "$workspace" "$run" "$label"
+        assert_not_contains "$(ab_diag_manifest "$workspace" VTK_CANDIDATE_PATHS)" "partial" \
+            "${label}: no partial candidate list is kept"
+        case "$when" in
+            before)
+                assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_BEFORE_CHECK)" \
+                    "${label}: the manifest has no candidate count"
+                assert_not_contains "$(ab_diag_calls "$workspace")" "checkMesh -parallel" \
+                    "${label}: the refined check does not run" ;;
+            after)
+                assert_eq "0" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_BEFORE_CHECK)" \
+                    "${label}: the completed discovery before the check is kept"
+                assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+                    "${label}: the manifest has no candidate count after the check"
+                assert_eq "23913" "$(ab_diag_value "$workspace" REFINED_CONCAVE_CELLS)" \
+                    "${label}: the refined check evidence is kept"
+                assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" \
+                    "${label}: no reconstruction runs" ;;
+        esac
+    done
+}
+
+s50_capture_slow_hash_publishes_no_partial_hash() {
+    local workspace run dir flow label rows first
+    # The first setup log.
+    label="S50 (transform log)"
+    workspace="$(new_workspace s50_transform_hash)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_capture_window_run "$workspace" FAKE_SLOW_HASH="*/flow/log.surfaceTransformPoints")"
+    dir="$(ab_diag_dir "$workspace")"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SETUP_LOGS setup-log-hash \
+        "${AB_DIAG_FLOW}/log.surfaceTransformPoints" "$label"
+    ab_assert_capture_in_window "$workspace" "$run" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" TRANSFORM_LOG_SHA256)" "${label}: no hash is published"
+    assert_file_missing "${dir}/evidence/logs/setup-surfaceTransformPoints.log" "${label}: no copy is made"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "surfaceFeatureExtract" "${label}: no mesh command runs"
+
+    # The second setup log, above 1 MiB: no exclusion row without a complete
+    # hash. The completed first log stays valid evidence.
+    label="S50 (check log)"
+    workspace="$(new_workspace s50_check_hash)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_capture_window_run "$workspace" FAKE_SETUP_LOG=big_check FAKE_SLOW_HASH="*/flow/log.surfaceCheck")"
+    dir="$(ab_diag_dir "$workspace")"
+    flow="${workspace}/checkout/${AB_DIAG_FLOW}"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SETUP_LOGS setup-log-hash \
+        "${AB_DIAG_FLOW}/log.surfaceCheck" "$label"
+    ab_assert_capture_in_window "$workspace" "$run" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" CHECK_LOG_SHA256)" "${label}: no hash is published"
+    assert_eq "0" "$(tail -n +2 "${dir}/evidence/excluded.tsv" | wc -l | tr -d ' ')" \
+        "${label}: no exclusion row is published"
+    assert_eq "$(ab_sha "${flow}/log.surfaceTransformPoints")" "$(ab_diag_manifest "$workspace" TRANSFORM_LOG_SHA256)" \
+        "${label}: the completed first log hash is kept"
+    assert_eq "$(ab_sha "${flow}/log.surfaceTransformPoints")" \
+        "$(ab_diag_inventory_sha "$workspace" logs/setup-surfaceTransformPoints.log)" \
+        "${label}: the completed first log copy is uploaded"
+
+    # The second of two oversized candidates: the first exclusion row stays,
+    # and the timeout replaces the duplicate cause.
+    label="S50 (oversized candidate)"
+    workspace="$(new_workspace s50_candidate_hash)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_capture_window_run "$workspace" FAKE_VTK=big_two FAKE_SLOW_HASH="$AB_CAPTURE_VTP")"
+    dir="$(ab_diag_dir "$workspace")"
+    flow="${workspace}/checkout/${AB_DIAG_FLOW}"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE vtk-exclusion-hash \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" "$label"
+    ab_assert_capture_in_window "$workspace" "$run" "$label"
+    rows="$(tail -n +2 "${dir}/evidence/excluded.tsv")"
+    first="${AB_DIAG_FLOW}/postProcessing/1/concaveCells.vtp"
+    assert_eq "${first}	20971521	$(ab_sha "${workspace}/checkout/${first}")	the VTK file is above 20971520 bytes" \
+        "$rows" "${label}: the one completed exclusion row stays, and no other row is published"
+    assert_eq "1" "$(ab_diag_manifest "$workspace" VTK_OVERSIZED_CANDIDATES)" \
+        "${label}: the manifest counts one completed exclusion"
+    assert_eq "2" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+        "${label}: the completed discovery is kept"
+    assert_contains "$(cat "${dir}/upload/inventory.txt")" \
+        "EXCLUDED	20971521	$(ab_sha "${workspace}/checkout/${first}")	${first}" \
+        "${label}: the inventory names the completed exclusion"
+
+    # The VTP file.
+    label="S50 (VTP file)"
+    workspace="$(new_workspace s50_vtp_hash)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_capture_window_run "$workspace" FAKE_SLOW_HASH="$AB_CAPTURE_VTP")"
+    dir="$(ab_diag_dir "$workspace")"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE vtp-hash \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" "$label"
+    ab_assert_capture_in_window "$workspace" "$run" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_SHA256)" "${label}: no hash is published"
+    assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "${label}: no copy is made"
+    assert_contains "$(ab_diag_archive_list "$workspace")" "evidence/logs/setup-surfaceCheck.log" \
+        "${label}: the completed setup log copy is uploaded"
+}
+
+s51_capture_slow_copy_publishes_no_partial_file() {
+    local workspace run dir flow label entry name prefix path
+    for entry in "surfaceTransformPoints:TRANSFORM_LOG" "surfaceCheck:CHECK_LOG"; do
+        IFS=: read -r name prefix <<< "$entry"
+        label="S51 (${name} log)"
+        workspace="$(new_workspace "s51_${name}_copy")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_capture_window_run "$workspace" FAKE_SLOW_COPY="*/flow/log.${name}")"
+        dir="$(ab_diag_dir "$workspace")"
+        flow="${workspace}/checkout/${AB_DIAG_FLOW}"
+        ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SETUP_LOGS setup-log-copy \
+            "${AB_DIAG_FLOW}/log.${name}" "$label"
+        ab_assert_capture_in_window "$workspace" "$run" "$label"
+        assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" "${prefix}_DESTINATION")" \
+            "${label}: the manifest names no destination"
+        assert_file_missing "${dir}/evidence/logs/setup-${name}.log" "${label}: no partial copy is evidence"
+        assert_eq "" "$(ab_diag_inventory_sha "$workspace" "logs/setup-${name}.log")" \
+            "${label}: no partial copy is inventoried"
+        assert_eq "$(ab_sha "${flow}/log.${name}")" "$(ab_diag_manifest "$workspace" "${prefix}_SHA256")" \
+            "${label}: the completed hash is kept"
+    done
+    # The completed first log stays valid evidence.
+    assert_eq "$(ab_sha "${flow}/log.surfaceTransformPoints")" \
+        "$(ab_diag_inventory_sha "$workspace" logs/setup-surfaceTransformPoints.log)" \
+        "S51 (surfaceCheck log): the completed first log copy is uploaded"
+
+    label="S51 (VTP file)"
+    workspace="$(new_workspace s51_vtp_copy)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_capture_window_run "$workspace" FAKE_SLOW_COPY="$AB_CAPTURE_VTP")"
+    dir="$(ab_diag_dir "$workspace")"
+    path="${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE vtp-copy "$path" "$label"
+    ab_assert_capture_in_window "$workspace" "$run" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_DESTINATION)" \
+        "${label}: the manifest names no destination"
+    assert_eq "$(ab_sha "${workspace}/checkout/${path}")" "$(ab_diag_manifest "$workspace" VTK_SHA256)" \
+        "${label}: the completed hash is kept"
+    assert_file_missing "${dir}/evidence/spatial/concaveCells.vtp" "${label}: no partial copy is evidence"
+    assert_eq "" "$(ab_diag_inventory_sha "$workspace" spatial/concaveCells.vtp)" \
+        "${label}: no partial copy is inventoried"
+    if ab_diag_archive_list "$workspace" | grep -Eq '\.(vtk|vtp)$'; then
+        _fail "${label}: the archive must hold no set geometry"
+    fi
+    assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" "${label}: no reconstruction runs"
+}
+
+s52_capture_failure_and_delayed_success() {
+    local workspace run dir source label
+    # A failed operation that is not a timeout.
+    label="S52 (VTP copy failure)"
+    workspace="$(new_workspace s52_copy_failure)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_FAIL_COPY="$AB_CAPTURE_VTP")"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_FAILURE SPATIAL_CAPTURE vtp-copy \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" "$label"
+    assert_contains "$(ab_diag_value "$workspace" DIAG_REASON)" "status 1" "${label}: the reason gives the status"
+    assert_file_missing "$(ab_diag_dir "$workspace")/evidence/spatial/concaveCells.vtp" "${label}: no copy is made"
+    assert_not_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time" "${label}: no reconstruction runs"
+
+    label="S52 (discovery failure)"
+    workspace="$(new_workspace s52_discovery_failure)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_FAIL_DISCOVERY=after)"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_FAILURE SPATIAL_CAPTURE \
+        vtk-discovery-after-check "$AB_DIAG_FLOW" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" VTK_CANDIDATES_AFTER_CHECK)" \
+        "${label}: the manifest has no candidate count after the check"
+
+    label="S52 (setup log hash failure)"
+    workspace="$(new_workspace s52_hash_failure)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_FAIL_HASH="*/flow/log.surfaceCheck")"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_FAILURE SETUP_LOGS setup-log-hash \
+        "${AB_DIAG_FLOW}/log.surfaceCheck" "$label"
+    assert_eq "UNAVAILABLE" "$(ab_diag_manifest "$workspace" CHECK_LOG_SHA256)" "${label}: no hash is published"
+    assert_file_missing "$(ab_diag_dir "$workspace")/evidence/logs/setup-surfaceCheck.log" "${label}: no copy is made"
+
+    # A slow hash and a slow copy that finish inside the window keep the
+    # complete capture and the diagnostic class.
+    label="S52 (delayed success)"
+    workspace="$(new_workspace s52_delayed_success)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_SLOW_HASH="$AB_CAPTURE_VTP" \
+           FAKE_SLOW_COPY="$AB_CAPTURE_VTP" FAKE_SLOW_SECONDS=2)"
+    dir="$(ab_diag_dir "$workspace")"
+    source="${workspace}/checkout/${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp"
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "${label}: the diagnostic class stands"
+    assert_eq "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "${label}: the capture is complete"
+    assert_eq "NO" "$(ab_diag_value "$workspace" CAPTURE_TIMEOUT)" "${label}: the result shows no capture timeout"
+    assert_eq "NO" "$(ab_diag_manifest "$workspace" CAPTURE_TIMEOUT)" "${label}: the manifest shows no capture timeout"
+    assert_eq "NONE" "$(ab_diag_manifest "$workspace" CAPTURE_INCOMPLETE_OPERATION)" \
+        "${label}: the manifest names no incomplete operation"
+    cmp -s -- "$source" "${dir}/evidence/spatial/concaveCells.vtp" ||
+        _fail "${label}: the copy must have the bytes of the source"
+    assert_eq "$(ab_sha "$source")" "$(ab_diag_manifest "$workspace" VTK_SHA256)" "${label}: the hash is exact"
+    assert_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time 1" "${label}: the diagnostic continues"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Capture timeout | `NO` |' \
+        "${label}: the job summary shows no capture timeout"
+    ab_assert_fakes_stopped "$workspace" "$label"
+}
+
+s53_capture_term_ignoring_child_is_killed() {
+    local workspace run entry operation fault path label end deadline elapsed
+    # The blocked wrapper exits on SIGTERM, so timeout returns, and its child
+    # ignores SIGTERM (PR #93 review 5399027552). The hash wrapper is the direct
+    # child of timeout. The discovery wrapper is a grandchild, under bash -c.
+    for entry in "vtp-hash:FAKE_SLOW_HASH=${AB_CAPTURE_VTP}:${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" \
+                 "vtk-discovery-after-check:FAKE_SLOW_DISCOVERY=after:${AB_DIAG_FLOW}"; do
+        IFS=: read -r operation fault path <<< "$entry"
+        label="S53 (${operation})"
+        workspace="$(new_workspace "s53_${operation}")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_capture_window_run "$workspace" "$fault" FAKE_SLOW_IGNORE_TERM=1)"
+        ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE \
+            "$operation" "$path" "$label"
+        # The child is gone before the operation returns: it never sees the
+        # manifest that the stop writes after the operation.
+        assert_file_missing "${workspace}/fake_pids.survivor" \
+            "${label}: the TERM-ignoring child is gone before the operation returns"
+        ab_assert_fakes_stopped "$workspace" "$label"
+        # SIGKILL comes after the kill grace, at the end of the reserve.
+        end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
+        deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
+        elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+        if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end < deadline || end > deadline + 1 )); then
+            _fail "${label}: SIGKILL must come after the kill grace, at the active-work deadline" \
+                  "end: ${end}, deadline: ${deadline}"
+        fi
+        (( elapsed <= AB_CAPTURE_WINDOW + 1 )) ||
+            _fail "${label}: the operation must stop at the end of the kill reserve" "elapsed: ${elapsed}"
+    done
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -3701,6 +4229,12 @@ AB_OBSERVATIONS=(
     s45_spatial_capture_provenance_and_zero_count
     s46_spatial_capture_setup_logs
     s47_spatial_capture_final_inventory_rule
+    s48_capture_deadline_expired_before_an_operation
+    s49_capture_slow_discovery_stops_in_the_window
+    s50_capture_slow_hash_publishes_no_partial_hash
+    s51_capture_slow_copy_publishes_no_partial_file
+    s52_capture_failure_and_delayed_success
+    s53_capture_term_ignoring_child_is_killed
 )
 
 # One observation runs in this process when the caller names it. The scenario

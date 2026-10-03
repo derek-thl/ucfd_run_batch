@@ -32,6 +32,15 @@ name: openfoam-m3-mesh-diagnostic
 # INCONCLUSIVE result and is not copied. Every readable regular candidate above
 # 20 MiB gets an excluded.tsv row before the stop, and the primary cause stays.
 # That one VTP file is the only set geometry in the upload.
+#
+# Capture deadline (Issue #80, contract 5964418182): each candidate discovery,
+# hash, and copy of the capture runs under timeout inside the active-work
+# window, as each command does. An operation without time, or one that does not
+# finish, gives INCONCLUSIVE_CAPTURE_TIMEOUT, and another failed operation gives
+# INCONCLUSIVE_CAPTURE_FAILURE. No partial hash, exclusion row, candidate list,
+# or copy is kept. Each operation returns only when its process group is empty:
+# a process that ignores SIGTERM gets SIGKILL after the kill grace (PR #93
+# review 5399027552).
 
 on:
   workflow_dispatch:
@@ -115,8 +124,12 @@ jobs:
           KILL_GRACE=5
           EVIDENCE="${DIAG_DIR}/evidence"
           EXCLUDED="${DIAG_DIR}/excluded"
+          # Temporary capture output. It is outside the evidence, so a partial
+          # output is never packaged.
+          CAPTURE_TMP="${DIAG_DIR}/capture-tmp"
 
-          mkdir -p "${EVIDENCE}/logs" "${EVIDENCE}/help" "${EVIDENCE}/dictionaries" "${EVIDENCE}/spatial" "$EXCLUDED"
+          mkdir -p "${EVIDENCE}/logs" "${EVIDENCE}/help" "${EVIDENCE}/dictionaries" "${EVIDENCE}/spatial" \
+                   "$EXCLUDED" "$CAPTURE_TMP"
           : > "${EVIDENCE}/identity.txt"
           : > "${EVIDENCE}/help-checks.txt"
           printf 'seq\tlabel\tcap_seconds\tlimit_seconds\tstart\tend\tstatus\toutcome\tlog\tvector\n' \
@@ -157,6 +170,15 @@ jobs:
           VTK_CANDIDATES_AFTER_CHECK=UNAVAILABLE
           VTK_CANDIDATE_PATHS=NONE
           VTK_OVERSIZED_CANDIDATES=0
+          # The bounded capture operations (contract 5964418182).
+          CAPTURE_TIMEOUT=NO
+          CAPTURE_INCOMPLETE_OPERATION=NONE
+          CAPTURE_INCOMPLETE_PATH=NONE
+          CAPTURE_OPERATION=NONE
+          CAPTURE_STATUS=NOT_RUN
+          CAPTURE_EXIT=0
+          CAPTURE_SHA=""
+          CANDIDATES=""
 
           # ---- result record ----------------------------------------------
 
@@ -186,6 +208,9 @@ jobs:
                 echo "FINAL_COMPARISON=${FINAL_COMPARISON}"
                 echo "SETUP_LOGS=${SETUP_LOGS}"
                 echo "SPATIAL_CAPTURE=${SPATIAL_CAPTURE}"
+                echo "CAPTURE_TIMEOUT=${CAPTURE_TIMEOUT}"
+                echo "CAPTURE_INCOMPLETE_OPERATION=${CAPTURE_INCOMPLETE_OPERATION}"
+                echo "CAPTURE_INCOMPLETE_PATH=${CAPTURE_INCOMPLETE_PATH}"
                 echo "DIAG_CLOCK_START=${DIAG_CLOCK_START}"
                 echo "DIAG_ACTIVE_DEADLINE=${DIAG_ACTIVE_DEADLINE}"
                 echo "DIAG_ACTIVE_END=${end}"
@@ -198,13 +223,17 @@ jobs:
           # write_manifest - the spatial-capture manifest: for each setup log
           # and the refined VTP file, the source path relative to the checkout,
           # the evidence destination, the byte count, and the SHA-256, with the
-          # Case, the commit, the run, the phase time, and the command vectors.
+          # Case, the commit, the run, the phase time, and the command vectors,
+          # and the timeout state of the capture operations.
           write_manifest() {
               local prefix key name
               {
                 echo "SETUP_LOGS=${SETUP_LOGS}"
                 echo "SPATIAL_CAPTURE=${SPATIAL_CAPTURE}"
                 echo "SPATIAL_REASON=${SPATIAL_REASON}"
+                echo "CAPTURE_TIMEOUT=${CAPTURE_TIMEOUT}"
+                echo "CAPTURE_INCOMPLETE_OPERATION=${CAPTURE_INCOMPLETE_OPERATION}"
+                echo "CAPTURE_INCOMPLETE_PATH=${CAPTURE_INCOMPLETE_PATH}"
                 echo "CASE_ID=${CASE_ID}"
                 echo "MAIN_SHA=${GITHUB_SHA:-UNAVAILABLE}"
                 echo "RUN_ID=${GITHUB_RUN_ID:-UNAVAILABLE}"
@@ -331,6 +360,127 @@ jobs:
               if [[ "$RUN_OUTCOME" != COMPLETED ]]; then
                   stop PREPARATION_FAILURE "the ${label} command ended with status ${RUN_STATUS}" "$label"
               fi
+          }
+
+          # ---- the bounded capture operations -----------------------------
+
+          # capture_op <label> <output> <command> [args...] - run one capture
+          # operation (a candidate discovery, a hash, or a copy) as run_bounded
+          # runs a command. The limit is the active time left, less the kill
+          # grace. timeout stops the operation and its process group, and
+          # stop_operation_group stops what remains, so no operation runs into
+          # the reserve or continues in the background. No operation starts
+          # without that time. Standard output goes to <output>. Sets
+          # CAPTURE_OPERATION, CAPTURE_EXIT, and CAPTURE_STATUS: COMPLETED,
+          # TIMEOUT, NOT_STARTED, or FAILED.
+          capture_op() {
+              local label="$1" output="$2" now left group
+              shift 2
+              CAPTURE_OPERATION="$label"
+              now="$(date +%s)"
+              left=$(( DIAG_ACTIVE_DEADLINE - now - KILL_GRACE ))
+              if (( left <= 0 )); then
+                  CAPTURE_STATUS=NOT_STARTED
+                  CAPTURE_EXIT=124
+                  echo "capture ${label}: NOT_STARTED, no active time left"
+                  return 0
+              fi
+              # timeout makes a new process group, and its PID is the group ID.
+              timeout --kill-after="${KILL_GRACE}s" "${left}s" "$@" > "$output" < /dev/null &
+              group=$!
+              wait "$group"
+              CAPTURE_EXIT=$?
+              stop_operation_group "$group"
+              case "$CAPTURE_EXIT" in
+                  0) CAPTURE_STATUS=COMPLETED ;;
+                  124|137) CAPTURE_STATUS=TIMEOUT ;;
+                  *) CAPTURE_STATUS=FAILED ;;
+              esac
+              echo "capture ${label}: ${CAPTURE_STATUS}, status ${CAPTURE_EXIT}, limit ${left} s"
+          }
+
+          # stop_operation_group <group> - stop each process that is still in
+          # the process group of one capture operation after timeout returns.
+          # timeout sends SIGKILL only while its direct child runs, so a
+          # descendant that ignores SIGTERM can remain after the direct child
+          # exits (PR #93 review 5399027552). Each remaining process gets
+          # SIGTERM, and SIGKILL after KILL_GRACE seconds. The function returns
+          # only when the group is empty. Linux does not give a group ID to a
+          # new process while the group has a process, so no other process gets
+          # a signal.
+          stop_operation_group() {
+              local group="$1" tick
+              kill -0 -- "-${group}" 2>/dev/null || return 0
+              kill -TERM -- "-${group}" 2>/dev/null
+              for (( tick = 0; tick < KILL_GRACE * 10; tick++ )); do
+                  kill -0 -- "-${group}" 2>/dev/null || return 0
+                  sleep 0.1
+              done
+              kill -KILL -- "-${group}" 2>/dev/null
+              while kill -0 -- "-${group}" 2>/dev/null; do
+                  sleep 0.1
+              done
+              echo "capture ${CAPTURE_OPERATION}: process group ${group} stopped with SIGKILL"
+          }
+
+          # capture_stop <state> <path> - stop after an incomplete capture
+          # operation on <path>. <state> is SETUP_LOGS or SPATIAL_CAPTURE. The
+          # temporary output is already removed, so no partial hash, exclusion
+          # row, candidate list, or copy is reported. No time, or a timeout,
+          # gives INCONCLUSIVE_CAPTURE_TIMEOUT at the stop point
+          # capture-timeout. Another failure gives INCONCLUSIVE_CAPTURE_FAILURE
+          # at capture-failure. A timeout replaces the capture causes that the
+          # incomplete operation could not check.
+          capture_stop() {
+              local cause point reason
+              case "$CAPTURE_STATUS" in
+                  NOT_STARTED)
+                      cause=CAPTURE_TIMEOUT point=capture-timeout
+                      reason="no active time was left for the ${CAPTURE_OPERATION} operation on $2" ;;
+                  TIMEOUT)
+                      cause=CAPTURE_TIMEOUT point=capture-timeout
+                      reason="the ${CAPTURE_OPERATION} operation on $2 did not complete before the active-work deadline" ;;
+                  *)
+                      cause=CAPTURE_FAILURE point=capture-failure
+                      reason="the ${CAPTURE_OPERATION} operation on $2 failed with status ${CAPTURE_EXIT}" ;;
+              esac
+              [[ "$cause" == CAPTURE_TIMEOUT ]] && CAPTURE_TIMEOUT=YES
+              CAPTURE_INCOMPLETE_OPERATION="$CAPTURE_OPERATION"
+              CAPTURE_INCOMPLETE_PATH="$2"
+              printf -v "$1" '%s' "INCONCLUSIVE_${cause}"
+              [[ "$1" == SPATIAL_CAPTURE ]] && SPATIAL_REASON="$reason"
+              stop "$cause" "$reason" "$point"
+          }
+
+          # capture_sha <state> <label> <file> <path> - CAPTURE_SHA is the
+          # SHA-256 of <file>, shown as <path>. The hash is published only after
+          # sha256sum completes. Otherwise the run stops. sha256sum starts the
+          # line with a backslash for an escaped file name.
+          capture_sha() {
+              local out="${CAPTURE_TMP}/sha256" line=""
+              CAPTURE_SHA=""
+              capture_op "$2" "$out" sha256sum -- "$3"
+              if [[ "$CAPTURE_STATUS" == COMPLETED ]]; then
+                  IFS= read -r line < "$out" || true
+                  line="${line#\\}"
+                  CAPTURE_SHA="${line%% *}"
+              fi
+              rm -f -- "$out"
+              [[ "$CAPTURE_STATUS" == COMPLETED ]] || capture_stop "$1" "$4"
+          }
+
+          # capture_copy <state> <label> <file> <destination> <path> - copy
+          # <file>, shown as <path>, through a temporary file outside the
+          # evidence. The destination appears only after cp completes.
+          # Otherwise the run stops, and no partial copy remains.
+          capture_copy() {
+              local tmp="${CAPTURE_TMP}/copy"
+              capture_op "$2" /dev/null cp -- "$3" "$tmp"
+              if [[ "$CAPTURE_STATUS" == COMPLETED ]]; then
+                  mv -f -- "$tmp" "$4" || { CAPTURE_EXIT=$?; CAPTURE_STATUS=FAILED; }
+              fi
+              rm -f -- "$tmp"
+              [[ "$CAPTURE_STATUS" == COMPLETED ]] || capture_stop "$1" "$5"
           }
 
           # ---- checkMesh evidence -----------------------------------------
@@ -613,14 +763,15 @@ jobs:
           # The setup Stage writes these two logs when it rotates the STL files.
           # Each must be a readable regular file of at most LOG_LIMIT bytes. A
           # larger log is not cut: its size and checksum are recorded, and the
-          # run stops before any mesh command.
+          # run stops before any mesh command. The hash and the copy are
+          # bounded capture operations.
           setup_log_stop() {
               SETUP_LOGS="INCONCLUSIVE_SETUP_LOG_$1"
               stop "SETUP_LOG_$1" "$2" setup-logs
           }
           # capture_setup_log <prefix> <name> - check and copy one setup log.
           capture_setup_log() {
-              local prefix="$1" src="${FLOW_DIR}/$2" destination="logs/setup-${2#log.}.log" bytes sha
+              local prefix="$1" src="${FLOW_DIR}/$2" destination="logs/setup-${2#log.}.log" bytes
               printf -v "${prefix}_SOURCE" '%s' "$src"
               if [[ ! -e "$src" && ! -L "$src" ]]; then
                   setup_log_stop MISSING "the setup Stage wrote no ${src}"
@@ -632,16 +783,16 @@ jobs:
                   setup_log_stop UNREADABLE "the setup log ${src} is not readable"
               fi
               bytes="$(stat -c %s -- "$src")"
-              sha="$(sha256_of "$src")"
               printf -v "${prefix}_BYTES" '%s' "$bytes"
-              printf -v "${prefix}_SHA256" '%s' "$sha"
+              capture_sha SETUP_LOGS setup-log-hash "$src" "$src"
+              printf -v "${prefix}_SHA256" '%s' "$CAPTURE_SHA"
               if (( bytes > LOG_LIMIT )); then
                   printf -v "${prefix}_DESTINATION" '%s' EXCLUDED
-                  printf '%s\t%s\t%s\t%s\n' "$src" "$bytes" "$sha" "the setup log is above ${LOG_LIMIT} bytes" \
+                  printf '%s\t%s\t%s\t%s\n' "$src" "$bytes" "$CAPTURE_SHA" "the setup log is above ${LOG_LIMIT} bytes" \
                       >> "${EVIDENCE}/excluded.tsv"
                   setup_log_stop OUTPUT_LIMIT "the setup log ${src} has ${bytes} bytes, above ${LOG_LIMIT}"
               fi
-              cp -- "$src" "${EVIDENCE}/${destination}"
+              capture_copy SETUP_LOGS setup-log-copy "$src" "${EVIDENCE}/${destination}" "$src"
               printf -v "${prefix}_DESTINATION" '%s' "$destination"
           }
           capture_setup_log TRANSFORM_LOG log.surfaceTransformPoints
@@ -787,11 +938,20 @@ jobs:
           # vtkSurfaceWriter.C), and only for a set that it writes.
           vtk_expected="postProcessing/${phase_time}/concaveCells/concaveCells.vtp"
           VTK_EXPECTED_SOURCE="${FLOW_DIR}/${vtk_expected}"
-          # vtk_candidates - every entry named concaveCells.vtp or
-          # concaveCells.vtk in the flow Case, relative to it, sorted.
-          vtk_candidates() {
-              find . \( -name concaveCells.vtp -o -name concaveCells.vtk \) -print 2>/dev/null |
-                  sed -e 's#^\./##' | LC_ALL=C sort
+          # discover_candidates <label> - CANDIDATES lists every entry named
+          # concaveCells.vtp or concaveCells.vtk in the flow Case, relative to
+          # it and sorted, from one bounded capture operation. find does not
+          # follow links. A failed or incomplete discovery stops the run.
+          discover_candidates() {
+              local out="${CAPTURE_TMP}/candidates"
+              CANDIDATES=""
+              capture_op "$1" "$out" bash -c '
+                  set -o pipefail
+                  find . \( -name concaveCells.vtp -o -name concaveCells.vtk \) -print |
+                      sed -e "s#^\./##" | LC_ALL=C sort'
+              [[ "$CAPTURE_STATUS" == COMPLETED ]] && CANDIDATES="$(< "$out")"
+              rm -f -- "$out"
+              [[ "$CAPTURE_STATUS" == COMPLETED ]] || capture_stop SPATIAL_CAPTURE "$FLOW_DIR"
           }
           # record_candidates <list> <BEFORE|AFTER> - the count and the paths,
           # relative to the checkout, of one candidate list.
@@ -810,14 +970,17 @@ jobs:
           # excluded.tsv row with the path, byte count, and SHA-256 of each
           # readable regular candidate above VTK_LIMIT bytes (PR #92 review
           # 5394488889). A symbolic link is not followed. No candidate is
-          # copied or cut here, and the primary cause does not change.
+          # copied or cut here, and the primary cause does not change. Each
+          # hash is a bounded capture operation, and a row is written only for
+          # a complete hash.
           exclude_oversized_candidates() {
               local path bytes
               while IFS= read -r path; do
                   [[ -n "$path" && ! -L "$path" && -f "$path" && -r "$path" ]] || continue
                   bytes="$(stat -c %s -- "$path")"
                   (( bytes > VTK_LIMIT )) || continue
-                  printf '%s\t%s\t%s\t%s\n' "${FLOW_DIR}/${path}" "$bytes" "$(sha256_of "$path")" \
+                  capture_sha SPATIAL_CAPTURE vtk-exclusion-hash "$path" "${FLOW_DIR}/${path}"
+                  printf '%s\t%s\t%s\t%s\n' "${FLOW_DIR}/${path}" "$bytes" "$CAPTURE_SHA" \
                       "the VTK file is above ${VTK_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
                   VTK_OVERSIZED_CANDIDATES=$(( VTK_OVERSIZED_CANDIDATES + 1 ))
               done <<< "$1"
@@ -828,14 +991,13 @@ jobs:
               stop "SPATIAL_VTK_$1" "$2" spatial-capture
           }
           # capture_vtp - check and copy the refined concaveCells VTP file. The
-          # refined check ends at least KILL_GRACE seconds before the deadline,
-          # and the capture reads one file of at most VTK_LIMIT bytes, so the
-          # capture stays inside the active-work window.
+          # discovery, each hash, and the copy are bounded capture operations,
+          # so the capture stays inside the active-work window.
           capture_vtp() {
-              local candidates path bytes sha
-              candidates="$(vtk_candidates)"
-              record_candidates "$candidates" AFTER
-              exclude_oversized_candidates "$candidates"
+              local path bytes
+              discover_candidates vtk-discovery-after-check
+              record_candidates "$CANDIDATES" AFTER
+              exclude_oversized_candidates "$CANDIDATES"
               if [[ ! "$REFINED_CONCAVE_CELLS" =~ ^[0-9]+$ ]]; then
                   SPATIAL_CAPTURE=INCONCLUSIVE_SPATIAL_COUNT_UNAVAILABLE
                   SPATIAL_REASON="the refined concave count is ${REFINED_CONCAVE_CELLS}, so no VTP file is a validated capture"
@@ -875,14 +1037,14 @@ jobs:
               if (( bytes == 0 )); then
                   spatial_stop EMPTY "the file ${VTK_SOURCE} has 0 bytes"
               fi
-              sha="$(sha256_of "$path")"
-              VTK_SHA256="$sha"
+              capture_sha SPATIAL_CAPTURE vtp-hash "$path" "$VTK_SOURCE"
+              VTK_SHA256="$CAPTURE_SHA"
               # exclude_oversized_candidates already wrote the exclusion row.
               if (( bytes > VTK_LIMIT )); then
                   VTK_DESTINATION=EXCLUDED
                   spatial_stop OUTPUT_LIMIT "the file ${VTK_SOURCE} has ${bytes} bytes, above ${VTK_LIMIT}"
               fi
-              cp -- "$path" "${EVIDENCE}/spatial/concaveCells.vtp"
+              capture_copy SPATIAL_CAPTURE vtp-copy "$path" "${EVIDENCE}/spatial/concaveCells.vtp" "$VTK_SOURCE"
               VTK_DESTINATION=spatial/concaveCells.vtp
               SPATIAL_CAPTURE=COMPLETE
               SPATIAL_REASON="the refined check at time ${phase_time} wrote one concaveCells VTP file, and the file is copied"
@@ -890,9 +1052,9 @@ jobs:
 
           # Provenance: no candidate may exist before the refined check, so a
           # later file comes from that check.
-          candidates="$(vtk_candidates)"
-          record_candidates "$candidates" BEFORE
-          exclude_oversized_candidates "$candidates"
+          discover_candidates vtk-discovery-before-check
+          record_candidates "$CANDIDATES" BEFORE
+          exclude_oversized_candidates "$CANDIDATES"
           if (( VTK_CANDIDATES_BEFORE_CHECK > 0 )); then
               spatial_stop PROVENANCE "the flow Case holds ${VTK_CANDIDATES_BEFORE_CHECK} concaveCells VTK entries before the refined check: ${VTK_CANDIDATE_PATHS}"
           fi
@@ -1096,6 +1258,8 @@ jobs:
             echo "| Final comparison | \`$(value FINAL_COMPARISON)\` |"
             echo "| Setup logs | \`$(value SETUP_LOGS)\` |"
             echo "| Spatial capture | \`$(value SPATIAL_CAPTURE)\` |"
+            echo "| Capture timeout | \`$(value CAPTURE_TIMEOUT)\` |"
+            echo "| Incomplete capture operation | \`$(value CAPTURE_INCOMPLETE_OPERATION)\` |"
             echo "| Active elapsed seconds | $(value DIAG_ACTIVE_ELAPSED_SECONDS) |"
             echo "| Elapsed seconds at package | $(value DIAG_ELAPSED_AT_PACKAGE_SECONDS) |"
             echo "| Archive bytes | ${archive_bytes} |"
