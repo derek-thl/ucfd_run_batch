@@ -64,6 +64,9 @@
 # with its process group before the active-work deadline, that no partial hash,
 # exclusion row, candidate list, or copy is kept, that a failed operation is an
 # explicit capture failure, and that the summary and the upload stay eligible.
+# Check S53 covers PR #93 review 5399027552: the blocked wrapper exits on
+# SIGTERM, and its child ignores SIGTERM. The check proves that the child gets
+# SIGKILL after the kill grace and is gone before the operation returns.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -2632,7 +2635,11 @@ DIAG_SETUP
 # of the file. It records its process and its child process in DIAG_FAKE_PIDS
 # and waits 30 seconds before the real command. With FAKE_SLOW_SECONDS, the call
 # waits that time and writes no partial output, so its complete output is
-# exact. After the FAKE_CLOCK_JUMP command, date +%s is 100000 seconds later.
+# exact. With FAKE_SLOW_IGNORE_TERM=1, the child process ignores SIGTERM, and
+# the call itself still exits on SIGTERM (PR #93 review 5399027552). If that
+# child is alive when spatial/manifest.env appears, after the operation
+# returned, it writes "<DIAG_FAKE_PIDS>.survivor". It ends after 30 seconds.
+# After the FAKE_CLOCK_JUMP command, date +%s is 100000 seconds later.
 # Each find, sha256sum, and cp call appends one line to DIAG_FAKE_CAPTURE_CALLS:
 # name, target, and each argument, separated by tabs. The target is the
 # absolute file of a hash, the absolute source of a copy, "discovery" for a
@@ -2704,7 +2711,21 @@ if [[ "$mode" == slow ]]; then
             cp) head -c "$(( $(stat -c %s -- "$target") / 2 ))" -- "$target" > "${!#}" ;;
         esac
     fi
-    sleep "${FAKE_SLOW_SECONDS:-30}" &
+    if [[ "${FAKE_SLOW_IGNORE_TERM:-}" == 1 ]]; then
+        (
+            trap '' TERM
+            manifest="${DIAG_DIR:-/nonexistent}/evidence/spatial/manifest.env"
+            for (( tick = 0; tick < 300; tick++ )); do
+                if [[ -e "$manifest" ]]; then
+                    : > "${DIAG_FAKE_PIDS}.survivor"
+                    exit 0
+                fi
+                sleep 0.1
+            done
+        ) &
+    else
+        sleep "${FAKE_SLOW_SECONDS:-30}" &
+    fi
     printf '%s\n%s\n' "$$" "$!" >> "${DIAG_FAKE_PIDS:-/dev/null}"
     wait "$!"
 fi
@@ -4111,6 +4132,38 @@ s52_capture_failure_and_delayed_success() {
     ab_assert_fakes_stopped "$workspace" "$label"
 }
 
+s53_capture_term_ignoring_child_is_killed() {
+    local workspace run entry operation fault path label end deadline elapsed
+    # The blocked wrapper exits on SIGTERM, so timeout returns, and its child
+    # ignores SIGTERM (PR #93 review 5399027552). The hash wrapper is the direct
+    # child of timeout. The discovery wrapper is a grandchild, under bash -c.
+    for entry in "vtp-hash:FAKE_SLOW_HASH=${AB_CAPTURE_VTP}:${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" \
+                 "vtk-discovery-after-check:FAKE_SLOW_DISCOVERY=after:${AB_DIAG_FLOW}"; do
+        IFS=: read -r operation fault path <<< "$entry"
+        label="S53 (${operation})"
+        workspace="$(new_workspace "s53_${operation}")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_capture_window_run "$workspace" "$fault" FAKE_SLOW_IGNORE_TERM=1)"
+        ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE \
+            "$operation" "$path" "$label"
+        # The child is gone before the operation returns: it never sees the
+        # manifest that the stop writes after the operation.
+        assert_file_missing "${workspace}/fake_pids.survivor" \
+            "${label}: the TERM-ignoring child is gone before the operation returns"
+        ab_assert_fakes_stopped "$workspace" "$label"
+        # SIGKILL comes after the kill grace, at the end of the reserve.
+        end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
+        deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
+        elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+        if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end < deadline || end > deadline + 1 )); then
+            _fail "${label}: SIGKILL must come after the kill grace, at the active-work deadline" \
+                  "end: ${end}, deadline: ${deadline}"
+        fi
+        (( elapsed <= AB_CAPTURE_WINDOW + 1 )) ||
+            _fail "${label}: the operation must stop at the end of the kill reserve" "elapsed: ${elapsed}"
+    done
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -4181,6 +4234,7 @@ AB_OBSERVATIONS=(
     s50_capture_slow_hash_publishes_no_partial_hash
     s51_capture_slow_copy_publishes_no_partial_file
     s52_capture_failure_and_delayed_success
+    s53_capture_term_ignoring_child_is_killed
 )
 
 # One observation runs in this process when the caller names it. The scenario
