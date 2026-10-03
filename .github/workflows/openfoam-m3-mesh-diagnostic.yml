@@ -38,7 +38,9 @@ name: openfoam-m3-mesh-diagnostic
 # window, as each command does. An operation without time, or one that does not
 # finish, gives INCONCLUSIVE_CAPTURE_TIMEOUT, and another failed operation gives
 # INCONCLUSIVE_CAPTURE_FAILURE. No partial hash, exclusion row, candidate list,
-# or copy is kept.
+# or copy is kept. Each operation returns only when its process group is empty:
+# a process that ignores SIGTERM gets SIGKILL after the kill grace (PR #93
+# review 5399027552).
 
 on:
   workflow_dispatch:
@@ -365,13 +367,14 @@ jobs:
           # capture_op <label> <output> <command> [args...] - run one capture
           # operation (a candidate discovery, a hash, or a copy) as run_bounded
           # runs a command. The limit is the active time left, less the kill
-          # grace. timeout stops the operation and its process group, so no
-          # operation runs into the reserve or continues in the background. No
-          # operation starts without that time. Standard output goes to
-          # <output>. Sets CAPTURE_OPERATION, CAPTURE_EXIT, and CAPTURE_STATUS:
-          # COMPLETED, TIMEOUT, NOT_STARTED, or FAILED.
+          # grace. timeout stops the operation and its process group, and
+          # stop_operation_group stops what remains, so no operation runs into
+          # the reserve or continues in the background. No operation starts
+          # without that time. Standard output goes to <output>. Sets
+          # CAPTURE_OPERATION, CAPTURE_EXIT, and CAPTURE_STATUS: COMPLETED,
+          # TIMEOUT, NOT_STARTED, or FAILED.
           capture_op() {
-              local label="$1" output="$2" now left
+              local label="$1" output="$2" now left group
               shift 2
               CAPTURE_OPERATION="$label"
               now="$(date +%s)"
@@ -382,14 +385,42 @@ jobs:
                   echo "capture ${label}: NOT_STARTED, no active time left"
                   return 0
               fi
-              timeout --kill-after="${KILL_GRACE}s" "${left}s" "$@" > "$output" < /dev/null
+              # timeout makes a new process group, and its PID is the group ID.
+              timeout --kill-after="${KILL_GRACE}s" "${left}s" "$@" > "$output" < /dev/null &
+              group=$!
+              wait "$group"
               CAPTURE_EXIT=$?
+              stop_operation_group "$group"
               case "$CAPTURE_EXIT" in
                   0) CAPTURE_STATUS=COMPLETED ;;
                   124|137) CAPTURE_STATUS=TIMEOUT ;;
                   *) CAPTURE_STATUS=FAILED ;;
               esac
               echo "capture ${label}: ${CAPTURE_STATUS}, status ${CAPTURE_EXIT}, limit ${left} s"
+          }
+
+          # stop_operation_group <group> - stop each process that is still in
+          # the process group of one capture operation after timeout returns.
+          # timeout sends SIGKILL only while its direct child runs, so a
+          # descendant that ignores SIGTERM can remain after the direct child
+          # exits (PR #93 review 5399027552). Each remaining process gets
+          # SIGTERM, and SIGKILL after KILL_GRACE seconds. The function returns
+          # only when the group is empty. Linux does not give a group ID to a
+          # new process while the group has a process, so no other process gets
+          # a signal.
+          stop_operation_group() {
+              local group="$1" tick
+              kill -0 -- "-${group}" 2>/dev/null || return 0
+              kill -TERM -- "-${group}" 2>/dev/null
+              for (( tick = 0; tick < KILL_GRACE * 10; tick++ )); do
+                  kill -0 -- "-${group}" 2>/dev/null || return 0
+                  sleep 0.1
+              done
+              kill -KILL -- "-${group}" 2>/dev/null
+              while kill -0 -- "-${group}" 2>/dev/null; do
+                  sleep 0.1
+              done
+              echo "capture ${CAPTURE_OPERATION}: process group ${group} stopped with SIGKILL"
           }
 
           # capture_stop <state> <path> - stop after an incomplete capture
