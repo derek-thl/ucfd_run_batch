@@ -16,12 +16,13 @@ name: openfoam-m3-mesh-diagnostic
 #
 # Time: the job limit is 20 minutes. The active work ends 12 minutes after the
 # first step starts. Each command runs under the smaller of its cap and the
-# active time left. The package, summary, and upload steps have 1, 1, and 2
-# minutes, so summary and upload keep 3 minutes. Every step has a timeout, and
-# the six step timeouts sum to 18 minutes (1 + 1 + 12 + 1 + 1 + 2), so even the
-# worst case keeps a 2-minute job margin. The diagnostic step timeout equals the
-# active window, so it cannot stop the work before the active-work deadline.
-# The step timeouts are only final guards.
+# active time left. After a timeout, a command returns only when its process
+# group is empty (Issue #80, contract 5971128677). The package, summary, and
+# upload steps have 1, 1, and 2 minutes, so summary and upload keep 3 minutes.
+# Every step has a timeout, and the six step timeouts sum to 18 minutes
+# (1 + 1 + 12 + 1 + 1 + 2), so even the worst case keeps a 2-minute job margin.
+# The diagnostic step timeout equals the active window, so it cannot stop the
+# work before the active-work deadline. The step timeouts are only final guards.
 #
 # Spatial capture (Issue #80, contract 5847967745): the run also keeps the two
 # setup geometry logs and the refined concaveCells set geometry. The refined
@@ -291,12 +292,14 @@ jobs:
           # command in the current directory. The limit is the smaller of the
           # cap and the active time left, less the kill grace, so no command
           # runs into the reserve for the package, summary, and upload steps.
-          # timeout stops the command and its process group. A log above
-          # LOG_LIMIT bytes is not cut: it leaves the evidence, and its size and
-          # checksum are recorded. Sets RUN_STATUS, RUN_OUTCOME, RUN_LOG, and
-          # RUN_VECTOR.
+          # timeout stops the command and its process group. After a timeout,
+          # stop_operation_group stops what remains of that group, so the
+          # function returns only when the group is empty (contract
+          # 5971128677). A log above LOG_LIMIT bytes is not cut: it leaves the
+          # evidence, and its size and checksum are recorded. Sets RUN_STATUS,
+          # RUN_OUTCOME, RUN_LOG, and RUN_VECTOR.
           run_bounded() {
-              local label="$1" cap="$2" now left limit start end vector log_ref bytes
+              local label="$1" cap="$2" now left limit start end vector log_ref bytes group
               shift 2
               DIAG_SEQ=$(( DIAG_SEQ + 1 ))
               RUN_LOG="${EVIDENCE}/logs/$(printf '%02d' "$DIAG_SEQ")-${label}.log"
@@ -319,8 +322,14 @@ jobs:
               fi
               start="$now"
               echo "command ${label}: limit ${limit} s: ${vector}"
-              timeout --kill-after="${KILL_GRACE}s" "${limit}s" "$@" > "$RUN_LOG" 2>&1 < /dev/null
+              # timeout makes a new process group, and its PID is the group ID.
+              timeout --kill-after="${KILL_GRACE}s" "${limit}s" "$@" > "$RUN_LOG" 2>&1 < /dev/null &
+              group=$!
+              wait "$group"
               RUN_STATUS=$?
+              case "$RUN_STATUS" in
+                  124|137) stop_operation_group "$group" "command ${label}" ;;
+              esac
               end="$(date +%s)"
               case "$RUN_STATUS" in
                   0) RUN_OUTCOME=COMPLETED ;;
@@ -390,7 +399,7 @@ jobs:
               group=$!
               wait "$group"
               CAPTURE_EXIT=$?
-              stop_operation_group "$group"
+              stop_operation_group "$group" "capture ${label}"
               case "$CAPTURE_EXIT" in
                   0) CAPTURE_STATUS=COMPLETED ;;
                   124|137) CAPTURE_STATUS=TIMEOUT ;;
@@ -399,8 +408,9 @@ jobs:
               echo "capture ${label}: ${CAPTURE_STATUS}, status ${CAPTURE_EXIT}, limit ${left} s"
           }
 
-          # stop_operation_group <group> - stop each process that is still in
-          # the process group of one capture operation after timeout returns.
+          # stop_operation_group <group> <label> - stop each process that is
+          # still in the process group of one command or capture operation
+          # after timeout returns.
           # timeout sends SIGKILL only while its direct child runs, so a
           # descendant that ignores SIGTERM can remain after the direct child
           # exits (PR #93 review 5399027552). Each remaining process gets
@@ -409,7 +419,7 @@ jobs:
           # new process while the group has a process, so no other process gets
           # a signal.
           stop_operation_group() {
-              local group="$1" tick
+              local group="$1" label="$2" tick
               kill -0 -- "-${group}" 2>/dev/null || return 0
               kill -TERM -- "-${group}" 2>/dev/null
               for (( tick = 0; tick < KILL_GRACE * 10; tick++ )); do
@@ -420,7 +430,7 @@ jobs:
               while kill -0 -- "-${group}" 2>/dev/null; do
                   sleep 0.1
               done
-              echo "capture ${CAPTURE_OPERATION}: process group ${group} stopped with SIGKILL"
+              echo "${label}: process group ${group} stopped with SIGKILL"
           }
 
           # capture_stop <state> <path> - stop after an incomplete capture
