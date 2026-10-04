@@ -76,7 +76,9 @@
 # SIGTERM. The check proves that the child stops before run_bounded returns,
 # and that the cleanup ends with the one kill grace, at the active-work
 # deadline. Check S55 proves the late case for a capture operation, which uses
-# the same cleanup function.
+# the same cleanup function. It also proves that a capture operation that
+# completes but leaves a TERM-ignoring child gives that child at most the kill
+# grace, and that the diagnostic then continues.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -2672,7 +2674,9 @@ DIAG_SETUP
 # child is alive when spatial/manifest.env appears, after the operation
 # returned, it writes "<DIAG_FAKE_PIDS>.survivor". It ends after 30 seconds.
 # With FAKE_SLOW_EXIT_DELAY, the blocked call exits that many seconds after
-# SIGTERM (PR #94 review 5404512470).
+# SIGTERM (PR #94 review 5404512470). FAKE_LEAVE_CHILD_HASH = <pattern> - a
+# matching hash completes at once, but it leaves such a TERM-ignoring child in
+# its process group.
 # After the FAKE_CLOCK_JUMP command, date +%s is 100000 seconds later.
 # Each find, sha256sum, and cp call appends one line to DIAG_FAKE_CAPTURE_CALLS:
 # name, target, and each argument, separated by tabs. The target is the
@@ -2702,6 +2706,21 @@ calls="${DIAG_FAKE_CAPTURE_CALLS:-/dev/null}"
 absolute() {
     if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$PWD" "$1"; fi
 }
+# term_ignoring_child - start a background child that ignores SIGTERM. If it is
+# alive when spatial/manifest.env appears, it writes the survivor file.
+term_ignoring_child() {
+    (
+        trap '' TERM
+        manifest="${DIAG_DIR:-/nonexistent}/evidence/spatial/manifest.env"
+        for (( tick = 0; tick < 300; tick++ )); do
+            if [[ -e "$manifest" ]]; then
+                : > "${DIAG_FAKE_PIDS}.survivor"
+                exit 0
+            fi
+            sleep 0.1
+        done
+    ) &
+}
 target="-"
 mode=""
 case "$name" in
@@ -2717,7 +2736,7 @@ case "$name" in
     sha256sum)
         if (( $# > 0 )); then
             target="$(absolute "${!#}")"
-        elif [[ -n "${FAKE_SLOW_HASH:-}${FAKE_FAIL_HASH:-}" ]]; then
+        elif [[ -n "${FAKE_SLOW_HASH:-}${FAKE_FAIL_HASH:-}${FAKE_LEAVE_CHILD_HASH:-}" ]]; then
             target="$(readlink "/proc/$$/fd/0" 2>/dev/null || echo -)"
         fi
         # Each fault value is a pattern, so it is not quoted.
@@ -2733,6 +2752,10 @@ esac
 record="${name}"$'\t'"${target}"
 for argument in "$@"; do record+=$'\t'"${argument}"; done
 printf '%s\n' "$record" >> "$calls"
+if [[ "$name" == sha256sum && -n "${FAKE_LEAVE_CHILD_HASH:-}" && "$target" == $FAKE_LEAVE_CHILD_HASH ]]; then
+    term_ignoring_child
+    printf '%s\n' "$!" >> "${DIAG_FAKE_PIDS:-/dev/null}"
+fi
 if [[ "$mode" == fail ]]; then
     echo "fake ${name}: forced capture failure" >&2
     exit 1
@@ -2746,17 +2769,7 @@ if [[ "$mode" == slow ]]; then
         esac
     fi
     if [[ "${FAKE_SLOW_IGNORE_TERM:-}" == 1 ]]; then
-        (
-            trap '' TERM
-            manifest="${DIAG_DIR:-/nonexistent}/evidence/spatial/manifest.env"
-            for (( tick = 0; tick < 300; tick++ )); do
-                if [[ -e "$manifest" ]]; then
-                    : > "${DIAG_FAKE_PIDS}.survivor"
-                    exit 0
-                fi
-                sleep 0.1
-            done
-        ) &
+        term_ignoring_child
     else
         sleep "${FAKE_SLOW_SECONDS:-30}" &
     fi
@@ -4342,6 +4355,26 @@ s55_capture_cleanup_stays_in_the_reserve() {
     if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end > deadline + 1 )); then
         _fail "${label}: the cleanup must stay inside the kill reserve" "end: ${end}, deadline: ${deadline}"
     fi
+
+    # A hash that completes at once but leaves a child that ignores SIGTERM.
+    # The cleanup gives the child at most the 5-second kill grace, not the rest
+    # of the active window, so the diagnostic continues inside the window.
+    label="S55 (VTP hash completes and leaves a child)"
+    workspace="$(new_workspace s55_capture_leftover_child)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" "${AB_DIAG_CONCAVE[@]}" FAKE_LEAVE_CHILD_HASH="$AB_CAPTURE_VTP" \
+           DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + 25 ))")"
+    assert_contains "$(cat "${workspace}/diagnostic.out")" "capture vtp-hash: COMPLETED" \
+        "${label}: the hash completes"
+    assert_contains "$(cat "${workspace}/diagnostic.out")" "stopped with SIGKILL" \
+        "${label}: the cleanup stops the remaining child"
+    assert_file_missing "${workspace}/fake_pids.survivor" \
+        "${label}: the TERM-ignoring child is gone before the operation returns"
+    ab_assert_fakes_stopped "$workspace" "$label"
+    assert_eq "COMPLETE" "$(ab_diag_value "$workspace" SPATIAL_CAPTURE)" "${label}: the capture is complete"
+    assert_eq "FIRST_CONCAVITY_AT_REFINED_MESH" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "${label}: the diagnostic class stands"
+    assert_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time 1" "${label}: the diagnostic continues"
 }
 
 # ---- the observation list ---------------------------------------------------
