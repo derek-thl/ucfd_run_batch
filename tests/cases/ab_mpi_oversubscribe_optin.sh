@@ -68,6 +68,12 @@
 # SIGTERM, and its child ignores SIGTERM. The check proves that the child gets
 # SIGKILL after the kill grace and is gone before the operation returns.
 #
+# Check S54 covers the same case for the command runner run_bounded (Issue #80,
+# contract 5971128677). It calls the run_bounded function from the workflow
+# with a controlled command, and it runs the diagnostic step with a blocked
+# blockMesh. The command exits on SIGTERM, and its child ignores SIGTERM. The
+# check proves that the child stops before run_bounded returns.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -2329,6 +2335,27 @@ if ! has -help-full "$@"; then
             exec sleep 300
         fi
     done
+    # The command exits on SIGTERM, and its child ignores SIGTERM (contract
+    # 5971128677). If the child is alive when spatial/manifest.env appears,
+    # after run_bounded returned, it writes "<DIAG_FAKE_PIDS>.survivor".
+    for entry in ${FAKE_HANG_IGNORE_TERM:-}; do
+        if [[ "$entry" == "$name" ]]; then
+            trap 'exit 0' TERM
+            (
+                trap '' TERM
+                for (( tick = 0; tick < 300; tick++ )); do
+                    if [[ -e "${DIAG_DIR}/evidence/spatial/manifest.env" ]]; then
+                        : > "${DIAG_FAKE_PIDS}.survivor"
+                        exit 0
+                    fi
+                    sleep 0.1
+                done
+            ) &
+            printf '%s\n%s\n' "$$" "$!" >> "$DIAG_FAKE_PIDS"
+            wait
+            exit 0
+        fi
+    done
 fi
 np="${FAKE_MPI_NP:-1}"
 write_geometry=0
@@ -4164,6 +4191,114 @@ s53_capture_term_ignoring_child_is_killed() {
     done
 }
 
+# ---- S54: the run_bounded command group (Issue #80) ------------------------
+
+# ab_diag_functions <workspace> - every top-level function of the diagnostic
+# script in the workflow. A definition starts at a "name() {" line and ends at
+# the next "}" line, both at the first column of the script.
+ab_diag_functions() {
+    awk '/<<.MESH_DIAGNOSTIC.$/ { inside = 1; next } /^MESH_DIAGNOSTIC$/ { inside = 0 } inside' \
+        "${1}/diagnostic_step.sh" |
+        awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) \{$/ { body = 1 } body { print } body && /^\}$/ { body = 0 }'
+}
+
+# ab_write_term_ignoring_command <file> - a command that exits on SIGTERM. Its
+# child ignores SIGTERM and ends by itself after 30 seconds. Both print their
+# PIDs.
+ab_write_term_ignoring_command() {
+    cat > "$1" <<'TERM_IGNORING_COMMAND'
+#!/usr/bin/env bash
+trap 'exit 0' TERM
+(
+    trap '' TERM
+    printf 'CHILD_PID=%s\n' "$BASHPID"
+    for (( tick = 0; tick < 300; tick++ )); do sleep 0.1; done
+) &
+printf 'PARENT_PID=%s\n' "$$"
+wait
+TERM_IGNORING_COMMAND
+    chmod +x "$1"
+}
+
+s54_run_bounded_stops_the_command_group() {
+    local workspace run probe limit elapsed child parent dir end deadline
+    # The run_bounded function of the workflow, called directly. Directly
+    # after the function returns, the same shell checks the child.
+    workspace="$(new_workspace s54_function)"
+    ab_diag_fixture "$workspace"
+    ab_diag_functions "$workspace" > "${workspace}/functions.sh"
+    grep -q '^run_bounded() {$' "${workspace}/functions.sh" ||
+        _fail "S54: the run_bounded function must be extracted from the workflow"
+    ab_write_term_ignoring_command "${workspace}/term_ignoring_command"
+    probe="$(cd "$workspace" && bash -c '
+        source ./functions.sh
+        EVIDENCE="${PWD}/evidence"
+        EXCLUDED="${PWD}/excluded"
+        mkdir -p "${EVIDENCE}/logs" "$EXCLUDED"
+        KILL_GRACE=5
+        LOG_LIMIT=1048576
+        DIAG_SEQ=0
+        DIAG_ACTIVE_DEADLINE=$(( $(date +%s) + 8 ))
+        start=$(date +%s)
+        run_bounded term-ignoring 30 ./term_ignoring_command
+        end=$(date +%s)
+        child=$(sed -n "s/^CHILD_PID=//p" "$RUN_LOG")
+        parent=$(sed -n "s/^PARENT_PID=//p" "$RUN_LOG")
+        alive=NO
+        if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
+            alive=YES
+            kill -KILL "$child" 2>/dev/null
+        fi
+        printf "status=%s outcome=%s elapsed=%s child=%s parent=%s child_alive_at_return=%s\n" \
+            "$RUN_STATUS" "$RUN_OUTCOME" "$(( end - start ))" "${child:-NONE}" "${parent:-NONE}" "$alive"
+    ')"
+    child="$(sed -n 's/.* child=\([^ ]*\) .*/\1/p' <<< "$probe")"
+    parent="$(sed -n 's/.* parent=\([^ ]*\) .*/\1/p' <<< "$probe")"
+    [[ "$child" =~ ^[0-9]+$ && "$parent" =~ ^[0-9]+$ ]] ||
+        _fail "S54 (function): the command and its child must start" "probe: ${probe}"
+    printf '%s\n%s\n' "$parent" "$child" >> "${workspace}/fake_pids"
+    assert_contains "$probe" "child_alive_at_return=NO" \
+        "S54 (function): the TERM-ignoring child stops before run_bounded returns"
+    assert_contains "$probe" "status=124 outcome=TIMEOUT " "S54 (function): the result is still a timeout"
+    ab_assert_fakes_stopped "$workspace" "S54 (function)"
+    # SIGKILL comes after the kill grace that follows SIGTERM at the limit.
+    limit="$(awk -F '\t' '$2 == "term-ignoring" { print $4 }' "${workspace}/evidence/commands.tsv")"
+    elapsed="$(sed -n 's/.* elapsed=\([0-9]*\) .*/\1/p' <<< "$probe")"
+    if [[ ! "$limit" =~ ^[0-9]+$ || ! "$elapsed" =~ ^[0-9]+$ ]] \
+       || (( elapsed < limit + 5 - 1 || elapsed > limit + 5 + 2 )); then
+        _fail "S54 (function): SIGKILL must come after the 5-second kill grace" \
+              "limit: ${limit}, elapsed: ${elapsed}"
+    fi
+    assert_contains "$(cat "${workspace}/evidence/commands.tsv")" "	124	TIMEOUT	" \
+        "S54 (function): the command record shows the timeout"
+
+    # The diagnostic step: a blocked blockMesh exits on SIGTERM, and its child
+    # ignores SIGTERM. The child writes a survivor file if it is alive when the
+    # manifest appears, after run_bounded returned.
+    workspace="$(new_workspace s54_step)"
+    ab_diag_fixture "$workspace"
+    run="$(ab_diag_run "$workspace" FAKE_HANG_IGNORE_TERM=blockMesh \
+           DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + 12 ))")"
+    dir="$(ab_diag_dir "$workspace")"
+    assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+        "S54 (step): the result class stays INCONCLUSIVE_TIMEOUT"
+    assert_eq "blockMesh" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "S54 (step): the run stops at blockMesh"
+    assert_file_missing "${workspace}/fake_pids.survivor" \
+        "S54 (step): the TERM-ignoring child stops before run_bounded returns"
+    ab_assert_fakes_stopped "$workspace" "S54 (step)"
+    end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
+    deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
+    if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end > deadline + 1 )); then
+        _fail "S54 (step): the cleanup must end at the active-work deadline" "end: ${end}, deadline: ${deadline}"
+    fi
+    assert_not_contains "$(ab_diag_calls "$workspace")" "decomposePar" "S54 (step): no command runs after the timeout"
+    assert_contains "$run" "package=0 " "S54 (step): the package step ends with status 0"
+    assert_contains "$run" "summary=0" "S54 (step): the summary step ends with status 0"
+    assert_file_exists "${dir}/upload/result.env" "S54 (step): the upload holds the result"
+    assert_contains "$(cat "${workspace}/step_summary")" '| Result | `INCONCLUSIVE_TIMEOUT` |' \
+        "S54 (step): the job summary shows the timeout"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -4235,6 +4370,7 @@ AB_OBSERVATIONS=(
     s51_capture_slow_copy_publishes_no_partial_file
     s52_capture_failure_and_delayed_success
     s53_capture_term_ignoring_child_is_killed
+    s54_run_bounded_stops_the_command_group
 )
 
 # One observation runs in this process when the caller names it. The scenario
