@@ -17,8 +17,9 @@ name: openfoam-m3-mesh-diagnostic
 # Time: the job limit is 20 minutes. The active work ends 12 minutes after the
 # first step starts. Each command runs under the smaller of its cap and the
 # active time left. After a timeout, a command returns only when its process
-# group is empty (Issue #80, contract 5971128677). The package, summary, and
-# upload steps have 1, 1, and 2 minutes, so summary and upload keep 3 minutes.
+# group is empty, and that cleanup ends with the same kill grace (Issue #80,
+# contract 5971128677). The package, summary, and upload steps have 1, 1, and 2
+# minutes, so summary and upload keep 3 minutes.
 # Every step has a timeout, and the six step timeouts sum to 18 minutes
 # (1 + 1 + 12 + 1 + 1 + 2), so even the worst case keeps a 2-minute job margin.
 # The diagnostic step timeout equals the active window, so it cannot stop the
@@ -40,8 +41,8 @@ name: openfoam-m3-mesh-diagnostic
 # finish, gives INCONCLUSIVE_CAPTURE_TIMEOUT, and another failed operation gives
 # INCONCLUSIVE_CAPTURE_FAILURE. No partial hash, exclusion row, candidate list,
 # or copy is kept. Each operation returns only when its process group is empty:
-# a process that ignores SIGTERM gets SIGKILL after the kill grace (PR #93
-# review 5399027552).
+# a process that ignores SIGTERM gets SIGKILL at the end of the kill grace
+# (PR #93 review 5399027552, PR #94 review 5404512470).
 
 on:
   workflow_dispatch:
@@ -293,11 +294,12 @@ jobs:
           # cap and the active time left, less the kill grace, so no command
           # runs into the reserve for the package, summary, and upload steps.
           # timeout stops the command and its process group. After a timeout,
-          # stop_operation_group stops what remains of that group, so the
-          # function returns only when the group is empty (contract
-          # 5971128677). A log above LOG_LIMIT bytes is not cut: it leaves the
-          # evidence, and its size and checksum are recorded. Sets RUN_STATUS,
-          # RUN_OUTCOME, RUN_LOG, and RUN_VECTOR.
+          # stop_operation_group stops what remains of that group by the end
+          # of the same kill grace, start + limit + KILL_GRACE, so the function
+          # returns only when the group is empty, inside the reserve (contract
+          # 5971128677, PR #94 review 5404512470). A log above LOG_LIMIT bytes
+          # is not cut: it leaves the evidence, and its size and checksum are
+          # recorded. Sets RUN_STATUS, RUN_OUTCOME, RUN_LOG, and RUN_VECTOR.
           run_bounded() {
               local label="$1" cap="$2" now left limit start end vector log_ref bytes group
               shift 2
@@ -328,7 +330,8 @@ jobs:
               wait "$group"
               RUN_STATUS=$?
               case "$RUN_STATUS" in
-                  124|137) stop_operation_group "$group" "command ${label}" ;;
+                  124|137)
+                      stop_operation_group "$group" "command ${label}" "$(( start + limit + KILL_GRACE ))" ;;
               esac
               end="$(date +%s)"
               case "$RUN_STATUS" in
@@ -399,7 +402,7 @@ jobs:
               group=$!
               wait "$group"
               CAPTURE_EXIT=$?
-              stop_operation_group "$group" "capture ${label}"
+              stop_operation_group "$group" "capture ${label}" "$(( now + left + KILL_GRACE ))"
               case "$CAPTURE_EXIT" in
                   0) CAPTURE_STATUS=COMPLETED ;;
                   124|137) CAPTURE_STATUS=TIMEOUT ;;
@@ -408,25 +411,34 @@ jobs:
               echo "capture ${label}: ${CAPTURE_STATUS}, status ${CAPTURE_EXIT}, limit ${left} s"
           }
 
-          # stop_operation_group <group> <label> - stop each process that is
-          # still in the process group of one command or capture operation
-          # after timeout returns.
+          # stop_operation_group <group> <label> <kill-at> - stop each process
+          # that is still in the process group of one command or capture
+          # operation after timeout returns.
           # timeout sends SIGKILL only while its direct child runs, so a
           # descendant that ignores SIGTERM can remain after the direct child
           # exits (PR #93 review 5399027552). Each remaining process gets
-          # SIGTERM, and SIGKILL after KILL_GRACE seconds. The function returns
-          # only when the group is empty. Linux does not give a group ID to a
-          # new process while the group has a process, so no other process gets
-          # a signal.
+          # SIGTERM, and SIGKILL at <kill-at>, the epoch second that ends the
+          # kill grace after timeout's SIGTERM: the operation start plus its
+          # limit plus KILL_GRACE. A late exit of the direct child therefore
+          # starts no second grace, and the cleanup stays inside the reserve
+          # (PR #94 review 5404512470). After an earlier return, the remaining
+          # processes get at most KILL_GRACE seconds. The function returns only
+          # when the group is empty. Linux does not give a group ID to a new
+          # process while the group has a process, so no other process gets a
+          # signal.
           stop_operation_group() {
-              local group="$1" label="$2" tick
+              local group="$1" label="$2" kill_at="$3" now
               kill -0 -- "-${group}" 2>/dev/null || return 0
               kill -TERM -- "-${group}" 2>/dev/null
-              for (( tick = 0; tick < KILL_GRACE * 10; tick++ )); do
+              now="$(date +%s)"
+              if (( kill_at > now + KILL_GRACE )); then
+                  kill_at=$(( now + KILL_GRACE ))
+              fi
+              while (( $(date +%s) < kill_at )); do
                   kill -0 -- "-${group}" 2>/dev/null || return 0
                   sleep 0.1
               done
-              kill -KILL -- "-${group}" 2>/dev/null
+              kill -KILL -- "-${group}" 2>/dev/null || return 0
               while kill -0 -- "-${group}" 2>/dev/null; do
                   sleep 0.1
               done
