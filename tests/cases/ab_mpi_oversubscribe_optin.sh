@@ -71,8 +71,12 @@
 # Check S54 covers the same case for the command runner run_bounded (Issue #80,
 # contract 5971128677). It calls the run_bounded function from the workflow
 # with a controlled command, and it runs the diagnostic step with a blocked
-# blockMesh. The command exits on SIGTERM, and its child ignores SIGTERM. The
-# check proves that the child stops before run_bounded returns.
+# blockMesh. The command exits on SIGTERM at once, or 4 seconds later near the
+# end of the first kill grace (PR #94 review 5404512470), and its child ignores
+# SIGTERM. The check proves that the child stops before run_bounded returns,
+# and that the cleanup ends with the one kill grace, at the active-work
+# deadline. Check S55 proves the late case for a capture operation, which uses
+# the same cleanup function.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -2335,12 +2339,13 @@ if ! has -help-full "$@"; then
             exec sleep 300
         fi
     done
-    # The command exits on SIGTERM, and its child ignores SIGTERM (contract
-    # 5971128677). If the child is alive when spatial/manifest.env appears,
+    # The command exits on SIGTERM, FAKE_HANG_EXIT_DELAY seconds later (default
+    # 0), and its child ignores SIGTERM (contract 5971128677, PR #94 review
+    # 5404512470). If the child is alive when spatial/manifest.env appears,
     # after run_bounded returned, it writes "<DIAG_FAKE_PIDS>.survivor".
     for entry in ${FAKE_HANG_IGNORE_TERM:-}; do
         if [[ "$entry" == "$name" ]]; then
-            trap 'exit 0' TERM
+            trap 'sleep "${FAKE_HANG_EXIT_DELAY:-0}"; exit 0' TERM
             (
                 trap '' TERM
                 for (( tick = 0; tick < 300; tick++ )); do
@@ -2666,6 +2671,8 @@ DIAG_SETUP
 # the call itself still exits on SIGTERM (PR #93 review 5399027552). If that
 # child is alive when spatial/manifest.env appears, after the operation
 # returned, it writes "<DIAG_FAKE_PIDS>.survivor". It ends after 30 seconds.
+# With FAKE_SLOW_EXIT_DELAY, the blocked call exits that many seconds after
+# SIGTERM (PR #94 review 5404512470).
 # After the FAKE_CLOCK_JUMP command, date +%s is 100000 seconds later.
 # Each find, sha256sum, and cp call appends one line to DIAG_FAKE_CAPTURE_CALLS:
 # name, target, and each argument, separated by tabs. The target is the
@@ -2754,6 +2761,9 @@ if [[ "$mode" == slow ]]; then
         sleep "${FAKE_SLOW_SECONDS:-30}" &
     fi
     printf '%s\n%s\n' "$$" "$!" >> "${DIAG_FAKE_PIDS:-/dev/null}"
+    if [[ -n "${FAKE_SLOW_EXIT_DELAY:-}" ]]; then
+        trap 'sleep "$FAKE_SLOW_EXIT_DELAY"; exit 0' TERM
+    fi
     wait "$!"
 fi
 exec "$real" "$@"
@@ -4202,13 +4212,14 @@ ab_diag_functions() {
         awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) \{$/ { body = 1 } body { print } body && /^\}$/ { body = 0 }'
 }
 
-# ab_write_term_ignoring_command <file> - a command that exits on SIGTERM. Its
-# child ignores SIGTERM and ends by itself after 30 seconds. Both print their
-# PIDs.
+# ab_write_term_ignoring_command <file> [<exit-delay>] - a command that exits
+# on SIGTERM, <exit-delay> seconds later (default 0). Its child ignores SIGTERM
+# and ends by itself after 30 seconds. Both print their PIDs.
 ab_write_term_ignoring_command() {
-    cat > "$1" <<'TERM_IGNORING_COMMAND'
-#!/usr/bin/env bash
-trap 'exit 0' TERM
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf "trap 'sleep %s; exit 0' TERM\n" "${2:-0}"
+        cat <<'TERM_IGNORING_COMMAND'
 (
     trap '' TERM
     printf 'CHILD_PID=%s\n' "$BASHPID"
@@ -4217,86 +4228,120 @@ trap 'exit 0' TERM
 printf 'PARENT_PID=%s\n' "$$"
 wait
 TERM_IGNORING_COMMAND
+    } > "$1"
     chmod +x "$1"
 }
 
 s54_run_bounded_stops_the_command_group() {
-    local workspace run probe limit elapsed child parent dir end deadline
-    # The run_bounded function of the workflow, called directly. Directly
-    # after the function returns, the same shell checks the child.
-    workspace="$(new_workspace s54_function)"
-    ab_diag_fixture "$workspace"
-    ab_diag_functions "$workspace" > "${workspace}/functions.sh"
-    grep -q '^run_bounded() {$' "${workspace}/functions.sh" ||
-        _fail "S54: the run_bounded function must be extracted from the workflow"
-    ab_write_term_ignoring_command "${workspace}/term_ignoring_command"
-    probe="$(cd "$workspace" && bash -c '
-        source ./functions.sh
-        EVIDENCE="${PWD}/evidence"
-        EXCLUDED="${PWD}/excluded"
-        mkdir -p "${EVIDENCE}/logs" "$EXCLUDED"
-        KILL_GRACE=5
-        LOG_LIMIT=1048576
-        DIAG_SEQ=0
-        DIAG_ACTIVE_DEADLINE=$(( $(date +%s) + 8 ))
-        start=$(date +%s)
-        run_bounded term-ignoring 30 ./term_ignoring_command
-        end=$(date +%s)
-        child=$(sed -n "s/^CHILD_PID=//p" "$RUN_LOG")
-        parent=$(sed -n "s/^PARENT_PID=//p" "$RUN_LOG")
-        alive=NO
-        if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
-            alive=YES
-            kill -KILL "$child" 2>/dev/null
+    local workspace run probe limit elapsed child parent dir end deadline delay label
+    # The command exits on SIGTERM at once, or 4 seconds later, near the end of
+    # the first kill grace (PR #94 review 5404512470). Its child ignores
+    # SIGTERM. timeout sends its own SIGKILL 5 seconds after SIGTERM, so a
+    # 4-second exit still returns status 124.
+    for delay in 0 4; do
+        # The run_bounded function of the workflow, called directly. Directly
+        # after the function returns, the same shell checks the child.
+        label="S54 (function, exit ${delay} s after SIGTERM)"
+        workspace="$(new_workspace "s54_function_${delay}")"
+        ab_diag_fixture "$workspace"
+        ab_diag_functions "$workspace" > "${workspace}/functions.sh"
+        grep -q '^run_bounded() {$' "${workspace}/functions.sh" ||
+            _fail "${label}: the run_bounded function must be extracted from the workflow"
+        ab_write_term_ignoring_command "${workspace}/term_ignoring_command" "$delay"
+        probe="$(cd "$workspace" && bash -c '
+            source ./functions.sh
+            EVIDENCE="${PWD}/evidence"
+            EXCLUDED="${PWD}/excluded"
+            mkdir -p "${EVIDENCE}/logs" "$EXCLUDED"
+            KILL_GRACE=5
+            LOG_LIMIT=1048576
+            DIAG_SEQ=0
+            DIAG_ACTIVE_DEADLINE=$(( $(date +%s) + 8 ))
+            start=$(date +%s)
+            run_bounded term-ignoring 30 ./term_ignoring_command
+            end=$(date +%s)
+            child=$(sed -n "s/^CHILD_PID=//p" "$RUN_LOG")
+            parent=$(sed -n "s/^PARENT_PID=//p" "$RUN_LOG")
+            alive=NO
+            if [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null; then
+                alive=YES
+                kill -KILL "$child" 2>/dev/null
+            fi
+            printf "status=%s outcome=%s elapsed=%s child=%s parent=%s child_alive_at_return=%s\n" \
+                "$RUN_STATUS" "$RUN_OUTCOME" "$(( end - start ))" "${child:-NONE}" "${parent:-NONE}" "$alive"
+        ')"
+        child="$(sed -n 's/.* child=\([^ ]*\) .*/\1/p' <<< "$probe")"
+        parent="$(sed -n 's/.* parent=\([^ ]*\) .*/\1/p' <<< "$probe")"
+        [[ "$child" =~ ^[0-9]+$ && "$parent" =~ ^[0-9]+$ ]] ||
+            _fail "${label}: the command and its child must start" "probe: ${probe}"
+        printf '%s\n%s\n' "$parent" "$child" >> "${workspace}/fake_pids"
+        assert_contains "$probe" "child_alive_at_return=NO" \
+            "${label}: the TERM-ignoring child stops before run_bounded returns"
+        assert_contains "$probe" "status=124 outcome=TIMEOUT " "${label}: the result is still a timeout"
+        ab_assert_fakes_stopped "$workspace" "$label"
+        # SIGKILL comes at the end of the one kill grace that follows SIGTERM
+        # at the limit. A late command exit starts no second grace.
+        limit="$(awk -F '\t' '$2 == "term-ignoring" { print $4 }' "${workspace}/evidence/commands.tsv")"
+        elapsed="$(sed -n 's/.* elapsed=\([0-9]*\) .*/\1/p' <<< "$probe")"
+        if [[ ! "$limit" =~ ^[0-9]+$ || ! "$elapsed" =~ ^[0-9]+$ ]] \
+           || (( elapsed < limit + 5 - 1 || elapsed > limit + 5 + 1 )); then
+            _fail "${label}: SIGKILL must come at the end of the one 5-second kill grace" \
+                  "limit: ${limit}, elapsed: ${elapsed}"
         fi
-        printf "status=%s outcome=%s elapsed=%s child=%s parent=%s child_alive_at_return=%s\n" \
-            "$RUN_STATUS" "$RUN_OUTCOME" "$(( end - start ))" "${child:-NONE}" "${parent:-NONE}" "$alive"
-    ')"
-    child="$(sed -n 's/.* child=\([^ ]*\) .*/\1/p' <<< "$probe")"
-    parent="$(sed -n 's/.* parent=\([^ ]*\) .*/\1/p' <<< "$probe")"
-    [[ "$child" =~ ^[0-9]+$ && "$parent" =~ ^[0-9]+$ ]] ||
-        _fail "S54 (function): the command and its child must start" "probe: ${probe}"
-    printf '%s\n%s\n' "$parent" "$child" >> "${workspace}/fake_pids"
-    assert_contains "$probe" "child_alive_at_return=NO" \
-        "S54 (function): the TERM-ignoring child stops before run_bounded returns"
-    assert_contains "$probe" "status=124 outcome=TIMEOUT " "S54 (function): the result is still a timeout"
-    ab_assert_fakes_stopped "$workspace" "S54 (function)"
-    # SIGKILL comes after the kill grace that follows SIGTERM at the limit.
-    limit="$(awk -F '\t' '$2 == "term-ignoring" { print $4 }' "${workspace}/evidence/commands.tsv")"
-    elapsed="$(sed -n 's/.* elapsed=\([0-9]*\) .*/\1/p' <<< "$probe")"
-    if [[ ! "$limit" =~ ^[0-9]+$ || ! "$elapsed" =~ ^[0-9]+$ ]] \
-       || (( elapsed < limit + 5 - 1 || elapsed > limit + 5 + 2 )); then
-        _fail "S54 (function): SIGKILL must come after the 5-second kill grace" \
-              "limit: ${limit}, elapsed: ${elapsed}"
-    fi
-    assert_contains "$(cat "${workspace}/evidence/commands.tsv")" "	124	TIMEOUT	" \
-        "S54 (function): the command record shows the timeout"
+        assert_contains "$(cat "${workspace}/evidence/commands.tsv")" "	124	TIMEOUT	" \
+            "${label}: the command record shows the timeout"
+    done
 
-    # The diagnostic step: a blocked blockMesh exits on SIGTERM, and its child
-    # ignores SIGTERM. The child writes a survivor file if it is alive when the
-    # manifest appears, after run_bounded returned.
-    workspace="$(new_workspace s54_step)"
+    for delay in 0 4; do
+        # The diagnostic step: a blocked blockMesh exits on SIGTERM, and its
+        # child ignores SIGTERM. The child writes a survivor file if it is
+        # alive when the manifest appears, after run_bounded returned.
+        label="S54 (step, exit ${delay} s after SIGTERM)"
+        workspace="$(new_workspace "s54_step_${delay}")"
+        ab_diag_fixture "$workspace"
+        run="$(ab_diag_run "$workspace" FAKE_HANG_IGNORE_TERM=blockMesh FAKE_HANG_EXIT_DELAY="$delay" \
+               DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + 12 ))")"
+        dir="$(ab_diag_dir "$workspace")"
+        assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
+            "${label}: the result class stays INCONCLUSIVE_TIMEOUT"
+        assert_eq "blockMesh" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "${label}: the run stops at blockMesh"
+        assert_file_missing "${workspace}/fake_pids.survivor" \
+            "${label}: the TERM-ignoring child stops before run_bounded returns"
+        ab_assert_fakes_stopped "$workspace" "$label"
+        end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
+        deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
+        if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end > deadline + 1 )); then
+            _fail "${label}: the cleanup must end at the active-work deadline" "end: ${end}, deadline: ${deadline}"
+        fi
+        assert_not_contains "$(ab_diag_calls "$workspace")" "decomposePar" "${label}: no command runs after the timeout"
+        assert_contains "$run" "package=0 " "${label}: the package step ends with status 0"
+        assert_contains "$run" "summary=0" "${label}: the summary step ends with status 0"
+        assert_file_exists "${dir}/upload/result.env" "${label}: the upload holds the result"
+        assert_contains "$(cat "${workspace}/step_summary")" '| Result | `INCONCLUSIVE_TIMEOUT` |' \
+            "${label}: the job summary shows the timeout"
+    done
+}
+
+s55_capture_cleanup_stays_in_the_reserve() {
+    local workspace run end deadline label="S55 (VTP hash, exit 4 s after SIGTERM)"
+    # capture_op uses the same cleanup function (PR #94 review 5404512470).
+    # The blocked hash call is the direct child of timeout. It exits 4 seconds
+    # after SIGTERM, near the end of the first kill grace, and its child
+    # ignores SIGTERM.
+    workspace="$(new_workspace s55_capture_late_exit)"
     ab_diag_fixture "$workspace"
-    run="$(ab_diag_run "$workspace" FAKE_HANG_IGNORE_TERM=blockMesh \
-           DIAG_ACTIVE_DEADLINE="$(( $(date +%s) + 12 ))")"
-    dir="$(ab_diag_dir "$workspace")"
-    assert_eq "INCONCLUSIVE_TIMEOUT" "$(ab_diag_value "$workspace" DIAG_RESULT)" \
-        "S54 (step): the result class stays INCONCLUSIVE_TIMEOUT"
-    assert_eq "blockMesh" "$(ab_diag_value "$workspace" DIAG_STOP_POINT)" "S54 (step): the run stops at blockMesh"
+    run="$(ab_capture_window_run "$workspace" FAKE_SLOW_HASH="$AB_CAPTURE_VTP" FAKE_SLOW_IGNORE_TERM=1 \
+           FAKE_SLOW_EXIT_DELAY=4)"
+    ab_assert_capture_stop "$workspace" "$run" INCONCLUSIVE_CAPTURE_TIMEOUT SPATIAL_CAPTURE vtp-hash \
+        "${AB_DIAG_FLOW}/postProcessing/1/concaveCells/concaveCells.vtp" "$label"
     assert_file_missing "${workspace}/fake_pids.survivor" \
-        "S54 (step): the TERM-ignoring child stops before run_bounded returns"
-    ab_assert_fakes_stopped "$workspace" "S54 (step)"
+        "${label}: the TERM-ignoring child is gone before the operation returns"
+    ab_assert_fakes_stopped "$workspace" "$label"
     end="$(ab_diag_value "$workspace" DIAG_ACTIVE_END)"
     deadline="$(ab_diag_value "$workspace" DIAG_ACTIVE_DEADLINE)"
     if [[ ! "$end" =~ ^[0-9]+$ || ! "$deadline" =~ ^[0-9]+$ ]] || (( end > deadline + 1 )); then
-        _fail "S54 (step): the cleanup must end at the active-work deadline" "end: ${end}, deadline: ${deadline}"
+        _fail "${label}: the cleanup must stay inside the kill reserve" "end: ${end}, deadline: ${deadline}"
     fi
-    assert_not_contains "$(ab_diag_calls "$workspace")" "decomposePar" "S54 (step): no command runs after the timeout"
-    assert_contains "$run" "package=0 " "S54 (step): the package step ends with status 0"
-    assert_contains "$run" "summary=0" "S54 (step): the summary step ends with status 0"
-    assert_file_exists "${dir}/upload/result.env" "S54 (step): the upload holds the result"
-    assert_contains "$(cat "${workspace}/step_summary")" '| Result | `INCONCLUSIVE_TIMEOUT` |' \
-        "S54 (step): the job summary shows the timeout"
 }
 
 # ---- the observation list ---------------------------------------------------
@@ -4371,6 +4416,7 @@ AB_OBSERVATIONS=(
     s52_capture_failure_and_delayed_success
     s53_capture_term_ignoring_child_is_killed
     s54_run_bounded_stops_the_command_group
+    s55_capture_cleanup_stays_in_the_reserve
 )
 
 # One observation runs in this process when the caller names it. The scenario
