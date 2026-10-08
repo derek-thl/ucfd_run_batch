@@ -4403,6 +4403,10 @@ METRIC_WORKFLOW="${REPO_ROOT}/.github/workflows/openfoam-m3-metric-validation.ym
 # The fake workflow commit. The dispatch input must equal it.
 AB_METRIC_SHA="6f198977b700a2bcb664bcc704a3d506eefb67ab"
 
+# GitHub runs each `shell: bash` step as `bash --noprofile --norc -eo pipefail
+# {0}`, so the checks run each extracted step the same way.
+AB_STEP_BASH=(bash --noprofile --norc -eo pipefail)
+
 # The exact command vector of the Architect contract, as the workflow text.
 AB_METRIC_COMMAND="simpleFoam -case \"\$CASE_DIR\" -postProcess -time \"\$SELECTED_TIME\" -fields '(U)' -dict \"\$TASK_TEMP/config/metric-functions\""
 
@@ -4745,14 +4749,14 @@ ab_metric_run() {
     local workspace="$1" start elapsed status package base=() published=()
     shift
     mapfile -t base < <(ab_metric_base "$workspace")
-    env "${base[@]}" bash "${workspace}/clock_step.sh" > "${workspace}/clock.out" 2>&1 ||
+    env "${base[@]}" "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > "${workspace}/clock.out" 2>&1 ||
         _fail "S56: the clock step must succeed"
     mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
     start="$(date +%s)"
     env "${base[@]}" "${published[@]}" OPENFOAM_ROOT="${workspace}/openfoam" "$@" \
-        bash "${workspace}/run_step.sh" > "${workspace}/run.out" 2>&1 && status=0 || status=$?
+        "${AB_STEP_BASH[@]}" "${workspace}/run_step.sh" > "${workspace}/run.out" 2>&1 && status=0 || status=$?
     elapsed=$(( $(date +%s) - start ))
-    env "${base[@]}" "${published[@]}" "$@" bash "${workspace}/package_step.sh" \
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/package_step.sh" \
         > "${workspace}/package.out" 2>&1 && package=0 || package=$?
     printf 'status=%s elapsed=%s package=%s\n' "$status" "$elapsed" "$package"
 }
@@ -4764,7 +4768,7 @@ ab_metric_package() {
     shift
     mapfile -t base < <(ab_metric_base "$workspace")
     mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
-    env "${base[@]}" "${published[@]}" "$@" bash "${workspace}/package_step.sh" \
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/package_step.sh" \
         > "${workspace}/package.out" 2>&1 && status=0 || status=$?
     printf '%s\n' "$status"
 }
@@ -4776,7 +4780,7 @@ ab_metric_cleanup() {
     shift
     mapfile -t base < <(ab_metric_base "$workspace")
     mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
-    env "${base[@]}" "${published[@]}" "$@" bash "${workspace}/cleanup_step.sh" \
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/cleanup_step.sh" \
         > "${workspace}/cleanup.out" 2>&1 && status=0 || status=$?
     printf '%s\n' "$status"
 }
@@ -4866,6 +4870,8 @@ s56_metric_workflow_interface() {
         "S56: workflow_dispatch with the required expected_main_sha input is the only trigger"
     assert_contains "$workflow" $'permissions:\n  contents: read' "S56: the token can only read contents"
     assert_contains "$workflow" "runs-on: ubuntu-24.04" "S56: the job runs on ubuntu-24.04"
+    assert_contains "$workflow" $'    defaults:\n      run:\n        shell: bash\n' \
+        "S56: each step runs as bash -eo pipefail, as the checks run it"
     assert_contains "$workflow" "EXPECTED_MAIN_SHA: \${{ inputs.expected_main_sha }}" \
         "S56: the input reaches the validation step only as an environment value"
     assert_not_contains "$workflow" "continue-on-error" "S56: no step continues after an error"
@@ -4910,7 +4916,7 @@ s56_metric_workflow_interface() {
     done
     (( total + 1 <= job )) || _fail "S56: the step timeouts must leave a one-minute job margin" "steps: ${total} min"
     env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
-        bash "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
+        "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
     first="$(ab_metric_root "$workspace")"
     window=$(( $(ab_file_value "${workspace}/github_env" METRIC_ACTIVE_DEADLINE) - \
                $(ab_file_value "${workspace}/github_env" METRIC_CLOCK_START) ))
@@ -4924,7 +4930,7 @@ s56_metric_workflow_interface() {
         "S56: the clock step names the installed OpenFOAM root"
     # Each run gets its own unique task directory under RUNNER_TEMP.
     env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
-        bash "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
+        "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
     second="$(ab_metric_root "$workspace")"
     assert_ne "$first" "$second" "S56: each run has a unique task directory"
     for name in "$first" "$second"; do
