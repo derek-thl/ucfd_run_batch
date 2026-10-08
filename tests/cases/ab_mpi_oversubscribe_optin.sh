@@ -5050,6 +5050,8 @@ s58_metric_pass_records_the_complete_evidence() {
     done
     # The exact command vectors, in order, each once.
     calls="$(ab_metric_calls "$workspace" | grep -vE '^(dpkg-query|uname|gcc) ')"
+    # The two sides of `curl ... | sudo bash` start together, in either order.
+    calls="$(head -n 2 <<< "$calls" | LC_ALL=C sort; tail -n +3 <<< "$calls")"
     assert_eq "curl -fsSL https://dl.openfoam.com/add-debian-repo.sh
 sudo bash
 sudo apt-get update
@@ -5289,7 +5291,8 @@ s65_metric_limits_and_process_cleanup() {
     elapsed=$(( $(date +%s) - now ))
     assert_eq "1" "$status" "S65: an incomplete package fails"
     (( elapsed <= 8 )) || _fail "S65: the package stops at its budget" "elapsed: ${elapsed}"
-    assert_eq "FAIL_PACKAGE" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S65: an incomplete package fails closed"
+    assert_eq "FAIL_EVIDENCE_PACKAGE" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S65: an incomplete evidence package fails closed"
     assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_PRIOR_RESULT)" "S65: the prior result stays recorded"
     assert_file_exists "$(ab_metric_root "$workspace")/upload/reason.txt" "S65: the upload keeps the reason"
     assert_file_missing "$(ab_metric_root "$workspace")/upload/m3-metric-validation-evidence.tar.gz" \
