@@ -115,6 +115,17 @@
 # parse the group as the operand. S71 also proves that a group ID below 2 is
 # refused. That part uses a refusing fake sudo, so no kill runs.
 #
+# Checks S72 to S81 cover the M3 mean-speed collection in the evidence
+# workflow (Issue #80, admission 6064804618 of approved proposal 6064220318).
+# They run the extracted capture step with a completed two-cell Case 7 flow
+# result, RAS kEpsilon inputs, a fake OpenFOAM tree, and fake system commands.
+# They prove the volume-weighted mean of the recorded latest time with the two
+# exact vectors and dictionary, NOT_ATTEMPTED after a failed product run, the
+# time, source, snapshot, environment, and output gates, a valid zero value and
+# no scientific range, the time, byte, process-stop, and cleanup limits, the
+# separate product, mesh, convergence, and PointData verdicts, and the
+# unchanged workflow interface.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4699,8 +4710,29 @@ CHECK_LOG
         fi
         printf '    Mesh non-orthogonality Max: 0 average: 0\n    Face pyramids OK.\n\nMesh OK.\n\nEnd\n\n' ;;
     simpleFoam)
+        # FAKE_TERM_CHILD=<file>: leave a child that ignores SIGTERM, write its
+        # PID to the file, and block.
+        if [[ -n "${FAKE_TERM_CHILD:-}" ]]; then
+            ( trap '' TERM; exec sleep 300 ) < /dev/null > /dev/null 2>&1 &
+            printf '%s\n' "$!" > "$FAKE_TERM_CHILD"
+            exec sleep 300
+        fi
         dict="$(after -dict "$@")"
         [[ -f "$dict" ]] || { echo "fake simpleFoam: cannot open ${dict}" >&2; exit 1; }
+        # FAKE_TOUCH_FILE=<file>: change one byte stream during the calculation.
+        if [[ -n "${FAKE_TOUCH_FILE:-}" ]]; then
+            printf '\n' >> "$FAKE_TOUCH_FILE"
+        fi
+        # FAKE_ESCAPE=<file>: a process that leaves the operation group and keeps
+        # its working directory in the Case; its PID goes to the file.
+        if [[ -n "${FAKE_ESCAPE:-}" ]]; then
+            ( cd -- "$case_dir" && exec setsid sleep 60 ) < /dev/null > /dev/null 2>&1 &
+            printf '%s\n' "$!" > "$FAKE_ESCAPE"
+        fi
+        # FAKE_BIG_FILE=<bytes>: a sparse file of that apparent size in the Case.
+        if [[ -n "${FAKE_BIG_FILE:-}" ]]; then
+            truncate -s "$FAKE_BIG_FILE" "${case_dir}/big.bin"
+        fi
         start_from="$(awk '$1 == "startFrom" { sub(/;$/, "", $2); print $2 }' "${case_dir}/system/controlDict")"
         if [[ "$start_from" == latestTime ]]; then
             start="$(latest)"
@@ -4733,6 +4765,7 @@ CHECK_LOG
             none) ;;
             header-only) dat "$output" 0 ;;
             two-rows) dat "$output" 2 ;;
+            two-headers) dat "$output" 1; sed -i -e '1p' "$output" ;;
             second-file) dat "$output" 1; dat "${output%.dat}_${time}.dat" 1 ;;
             other-time) dat "$output" 1; dat "${case_dir}/postProcessing/m3MeanSpeed/1/volFieldValue.dat" 1 ;;
             region-folder) dat "${case_dir}/postProcessing/region1/m3MeanSpeed/${start}/volFieldValue.dat" 1 ;;
@@ -5844,6 +5877,579 @@ sudo -n kill -KILL -- -${group}" "$calls" "S71: the signal comes first, and the 
     assert_eq "2" "$(grep -c 'refused' <<< "$out")" "S71: each refusal is in the log"
 }
 
+# ---- S72 to S81: the M3 mean-speed collection (Issue #80) --------------------
+#
+# The evidence workflow collects the cell-volume-weighted mean speed of Case 7
+# after a successful product run (admission 6064804618, approved proposal
+# 6064220318). These checks run the extracted capture step as GitHub runs it,
+# with a Batch Workspace that holds a completed two-cell Case 7 flow result, a
+# fake OpenFOAM tree, and fake system commands. The two-cell Case comes from
+# the merged metric-validation workflow; the checks add RAS kEpsilon inputs.
+# The fake simpleFoam calculates sum(V_i |U_i|) / sum(V_i) from the copied mesh
+# and U field. A second Case 8 with other speeds must never be used. No check
+# installs OpenFOAM, runs a solver, or dispatches a workflow.
+
+AB_COLLECT_DICTIONARY_SHA="ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef"
+AB_COLLECT_SHA="7c5a0e3e3b1d4c8f9a2b6d0e1f3a5c7e9b1d3f5a"
+
+# ab_collect_ras <flow-case> - RAS kEpsilon inputs: the turbulence dictionary
+# and k, epsilon, and nut at times 1 and 2.
+ab_collect_ras() {
+    local flow="$1" time field
+    cat > "${flow}/constant/turbulenceProperties" <<'COLLECT_RAS'
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      turbulenceProperties;
+}
+
+simulationType      RAS;
+
+RAS
+{
+    RASModel        kEpsilon;
+    turbulence      on;
+    printCoeffs     on;
+}
+COLLECT_RAS
+    for time in 1 2; do
+        for field in k epsilon nut; do
+            {
+                printf 'FoamFile\n{\n    version     2.0;\n    format      ascii;\n'
+                printf '    class       volScalarField;\n    location    "%s";\n    object      %s;\n}\n\n' \
+                    "$time" "$field"
+                printf 'dimensions      [0 2 -2 0 0 0 0];\n\ninternalField   nonuniform List<scalar> 2(0.1 0.2);\n\n'
+                printf 'boundaryField\n{\n    outside\n    {\n        type            zeroGradient;\n    }\n}\n'
+            } > "${flow}/${time}/${field}"
+        done
+    done
+}
+
+# ab_collect_fixture <workspace> - the extracted evidence steps, the fake
+# OpenFOAM tree and system commands, and a Batch Workspace with completed
+# Case 7 and Case 8 flow results: latest time 2, earlier time 1, the flow
+# completion record, and the post-processing time record.
+ab_collect_fixture() {
+    local workspace="$1" batch tree name library task case_id
+    ab_capture_fixture "$workspace"
+    batch="${workspace}/checkout/src/batch_9"
+    tree="${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin"
+    mkdir -p "$tree" "${workspace}/openfoam/openfoam2512/etc" "${workspace}/elsewhere"
+    : > "${workspace}/calls.tsv"
+    ab_metric_write_mesh_awk "${workspace}/mesh_metric.awk"
+    ab_metric_write_fake "${workspace}/metric_fake" "${workspace}/mesh_metric.awk"
+    for name in curl sudo dpkg-query gcc uname; do
+        ln -s "${workspace}/metric_fake" "${workspace}/fakebin/${name}"
+    done
+    for name in foamListTimes checkMesh simpleFoam; do
+        ln -s "${workspace}/metric_fake" "${tree}/${name}"
+    done
+    ln -s "${workspace}/metric_fake" "${workspace}/elsewhere/simpleFoam"
+    cat > "${workspace}/openfoam/openfoam2512/etc/bashrc" <<COLLECT_BASHRC
+if [[ -n "\${FAKE_BASHRC_STATUS:-}" ]]; then return "\${FAKE_BASHRC_STATUS}"; fi
+export WM_PROJECT_VERSION="\${FAKE_WM_VERSION-v2512}"
+export WM_OPTIONS=linux64GccDPInt32Opt
+export WM_COMPILER="\${FAKE_WM_COMPILER-Gcc}"
+export PATH="\${FAKE_EXTRA_PATH:+\${FAKE_EXTRA_PATH}:}${tree}:\${PATH}"
+COLLECT_BASHRC
+    # The two-cell Case and the metric dictionary of the merged validation
+    # workflow.
+    library="$(ab_step_run_body "Run the metric validation" "$METRIC_WORKFLOW" |
+        awk '/<<.METRIC_VALIDATION.$/ { inside = 1; next } /^METRIC_VALIDATION$/ { inside = 0 } inside' |
+        awk '/^case "\$\{1:-\}" in$/ { stop = 1 } !stop { print }')"
+    task="${workspace}/fixture/m3-mean-speed-validation"
+    mkdir -p "$task"
+    env METRIC_TASK_ROOT="${workspace}/fixture" METRIC_TASK_TEMP="$task" bash -c "${library}
+        write_fixture" || _fail "the validation fixture writer must succeed"
+    cp -- "${task}/config/metric-functions" "${workspace}/validation-metric-functions"
+    for case_id in case_7 case_8; do
+        mkdir -p "${batch}/${case_id}/vtk"
+        cp -R -- "${task}/case" "${batch}/${case_id}/flow"
+        ab_collect_ras "${batch}/${case_id}/flow"
+        : > "${batch}/${case_id}/flow/flow.marker"
+        : > "${batch}/${case_id}/flow/case.foam"
+        printf '2\n' > "${batch}/${case_id}/vtk/flow_latest_time.txt"
+        : > "${batch}/${case_id}/vtk/post_processing.complete"
+    done
+    # Case 8 has other speeds, so a wrong Case gives another value.
+    sed -i -e 's/(3 4 0)/(30 40 0)/' "${batch}/case_8/flow/2/U"
+}
+
+# ab_collect_flow <workspace> - the Case 7 flow result directory.
+ab_collect_flow() {
+    printf '%s\n' "${1}/checkout/src/batch_9/case_7/flow"
+}
+
+# ab_collect_run <workspace> [NAME=value ...] - run the extracted capture step
+# as GitHub runs it, after a successful product run, with the fake OpenFOAM
+# tree and a far deadline. The arguments override the environment. Prints
+# status= and elapsed= lines.
+ab_collect_run() {
+    local workspace="$1" start status
+    shift
+    start="$(date +%s)"
+    env PATH="${workspace}/fakebin:${PATH}" \
+        TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" \
+        EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_ENV="${workspace}/github_env" \
+        GITHUB_WORKSPACE="${workspace}/checkout" \
+        GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 \
+        LIB="${workspace}/runner_temp/evidence_lib.sh" \
+        CAPTURE_DEADLINE="$(( start + 100000 ))" \
+        EVIDENCE_CLOCK_START="$(( start - 1000 ))" \
+        CAPTURE_START_GUARD_SECONDS=60 \
+        CHECKOUT_RESULT=SUCCEEDED BASELINE_RESULT=SUCCEEDED INSTALL_RESULT=SUCCEEDED \
+        PREPARE_RESULT=SUCCEEDED ORCHESTRATOR_STARTED=true OVERALL_RESULT=SUCCEEDED \
+        OPENFOAM_BASELINE=v2512 OPENFOAM_PACKAGE=openfoam2512-default OPENFOAM_VERSION=v2512 \
+        OPENFOAM_BASHRC="${workspace}/openfoam/openfoam2512/etc/bashrc" \
+        METRIC_FAKE_CALLS="${workspace}/calls.tsv" \
+        METRIC_FAKE_PIDS="${workspace}/fake_pids" \
+        "$@" "${AB_STEP_BASH[@]}" "${workspace}/capture_step.sh" > "${workspace}/capture_step.out" 2>&1 \
+        && status=0 || status=$?
+    printf 'status=%s\nelapsed=%s\n' "$status" "$(( $(date +%s) - start ))"
+}
+
+# ab_collect_value <workspace> <key> - one value of the metric result file.
+ab_collect_value() {
+    ab_file_value "${1}/runner_temp/evidence/m3-mean-speed/result.env" "$2"
+}
+
+# ab_collect_tasks <workspace> - the metric task directories under RUNNER_TEMP.
+ab_collect_tasks() {
+    find "${1}/runner_temp" -mindepth 1 -maxdepth 1 -name 'm3-metric-collection.*' -print | LC_ALL=C sort
+}
+
+# ab_collect_summary <workspace> - run the extracted summary step with the
+# values that the capture step published. Prints the job summary.
+ab_collect_summary() {
+    local workspace="$1"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" \
+        CAPTURE_RESULT="$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        CAPTURE_REASON="$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        VTU_REQUIRED_FIELDS_VERDICT="$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        MESH_QUALITY_VERDICT="$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        CONVERGENCE_VERDICT="$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        MEAN_SPEED_VERDICT="$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" \
+        MEAN_SPEED_REASON_CODE="$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" \
+        MEAN_SPEED_REASON="$(ab_env_last "$workspace" MEAN_SPEED_REASON)" \
+        MEAN_SPEED_VALUE="$(ab_env_last "$workspace" MEAN_SPEED_VALUE)" \
+        OVERALL_RESULT=SUCCEEDED \
+        "${AB_STEP_BASH[@]}" "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
+        _fail "the extracted summary step must succeed"
+    cat "${workspace}/step_summary"
+}
+
+# ab_collect_expect <label> <reason-code> <setup|-> [NAME=value ...] - one run
+# in a new workspace. <setup> is a function that changes the fixture first. The
+# metric must be UNAVAILABLE with the reason code, no accepted value, a capture
+# step that ends with status 0, and a published verdict. A failed attempt must
+# give a capture note and an incomplete capture. NOT_ATTEMPTED gives neither.
+# The task directory must be gone. Sets AB_COLLECT_LAST to the workspace.
+ab_collect_expect() {
+    local label="$1" code="$2" setup="$3" workspace run argument arguments=()
+    shift 3
+    workspace="$(new_workspace "${label//[^A-Za-z0-9_.-]/_}")"
+    ab_collect_fixture "$workspace"
+    if [[ "$setup" != - ]]; then
+        "$setup" "$workspace"
+    fi
+    for argument in "$@"; do
+        arguments+=("${argument//@WORKSPACE@/${workspace}}")
+    done
+    run="$(ab_collect_run "$workspace" "${arguments[@]}")"
+    [[ "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" == "$code" ]] ||
+        _fail "${label}: the metric reason code must be ${code}" \
+              "actual: $(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+              "reason: $(ab_collect_value "$workspace" MEAN_SPEED_REASON)" \
+              "$(tail -n 8 "${workspace}/capture_step.out" 2>/dev/null)"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "${label}: the metric is UNAVAILABLE"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "${label}: no value is accepted"
+    assert_contains "$run" "status=0" "${label}: the capture step ends with status 0"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "${label}: GITHUB_ENV has the verdict"
+    assert_eq "$code" "$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" "${label}: GITHUB_ENV has the reason code"
+    if [[ "$code" == NOT_ATTEMPTED ]]; then
+        assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "${label}: no attempt gives no capture note"
+    else
+        assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+            "${label}: a failed attempt gives an incomplete capture"
+        assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" \
+            "M3 mean speed: ${code}" "${label}: the capture note names the reason"
+    fi
+    assert_eq "" "$(ab_collect_tasks "$workspace")" "${label}: no task directory remains"
+    AB_COLLECT_LAST="$workspace"
+}
+
+# ab_collect_no_openfoam <workspace> <label> - no metric OpenFOAM command ran.
+ab_collect_no_openfoam() {
+    assert_eq "0" "$(awk -F '\t' '$1 == "foamListTimes" || $1 == "simpleFoam" || $1 == "checkMesh"' \
+        "${1}/calls.tsv" | wc -l)" "${2}: no OpenFOAM command runs"
+}
+
+# ab_collect_no_calculation <workspace> <label> - no simpleFoam command ran.
+ab_collect_no_calculation() {
+    assert_eq "0" "$(awk -F '\t' '$1 == "simpleFoam"' "${1}/calls.tsv" | wc -l)" "${2}: no metric calculation runs"
+}
+
+# ab_collect_tree_sha <directory> - one checksum line for each file, sorted.
+ab_collect_tree_sha() {
+    (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
+}
+
+# ab_collect_block <workspace> - the metric functions of the capture work
+# script, between their begin and end markers.
+ab_collect_block() {
+    awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 } inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }' \
+        "${1}/capture_step.sh"
+}
+
+s72_collect_volume_weighted_mean_of_the_latest_time() {
+    local workspace run flow evidence before after calls task line summary file
+    workspace="$(new_workspace s72_collect)"
+    ab_collect_fixture "$workspace"
+    flow="$(ab_collect_flow "$workspace")"
+    evidence="${workspace}/runner_temp/evidence/m3-mean-speed"
+    before="$(ab_collect_tree_sha "$flow")"
+    run="$(ab_collect_run "$workspace")"
+    after="$(ab_collect_tree_sha "$flow")"
+    assert_contains "$run" "status=0" "S72: the capture step ends with status 0"
+    [[ "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" == AVAILABLE ]] ||
+        _fail "S72: the metric must be AVAILABLE" \
+              "code: $(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+              "reason: $(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "$(tail -n 8 "${workspace}/capture_step.out")"
+    assert_eq "NONE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S72: no failure reason"
+    # sum(V_i |U_i|) / sum(V_i) = (1 * 5 + 2 * 3) / 3 = 11/3 m/s at the latest time.
+    assert_eq "3.66666666666666652e+00" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" \
+        "S72: the volume-weighted mean speed of the latest time"
+    awk -v v="$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" 'BEGIN { d = v - 11 / 3; if (d < 0) d = -d; exit !(d <= 1e-6) }' ||
+        _fail "S72: the value must be 11/3 m/s within 1e-6 m/s"
+    assert_eq "m/s" "$(ab_collect_value "$workspace" MEAN_SPEED_UNIT)" "S72: the unit"
+    for line in "SELECTED_TIME=2" "POST_PROCESSING_TIME=2" "OUTPUT_TIME=2" "OUTPUT_CELLS=2" \
+                "OUTPUT_VOLUME=3.00000000000000000e+00" "OUTPUT_REGION=all region0" "OUTPUT_FIELD=volAverage(m3MagU)" \
+                "OUTPUT_PATH=postProcessing/m3MeanSpeed/2/volFieldValue.dat" "DICTIONARY_BYTES=636" \
+                "DICTIONARY_SHA256=${AB_COLLECT_DICTIONARY_SHA}" "INPUTS_UNCHANGED=YES" "INPUT_FILES=15" \
+                "CLEANUP_RESULT=REMOVED" "SOURCE_FLOW_CASE=src/batch_9/case_7/flow" "MAIN_SHA=${AB_COLLECT_SHA}" \
+                "RUN_ID=4545"; do
+        assert_eq "${line#*=}" "$(ab_collect_value "$workspace" "${line%%=*}")" "S72: the result records ${line%%=*}"
+    done
+    # The exact two vectors, each once, on Case 7 only.
+    calls="$(ab_metric_calls "$workspace" | grep -E '^(foamListTimes|simpleFoam|checkMesh|curl|sudo) ' || true)"
+    task="$(sed -n -e 's|^simpleFoam -case \(.*\)/case -postProcess .*|\1|p' <<< "$calls")"
+    [[ "$task" =~ ^${workspace}/runner_temp/m3-metric-collection\.[A-Za-z0-9]{8}$ ]] ||
+        _fail "S72: the calculation runs in one unique task directory under RUNNER_TEMP" "$calls"
+    assert_eq "foamListTimes -case ${flow} -latestTime
+simpleFoam -case ${task}/case -postProcess -time 2 -fields (U) -dict ${task}/config/metric-functions" \
+        "$calls" "S72: the exact selection and calculation vectors, each once"
+    assert_not_contains "$(cat "${workspace}/calls.tsv")" "case_8" "S72: Case 8 is never used"
+    # The isolated snapshot and the unchanged source Case.
+    assert_eq "$before" "$after" "S72: the command does not change the source Case"
+    assert_file_missing "${flow}/postProcessing" "S72: no output reaches the source Case"
+    assert_eq "" "$(ab_collect_tasks "$workspace")" "S72: the cleanup removes the task directory"
+    cmp -s "${workspace}/validation-metric-functions" "${evidence}/metric-functions" ||
+        _fail "S72: the dictionary bytes are the bytes of the merged validation workflow"
+    assert_eq "$AB_COLLECT_DICTIONARY_SHA" "$(ab_sha "${evidence}/metric-functions")" "S72: the dictionary hash"
+    cmp -s "${evidence}/source-before.tsv" "${evidence}/snapshot-before.tsv" ||
+        _fail "S72: the snapshot bytes equal the source bytes"
+    cmp -s "${evidence}/source-before.tsv" "${evidence}/source-after.tsv" ||
+        _fail "S72: the source bytes stay the same after the calculation"
+    cmp -s "${evidence}/snapshot-before.tsv" "${evidence}/snapshot-after.tsv" ||
+        _fail "S72: the snapshot bytes stay the same after the calculation"
+    for file in constant/polyMesh/points constant/polyMesh/faces constant/polyMesh/owner constant/polyMesh/neighbour \
+                constant/polyMesh/boundary constant/transportProperties constant/turbulenceProperties \
+                system/controlDict system/fvSchemes system/fvSolution 2/U 2/p 2/k 2/epsilon 2/nut; do
+        assert_contains "$(cat "${evidence}/source-before.tsv")" "${file}"$'\t'"$(stat -c %s -- "${flow}/${file}")"$'\t'"$(ab_sha "${flow}/${file}")" \
+            "S72: the source manifest records ${file}"
+    done
+    assert_not_contains "$(cat "${evidence}/source-before.tsv")" "1/U" "S72: the earlier time is not copied"
+    assert_eq "$(ab_collect_value "$workspace" OUTPUT_SHA256)" "$(ab_sha "${evidence}/output/volFieldValue.dat")" \
+        "S72: the output copy has the recorded checksum"
+    assert_contains "$(cat "${evidence}/identity.txt")" "WM_PROJECT_VERSION=v2512" "S72: the identity records the version"
+    assert_contains "$(cat "${evidence}/identity.txt")" \
+        "PATH_simpleFoam=${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin/simpleFoam" \
+        "S72: the identity records the command path"
+    assert_contains "$(cat "${evidence}/commands.tsv")" $'\tCOMPLETED\t' "S72: the command record has outcomes"
+    assert_eq "" "$(cd "$evidence" && find . -type f \( -name U -o -name p -o -name k -o -name epsilon -o -name nut \
+        -o -name points -o -name faces -o -name owner -o -name neighbour -o -name boundary -o -name '*.vtu' \) -print)" \
+        "S72: the evidence holds no mesh, field, or VTU file"
+    while IFS=$'\t' read -r line file; do
+        [[ "$line" == FILE ]] || continue
+        assert_file_exists "${evidence}/${file}" "S72: the inventory lists an existing file ${file}"
+    done < <(awk -F '\t' '{ print $1 "\t" $4 }' "${evidence}/inventory.txt")
+    assert_eq "$(( $(cd "$evidence" && find . -type f | wc -l) - 2 ))" "$(awk -F '\t' '$1 == "FILE"' "${evidence}/inventory.txt" | wc -l)" \
+        "S72: the inventory lists every evidence file except itself and the result"
+    # The capture and the summary.
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S72: the capture is complete"
+    assert_eq "AVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "S72: GITHUB_ENV has the verdict"
+    summary="$(ab_collect_summary "$workspace")"
+    assert_contains "$summary" "| Mean speed | \`AVAILABLE\` |" "S72: the summary shows the verdict"
+    assert_contains "$summary" "| Mean speed (m/s) | 3.66666666666666652e+00 |" "S72: the summary shows the value"
+}
+
+s73_collect_needs_a_successful_product_run() {
+    local label
+    for label in "OVERALL_RESULT=FAILED_EXIT_1" "OVERALL_RESULT=BUDGET_EXCEEDED" "PREPARE_RESULT=INFRASTRUCTURE_FAILURE"; do
+        ab_collect_expect "S73 ${label}" NOT_ATTEMPTED - "$label"
+        ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 ${label}"
+        assert_eq "0" "$(awk -F '\t' '$1 == "dpkg-query"' "${AB_COLLECT_LAST}/calls.tsv" | wc -l)" \
+            "S73 ${label}: no identity command runs"
+    done
+    ab_collect_expect "S73 no flow record" SOURCE_MISMATCH ab_collect_no_marker
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 no flow record"
+    ab_collect_expect "S73 no post-processing record" SOURCE_MISMATCH ab_collect_no_post
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 no post-processing record"
+}
+ab_collect_no_marker() { rm -f -- "$(ab_collect_flow "$1")/flow.marker"; }
+ab_collect_no_post() { rm -f -- "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"; }
+
+s74_collect_selects_only_the_recorded_latest_time() {
+    local label
+    for label in "FAKE_LIST_TIMES=" "FAKE_LIST_TIMES=0\n" "FAKE_LIST_TIMES=1\n2\n" "FAKE_LIST_TIMES=1\n" \
+                 "FAKE_LIST_TIMES=two\n"; do
+        ab_collect_expect "S74 ${label}" SOURCE_MISMATCH - "$label"
+        ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 ${label}"
+    done
+    ab_collect_expect "S74 earlier record" SOURCE_MISMATCH ab_collect_record_earlier
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 earlier record"
+    ab_collect_expect "S74 two-line record" SOURCE_MISMATCH ab_collect_record_two_lines
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 two-line record"
+    ab_collect_expect "S74 selection failure" COMMAND_FAILURE - FAKE_FAIL=foamListTimes
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 selection failure"
+}
+ab_collect_record_earlier() { printf '1\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_two_lines() { printf '2\n2\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+
+s75_collect_isolates_exact_input_bytes() {
+    local setup
+    for setup in ab_collect_no_epsilon ab_collect_komega ab_collect_start_time ab_collect_link_field \
+                 ab_collect_hard_link ab_collect_mesh_override ab_collect_unsafe_name; do
+        ab_collect_expect "S75 ${setup#ab_collect_}" SOURCE_MISMATCH "$setup"
+        ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 ${setup#ab_collect_}"
+    done
+    ab_collect_expect "S75 copy failure" COMMAND_FAILURE ab_collect_fail_copy
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 copy failure"
+    ab_collect_expect "S75 changed source" INPUT_CHANGED - \
+        "FAKE_TOUCH_FILE=@WORKSPACE@/checkout/src/batch_9/case_7/flow/2/U"
+    ab_collect_expect "S75 changed snapshot" INPUT_CHANGED - FAKE_TAMPER=simpleFoam:edit-U
+}
+ab_collect_no_epsilon() { rm -f -- "$(ab_collect_flow "$1")/2/epsilon"; }
+ab_collect_komega() { sed -i -e 's/kEpsilon/kOmega/' "$(ab_collect_flow "$1")/constant/turbulenceProperties"; }
+ab_collect_start_time() {
+    sed -i -e 's/^startFrom .*/startFrom         startTime;/' "$(ab_collect_flow "$1")/system/controlDict"
+}
+ab_collect_link_field() {
+    local flow
+    flow="$(ab_collect_flow "$1")"
+    mv -- "${flow}/2/nut" "${flow}/2/nut.real"
+    ln -s nut.real "${flow}/2/nut"
+}
+ab_collect_hard_link() { ln -- "$(ab_collect_flow "$1")/constant/polyMesh/points" "${1}/points.link"; }
+ab_collect_mesh_override() { mkdir -p "$(ab_collect_flow "$1")/2/polyMesh"; }
+ab_collect_unsafe_name() { printf 'x\n' > "$(ab_collect_flow "$1")/2/bad name"; }
+ab_collect_fail_copy() { ab_fake_fail "$1" cp '--parents'; }
+
+s76_collect_output_fails_closed() {
+    local entry
+    ab_collect_expect "S76 command failure" COMMAND_FAILURE - FAKE_FAIL=simpleFoam
+    while IFS='|' read -r entry code; do
+        ab_collect_expect "S76 ${entry}" "$code" - "$entry"
+    done <<'COLLECT_CASES'
+FAKE_OUTPUT=none|MISSING_OUTPUT
+FAKE_OUTPUT=region-folder|MISSING_OUTPUT
+FAKE_OUTPUT=second-file|DUPLICATE_OUTPUT
+FAKE_OUTPUT=other-time|DUPLICATE_OUTPUT
+FAKE_OUTPUT=two-rows|DUPLICATE_OUTPUT
+FAKE_OUTPUT=two-headers|DUPLICATE_OUTPUT
+FAKE_REGION=all region1|PARSE_FAILURE
+FAKE_COLUMN=volAverage(U)|PARSE_FAILURE
+FAKE_ROW_TIME=1|PARSE_FAILURE
+FAKE_DAT_CELLS=|PARSE_FAILURE
+FAKE_VALUE=abc|PARSE_FAILURE
+FAKE_DAT_VOLUME=0|INVALID_VOLUME
+FAKE_DAT_VOLUME=-3|INVALID_VOLUME
+FAKE_VALUE=nan|NON_FINITE_VALUE
+FAKE_VALUE=inf|NON_FINITE_VALUE
+FAKE_VALUE=-1.5e+00|NEGATIVE_VALUE
+COLLECT_CASES
+}
+
+s77_collect_accepts_zero_and_has_no_range() {
+    local value workspace
+    for value in 0 1.234e+03; do
+        workspace="$(new_workspace "s77_value_${value}")"
+        ab_collect_fixture "$workspace"
+        ab_collect_run "$workspace" FAKE_VALUE="$value" > /dev/null
+        assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" \
+            "S77: the value ${value} is AVAILABLE"
+        assert_eq "$value" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S77: the value ${value} stays as written"
+    done
+}
+
+s78_collect_requires_the_proven_environment() {
+    local label
+    for label in "FAKE_PACKAGE_VERSION=2512.0-1" "FAKE_ARCH=aarch64" "FAKE_WM_VERSION=v2506" \
+                 "FAKE_WM_COMPILER=Clang" "FAKE_BASHRC_STATUS=1" "FAKE_EXTRA_PATH=@WORKSPACE@/elsewhere" \
+                 "OPENFOAM_BASELINE=v2506"; do
+        ab_collect_expect "S78 ${label}" ENVIRONMENT_MISMATCH - "$label"
+        ab_collect_no_openfoam "$AB_COLLECT_LAST" "S78 ${label}"
+        assert_eq "0" "$(awk -F '\t' '$1 == "curl" || $1 == "sudo"' "${AB_COLLECT_LAST}/calls.tsv" | wc -l)" \
+            "S78 ${label}: no package is installed"
+    done
+}
+
+s79_collect_limits_stops_and_cleanup() {
+    local workspace run elapsed child pid library out group start
+    # A blocked calculation with a child that ignores SIGTERM stops in the
+    # metric window, and the capture, summary, and upload stay eligible.
+    workspace="$(new_workspace s79_timeout)"
+    ab_collect_fixture "$workspace"
+    run="$(ab_collect_run "$workspace" FAKE_TERM_CHILD="${workspace}/term_child" \
+        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 40 ))")"
+    elapsed="$(sed -n -e 's/^elapsed=//p' <<< "$run")"
+    child="$(cat "${workspace}/term_child" 2>/dev/null || true)"
+    if [[ "$child" =~ ^[0-9]+$ ]] && kill -0 "$child" 2>/dev/null; then
+        kill -KILL "$child" 2>/dev/null || true
+        _fail "S79: the TERM-ignoring child must stop in the metric window"
+    fi
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S79: the blocked calculation must start" "$(tail -n 8 "${workspace}/capture_step.out")"
+    assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S79: a blocked calculation is TIMEOUT"
+    assert_eq "REMOVED" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S79: the cleanup still removes the task directory"
+    assert_contains "$run" "status=0" "S79: the capture step ends with status 0"
+    (( elapsed <= 40 )) || _fail "S79: the metric work ends before the capture work limit" "elapsed: ${elapsed}"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S79: the capture is incomplete"
+    assert_contains "$(ab_collect_summary "$workspace")" "| Mean speed | \`UNAVAILABLE\` |" "S79: the summary still runs"
+    # No time for the metric work: nothing starts.
+    ab_collect_expect "S79 no budget" TIMEOUT - "CAPTURE_DEADLINE=$(( $(date +%s) + 180 + 25 ))"
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S79 no budget"
+    # The input, log, and task-directory byte limits.
+    ab_collect_expect "S79 file count" RESOURCE_LIMIT ab_collect_many_files
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S79 file count"
+    ab_collect_expect "S79 input bytes" RESOURCE_LIMIT ab_collect_big_input
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S79 input bytes"
+    ab_collect_expect "S79 log bytes" RESOURCE_LIMIT - FAKE_STDOUT_BYTES=1048577
+    assert_contains "$(cat "${AB_COLLECT_LAST}/runner_temp/evidence/m3-mean-speed/excluded.tsv")" $'\t1048577\t' \
+        "S79: the excluded log keeps its size"
+    ab_collect_expect "S79 task bytes" RESOURCE_LIMIT - FAKE_BIG_FILE=4294967297
+    # A process that leaves the group and keeps its working directory in the
+    # task directory stops the removal.
+    workspace="$(new_workspace s79_user)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_ESCAPE="${workspace}/escape" > /dev/null
+    pid="$(cat "${workspace}/escape" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill -KILL "$pid" 2>/dev/null || true; fi
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S79: a process in the task directory stops the removal"
+    assert_eq "REFUSED_PROCESS_ACTIVE" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S79: the cleanup refusal is explicit"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S79: the task directory stays while a process uses it"
+    # A failed removal.
+    ab_collect_failed_removal
+    # A process group that the stop cannot empty: kill -0 fails with EPERM, and
+    # the stop says NOT_STOPPED by its deadline. NOT_STOPPED is a process-stop
+    # failure.
+    group="$(ab_metric_foreign_group)"
+    [[ -n "$group" ]] || _fail "S79: the test host must have a process group that the test user may not signal"
+    workspace="$(new_workspace s79_stop)"
+    ab_collect_fixture "$workspace"
+    library="$(ab_collect_block "$workspace")"
+    [[ -n "$library" ]] || _fail "S79: the metric functions must be extracted"
+    start="$(date +%s%3N)"
+    out="$(env PATH="${workspace}/fakebin:${PATH}" bash -c "set -euo pipefail
+        ${library}
+        metric_stop_group ${group} probe \$(( \$(date +%s%3N) + 2000 )) && echo stop-status=0 || echo stop-status=\$?
+        echo stop=\${M_STOP}
+        M_CODE='' M_REASON='' M_OUTCOME=NOT_STOPPED M_GROUP=${group} M_STATUS=0 M_LIMIT=2000
+        metric_require metric COMMAND_FAILURE && echo require-status=0 || echo require-status=\$?
+        echo code=\${M_CODE}" 2>&1 || true)"
+    assert_contains "$out" "stop-status=1" "S79: the stop does not take a group of another user as empty"
+    assert_contains "$out" "stop=NOT_STOPPED" "S79: the stop records NOT_STOPPED"
+    (( $(date +%s%3N) - start <= 3500 )) || _fail "S79: the stop ends by its deadline"
+    assert_contains "$out" "require-status=1" "S79: NOT_STOPPED stops the metric work"
+    assert_contains "$out" "code=PROCESS_STOP_FAILURE" "S79: NOT_STOPPED is a process-stop failure"
+}
+ab_collect_many_files() {
+    local flow index
+    flow="$(ab_collect_flow "$1")"
+    for (( index = 0; index < 245; index++ )); do : > "${flow}/2/extra${index}"; done
+}
+ab_collect_big_input() { truncate -s 2147483649 "$(ab_collect_flow "$1")/2/big"; }
+ab_collect_failed_removal() {
+    local workspace
+    workspace="$(new_workspace s79_remove)"
+    ab_collect_fixture "$workspace"
+    ab_fake_fail "$workspace" rm '*m3-metric-collection.*'
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S79: a failed removal is a cleanup failure"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S79: no value after a failed removal"
+    assert_contains "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "FAILED" "S79: the cleanup result shows the failure"
+}
+
+s80_collect_keeps_the_other_verdicts_separate() {
+    local workspace batch summary
+    workspace="$(new_workspace s80_separate)"
+    ab_collect_fixture "$workspace"
+    batch="${workspace}/checkout/src/batch_9"
+    ab_checkmesh_log "${batch}/case_7/flow/log.checkMesh" failed
+    printf '<VTKFile><Piece><PointData><DataArray Name="U"/></PointData></Piece></VTKFile>\n' \
+        > "${batch}/case_7/vtk/flow_latest_100.vtu"
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S80: the metric is AVAILABLE"
+    assert_eq "MESH_QUALITY_REVIEW_REQUIRED" "$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        "S80: failed mesh checks stay blocking for mesh acceptance"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S80: missing required PointData stays incomplete"
+    assert_ne "CONVERGED" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" "S80: the metric gives no convergence"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/phase-results.txt")" "OVERALL_RESULT=SUCCEEDED" \
+        "S80: the product result stays"
+    assert_not_contains "$(cat "${workspace}/runner_temp/evidence/mesh-quality.txt")" "MEAN_SPEED" \
+        "S80: the mesh evidence holds no metric value"
+    summary="$(ab_collect_summary "$workspace")"
+    assert_contains "$summary" "| Mesh quality | \`MESH_QUALITY_REVIEW_REQUIRED\` |" "S80: the mesh row stays separate"
+    assert_contains "$summary" "| VTU required fields | \`INCOMPLETE\` |" "S80: the PointData row stays separate"
+    assert_contains "$summary" "| Mean speed | \`AVAILABLE\` |" "S80: the metric row is separate"
+}
+
+s81_collect_keeps_the_workflow_interface() {
+    local workspace body name constant
+    workspace="$(new_workspace s81_interface)"
+    ab_collect_fixture "$workspace"
+    body="$(cat "${workspace}/capture_step.sh")"
+    assert_eq $'on:\n  workflow_dispatch:' \
+        "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$WORKFLOW")" \
+        "S81: workflow_dispatch without inputs is the only trigger"
+    assert_contains "$(cat "$WORKFLOW")" $'permissions:\n  contents: read' "S81: the token can only read contents"
+    assert_contains "$(cat "$WORKFLOW")" $'  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120' \
+        "S81: the job, runner, and 120-minute setting stay"
+    assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
+        "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S81: the step list stays"
+    assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
+        "S81: the Orchestrator vector stays"
+    assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
+        "S81: the capture step guard stays 10 minutes"
+    for constant in 'work_cap_seconds=480' 'deadline_reserve_seconds=180'; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$body")" "S81: the capture keeps ${constant}"
+    done
+    assert_eq "1" "$(grep -cF -- 'foamListTimes -case "$SOURCE_FLOW_CASE" -latestTime' <<< "$body")" \
+        "S81: the exact selection vector appears once"
+    assert_eq "1" "$(grep -cF -- "simpleFoam -case \"\$CASE_DIR\" -postProcess -time \"\$SELECTED_TIME\" -fields '(U)' -dict \"\$TASK_TEMP/config/metric-functions\"" <<< "$body")" \
+        "S81: the exact calculation vector appears once"
+    assert_eq "2" "$(grep -cE '^[[:space:]]*metric_foam_op [A-Za-z-]+ [A-Z]+ ' <<< "$body")" \
+        "S81: the metric work runs only the two OpenFOAM vectors"
+    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=90000' \
+                    'METRIC_CLEANUP_MS=20000' 'METRIC_KILL_GRACE_MS=5000' 'METRIC_STOP_RESERVE_MS=1000' \
+                    'METRIC_MAX_FILES=256' 'METRIC_MAX_INPUT_BYTES=2147483648' 'METRIC_MAX_TASK_BYTES=4294967296' \
+                    'METRIC_LOG_LIMIT=1048576' 'METRIC_LOGS_LIMIT=8388608' 'METRIC_EVIDENCE_LIMIT=10485760' \
+                    "METRIC_DICTIONARY_SHA256=${AB_COLLECT_DICTIONARY_SHA}"; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$body")" "S81: the metric work sets ${constant}"
+    done
+    for name in "name: openfoam-v2512-evidence" "path: \${{ runner.temp }}/evidence" "include-hidden-files: true" \
+                "retention-days: 90"; do
+        assert_contains "$(cat "$WORKFLOW")" "$name" "S81: the upload keeps ${name}"
+    done
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -5933,6 +6539,16 @@ AB_OBSERVATIONS=(
     s69_metric_process_checks_do_not_depend_on_permission
     s70_metric_stop_ends_by_the_operation_deadline
     s71_metric_root_signal_vector_takes_a_small_group_id
+    s72_collect_volume_weighted_mean_of_the_latest_time
+    s73_collect_needs_a_successful_product_run
+    s74_collect_selects_only_the_recorded_latest_time
+    s75_collect_isolates_exact_input_bytes
+    s76_collect_output_fails_closed
+    s77_collect_accepts_zero_and_has_no_range
+    s78_collect_requires_the_proven_environment
+    s79_collect_limits_stops_and_cleanup
+    s80_collect_keeps_the_other_verdicts_separate
+    s81_collect_keeps_the_workflow_interface
 )
 
 # One observation runs in this process when the caller names it. The scenario
