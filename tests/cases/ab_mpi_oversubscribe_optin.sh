@@ -80,6 +80,41 @@
 # completes but leaves a TERM-ignoring child gives that child at most the kill
 # grace, and that the diagnostic then continues.
 #
+# Checks S56 to S67 cover the fixture-only mean-speed validation workflow
+# openfoam-m3-metric-validation.yml (Issue #80, contract 6043302440 with
+# correction 6043318728). They run its extracted steps with fake system
+# commands and a fake OpenFOAM tree. The fake simpleFoam calculates the
+# volume-weighted mean speed from the generated two-cell mesh and U field. The
+# checks prove the interface, the exact command and dictionary, the fixture
+# geometry and the expected 11/3 m/s, the complete PASS evidence, the ref, SHA,
+# package, and environment gates, each fail-closed condition, the command,
+# budget, log, and artifact limits, the process-group cleanup, and that the run
+# writes only inside its unique task directory, which the last step removes.
+#
+# Checks S68 and S69 cover PR #97 review 5453307998: a timed-out install can
+# leave a root process that the runner user may not signal. S68 proves that the
+# install stop signals the install group through sudo -n kill, and that a
+# process that does not stop fails the run in a bounded time and keeps the task
+# directory. S69 uses real processes of another host user. It proves that the
+# stop and the cleanup do not take a group as empty when kill -0 fails with
+# EPERM, that an unreadable /proc entry, a refused sudo, or a slow scan keeps
+# the task directory, and that a complete scan removes it.
+#
+# Check S70 covers PR #97 review 5454383774: each privileged signal helper
+# could start a new limit, so a 12-second operation returned after 22
+# seconds. With a sudo that hangs, S70 proves that the run, the install with
+# its stop, and stop_operation_group alone end by the absolute operation
+# deadline, that the result is FAIL_PROCESS_STOP, and that each slow helper
+# stops.
+#
+# Check S71 covers PR #97 review 5455232932: the procps kill takes the first
+# argument of the form -<number> as the signal, also after --, so
+# "kill -s TERM -- -58" printed its usage and sent nothing. S71 runs the
+# install signal helper with the real external kill on a small group ID that
+# is also a signal number and that no process group uses: each call must
+# parse the group as the operand. S71 also proves that a group ID below 2 is
+# refused. That part uses a refusing fake sudo, so no kill runs.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4377,6 +4412,1438 @@ s55_capture_cleanup_stays_in_the_reserve() {
     assert_contains "$(ab_diag_calls "$workspace")" "reconstructParMesh -time 1" "${label}: the diagnostic continues"
 }
 
+# ---- S56 to S67: the M3 mean-speed fixture validation (Issue #80) ------------
+#
+# The workflow openfoam-m3-metric-validation.yml validates the exact v2512
+# mean-speed command on a synthetic two-cell Case (Architect contract
+# 6043302440, correction 6043318728). These checks run its extracted steps
+# with fake system commands and a fake OpenFOAM tree. The fake simpleFoam
+# calculates sum(V_i |U_i|) / sum(V_i) from the generated fixture mesh and U
+# field, and writes the v2512 volFieldValue file under the Case start time.
+# No check installs OpenFOAM, runs a solver, or dispatches a workflow.
+
+METRIC_WORKFLOW="${REPO_ROOT}/.github/workflows/openfoam-m3-metric-validation.yml"
+
+# The fake workflow commit. The dispatch input must equal it.
+AB_METRIC_SHA="6f198977b700a2bcb664bcc704a3d506eefb67ab"
+
+# GitHub runs each `shell: bash` step as `bash --noprofile --norc -eo pipefail
+# {0}`, so the checks run each extracted step the same way.
+AB_STEP_BASH=(bash --noprofile --norc -eo pipefail)
+
+# The exact command vector of the Architect contract, as the workflow text.
+AB_METRIC_COMMAND="simpleFoam -case \"\$CASE_DIR\" -postProcess -time \"\$SELECTED_TIME\" -fields '(U)' -dict \"\$TASK_TEMP/config/metric-functions\""
+
+# The exact function block of the Architect contract (comment 6043302440).
+AB_METRIC_FUNCTIONS='functions
+{
+    m3MagU
+    {
+        type    mag;
+        libs    (fieldFunctionObjects);
+        field   U;
+        result  m3MagU;
+    }
+
+    m3MeanSpeed
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields           (m3MagU);
+        operation        volAverage;
+        regionType       all;
+        region           region0;
+        writeToFile      true;
+        writeFields      false;
+        writePrecision   17;
+        log              true;
+    }
+}'
+
+# ab_metric_write_mesh_awk <file> - an awk program that reads an ASCII
+# OpenFOAM polyMesh (points, faces, owner, neighbour) and one volVectorField.
+# It prints each cell volume (divergence theorem with the face centres and the
+# area vectors of planar quadrilateral faces) and speed, the number of
+# boundary faces that point out of their cell, the total volume, and the mean
+# speed sum(V_i |U_i|) / sum(V_i). Variables: dir (the Case) and field.
+ab_metric_write_mesh_awk() {
+    cat > "$1" <<'MESH_AWK'
+function body(file, out,    line, n, inside) {
+    n = 0; inside = 0
+    while ((getline line < file) > 0) {
+        if (!inside) { if (line ~ /^\($/) inside = 1; continue }
+        if (line ~ /^\)$/) break
+        out[n++] = line
+    }
+    close(file)
+    return n
+}
+BEGIN {
+    np = body(dir "/constant/polyMesh/points", praw)
+    for (i = 0; i < np; i++) {
+        s = praw[i]; gsub(/[()]/, "", s); split(s, c, " ")
+        px[i] = c[1]; py[i] = c[2]; pz[i] = c[3]
+    }
+    nf = body(dir "/constant/polyMesh/faces", fraw)
+    for (f = 0; f < nf; f++) {
+        s = fraw[f]; sub(/^[0-9]+\(/, "", s); sub(/\)$/, "", s)
+        fn[f] = split(s, v, " ")
+        for (k = 1; k <= fn[f]; k++) fv[f, k - 1] = v[k]
+    }
+    no = body(dir "/constant/polyMesh/owner", oraw)
+    nn = body(dir "/constant/polyMesh/neighbour", nraw)
+    cells = 0
+    for (f = 0; f < no; f++) { own[f] = oraw[f] + 0; if (own[f] + 1 > cells) cells = own[f] + 1 }
+    for (f = 0; f < nn; f++) { nei[f] = nraw[f] + 0; if (nei[f] + 1 > cells) cells = nei[f] + 1 }
+    for (f = 0; f < nf; f++) {
+        a = fv[f, 0]; b = fv[f, 1]; q = fv[f, 2]; d = fv[f, 3]
+        d1x = px[q] - px[a]; d1y = py[q] - py[a]; d1z = pz[q] - pz[a]
+        d2x = px[d] - px[b]; d2y = py[d] - py[b]; d2z = pz[d] - pz[b]
+        sx[f] = 0.5 * (d1y * d2z - d1z * d2y)
+        sy[f] = 0.5 * (d1z * d2x - d1x * d2z)
+        sz[f] = 0.5 * (d1x * d2y - d1y * d2x)
+        cx[f] = (px[a] + px[b] + px[q] + px[d]) / 4
+        cy[f] = (py[a] + py[b] + py[q] + py[d]) / 4
+        cz[f] = (pz[a] + pz[b] + pz[q] + pz[d]) / 4
+        flux = (cx[f] * sx[f] + cy[f] * sy[f] + cz[f] * sz[f]) / 3
+        vol[own[f]] += flux
+        mx[own[f]] += cx[f]; my[own[f]] += cy[f]; mz[own[f]] += cz[f]; m[own[f]]++
+        if (f < nn) {
+            vol[nei[f]] -= flux
+            mx[nei[f]] += cx[f]; my[nei[f]] += cy[f]; mz[nei[f]] += cz[f]; m[nei[f]]++
+        }
+    }
+    outward = 0
+    for (f = nn; f < nf; f++) {
+        o = own[f]
+        if ((cx[f] - mx[o] / m[o]) * sx[f] + (cy[f] - my[o] / m[o]) * sy[f] \
+            + (cz[f] - mz[o] / m[o]) * sz[f] > 0) outward++
+    }
+    while ((getline line < field) > 0) {
+        if (line !~ /^internalField[ \t]+nonuniform/) continue
+        sub(/^[^(]*\(/, "", line); sub(/\);[ \t]*$/, "", line); gsub(/[()]/, " ", line)
+        nu = split(line, u, " ")
+    }
+    close(field)
+    total = 0; weighted = 0
+    for (i = 0; i < cells; i++) {
+        speed = sqrt(u[3 * i + 1] ^ 2 + u[3 * i + 2] ^ 2 + u[3 * i + 3] ^ 2)
+        total += vol[i]; weighted += vol[i] * speed
+        printf "cell %d volume %.17g speed %.17g\n", i, vol[i], speed
+    }
+    printf "faces %d internal %d outward %d values %d\n", nf, nn, outward, nu
+    printf "total %.17g mean %.17g\n", total, weighted / total
+}
+MESH_AWK
+}
+
+# ab_metric_write_fake <file> <mesh-awk> - the one fake command of the metric
+# checks. The command name comes from $0. Each call appends one line to
+# METRIC_FAKE_CALLS: name, working directory, and each argument, separated by
+# tabs. The OpenFOAM fakes read the generated fixture: foamListTimes prints
+# its latest time, checkMesh prints its cell count and volumes in the v2512
+# format, and simpleFoam calculates the mean speed and writes the
+# volFieldValue file under the start time of the fixture control dictionary
+# (v2512 Time::setControls and writeFile::newFileAtStartTime). Each FAKE_*
+# value selects one fault.
+ab_metric_write_fake() {
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'MESH_AWK=%q\n' "$2"
+        cat <<'METRIC_FAKE'
+set -u
+name="${0##*/}"
+record="${name}"$'\t'"${PWD}"
+for argument in "$@"; do record+=$'\t'"${argument}"; done
+printf '%s\n' "$record" >> "$METRIC_FAKE_CALLS"
+after() { local want="$1" a previous=""; shift; for a in "$@"; do [[ "$previous" == "$want" ]] && { printf '%s' "$a"; return 0; }; previous="$a"; done; return 1; }
+for entry in ${FAKE_FAIL:-}; do
+    [[ "$entry" == "$name" ]] && { echo "fake ${name}: forced failure" >&2; exit 1; }
+done
+for entry in ${FAKE_BLOCK:-}; do
+    if [[ "$entry" == "$name" ]]; then
+        printf '%s\n' "$$" >> "$METRIC_FAKE_PIDS"
+        exec sleep 300
+    fi
+done
+case "$name" in
+    curl) exit 0 ;;
+    sudo)
+        # The fake install runs nothing, but the process control is real: sudo
+        # -n kill and the sudo -n sh process scan run. FAKE_SUDO=deny refuses
+        # them, as sudo without root access does. FAKE_SUDO=user runs them
+        # without root, so the /proc entries of root processes stay unreadable.
+        # FAKE_SUDO=slow hangs: it ignores SIGTERM, writes its PID, and runs
+        # nothing. By default the scan has the root view: the unreadable
+        # entries drop out, because no root process of the test host uses a
+        # test directory.
+        [[ "${1:-}" == -n ]] && shift
+        case "${1:-}" in
+            kill|sh)
+                case "${FAKE_SUDO:-root}" in
+                    deny) echo "sudo: a password is required" >&2; exit 1 ;;
+                    user) exec "$@" ;;
+                    slow)
+                        printf '%s\n' "$$" >> "$METRIC_FAKE_PIDS"
+                        trap '' TERM
+                        exec sleep 300 ;;
+                esac
+                [[ "$1" == kill ]] && exec "$@"
+                "$@" | grep -v ': Permission denied$'
+                exit "${PIPESTATUS[0]}" ;;
+            apt-get)
+                # FAKE_ROOT_CHILD=<file>: the install leaves a process that
+                # ignores SIGTERM in the operation group, as a root process of
+                # apt-get can, writes its PID to the file, and blocks.
+                if [[ "${2:-}" == install && -n "${FAKE_ROOT_CHILD:-}" ]]; then
+                    ( trap '' TERM; exec sleep 300 ) < /dev/null > /dev/null 2>&1 &
+                    printf '%s\n' "$!" > "$FAKE_ROOT_CHILD"
+                    exec sleep 300
+                fi ;;
+        esac
+        exit 0 ;;
+    dpkg-query)
+        case "${!#}" in
+            openfoam2512-default) printf '%s' "${FAKE_PACKAGE_VERSION-2512.0-2}" ;;
+            openfoam2512) printf '%s' "${FAKE_CORE_VERSION-2512.0-2}" ;;
+            *) exit 1 ;;
+        esac
+        exit 0 ;;
+    gcc) echo 13.3.0; exit 0 ;;
+    uname)
+        [[ "$*" == -m ]] && { echo "${FAKE_ARCH-x86_64}"; exit 0; }
+        PATH=/usr/bin:/bin exec uname "$@" ;;
+    tar) PATH=/usr/bin:/bin exec tar "$@" ;;
+esac
+case_dir="$(after -case "$@")"
+time="$(after -time "$@")"
+latest() {
+    find "$case_dir" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+([.][0-9]+)?' \
+        -printf '%f\n' | sort -g | tail -n 1
+}
+# mesh <time> - "cells min max total mean" of the fixture at one time.
+mesh() {
+    awk -v dir="$case_dir" -v field="${case_dir}/$1/U" -f "$MESH_AWK" | awk '
+        $1 == "cell" { n++; v = $4 + 0; if (n == 1 || v < min) min = v; if (n == 1 || v > max) max = v }
+        $1 == "total" { total = $2; mean = $4 }
+        END { printf "%d %.6g %.6g %s %s\n", n, min, max, total, mean }'
+}
+tamper() {
+    local entry
+    for entry in ${FAKE_TAMPER:-}; do
+        [[ "${entry%%:*}" == "$name" ]] || continue
+        case "${entry#*:}" in
+            remove-U) rm -f -- "${case_dir}/2/U" ;;
+            link-U) mv -- "${case_dir}/2/U" "${case_dir}/2/U.real" && ln -s U.real "${case_dir}/2/U" ;;
+            edit-U) printf '\n' >> "${case_dir}/2/U" ;;
+            edit-earlier-U) printf '\n' >> "${case_dir}/1/U" ;;
+            make-output)
+                mkdir -p "${case_dir}/postProcessing/m3MeanSpeed/2"
+                : > "${case_dir}/postProcessing/m3MeanSpeed/2/volFieldValue.dat" ;;
+        esac
+    done
+}
+case "$name" in
+    foamListTimes)
+        if [[ -n "${FAKE_LIST_TIMES+set}" ]]; then
+            printf '%b' "$FAKE_LIST_TIMES"
+        else
+            latest
+        fi ;;
+    checkMesh)
+        read -r cells min max total mean <<< "$(mesh "$time")"
+        cells="${FAKE_CELLS-$cells}"
+        cat <<CHECK_LOG
+Create time
+
+Create mesh for time = ${time}
+
+Check mesh...
+
+Time = ${time}
+
+Mesh stats
+    points:           12
+    faces:            11
+    internal faces:   1
+    cells:            ${cells}
+    faces per cell:   6
+    boundary patches: 1
+    point zones:      0
+    face zones:       0
+    cell zones:       0
+
+Overall number of cells of each type:
+    hexahedra:     ${cells}
+    polyhedra:     0
+
+Checking topology...
+    Boundary definition OK.
+    Cell to face addressing OK.
+    Point usage OK.
+    Upper triangular ordering OK.
+    Face vertices OK.
+    Number of regions: 1 (OK).
+
+Checking geometry...
+    Overall domain bounding box (0 0 0) (3 1 1)
+    Boundary openness (0 0 0) OK.
+    Max aspect ratio = 2 OK.
+    Minimum face area = 1. Maximum face area = 2.  Face area magnitudes OK.
+CHECK_LOG
+        if [[ -n "${FAKE_NEGATIVE_VOLUME:-}" ]]; then
+            echo " ***Zero or negative cell volume detected.  Minimum negative volume: -1, Number of negative volume cells: 1"
+        elif [[ -z "${FAKE_NO_VOLUME_LINE:-}" ]]; then
+            printf '    Min volume = %s. Max volume = %s.  Total volume = %s.  Cell volumes OK.\n' \
+                "${FAKE_MIN_VOLUME-$min}" "${FAKE_MAX_VOLUME-$max}" "${FAKE_TOTAL_VOLUME-$(printf '%.6g' "$total")}"
+        fi
+        printf '    Mesh non-orthogonality Max: 0 average: 0\n    Face pyramids OK.\n\nMesh OK.\n\nEnd\n\n' ;;
+    simpleFoam)
+        dict="$(after -dict "$@")"
+        [[ -f "$dict" ]] || { echo "fake simpleFoam: cannot open ${dict}" >&2; exit 1; }
+        start_from="$(awk '$1 == "startFrom" { sub(/;$/, "", $2); print $2 }' "${case_dir}/system/controlDict")"
+        if [[ "$start_from" == latestTime ]]; then
+            start="$(latest)"
+        else
+            start="$(awk '$1 == "startTime" { sub(/;$/, "", $2); print $2 }' "${case_dir}/system/controlDict")"
+        fi
+        read -r cells min max total mean <<< "$(mesh "${FAKE_VALUE_TIME:-$time}")"
+        # OpenFOAM writes doubles: awk formats a double, Bash printf a long double.
+        value="${FAKE_VALUE-$(awk -v m="$mean" 'BEGIN { printf "%.17e", m + 0 }')}"
+        # dat <file> <rows> - the v2512 volFieldValue file with writePrecision 17.
+        dat() {
+            local r
+            mkdir -p "${1%/*}"
+            {
+                printf '# %-23s: %s\n' Region "${FAKE_REGION-all region0}"
+                printf '# %-23s: %s\n' Cells "${FAKE_DAT_CELLS-$cells}"
+                printf '# %-23s: %s\n' Volume "${FAKE_DAT_VOLUME-$(awk -v t="$total" 'BEGIN { printf "%.17e", t + 0 }')}"
+                printf '# %-23s\t%s\n' Time "${FAKE_COLUMN-volAverage(m3MagU)}"
+                for (( r = 0; r < $2; r++ )); do
+                    if [[ "${FAKE_OUTPUT:-}" == no-value ]]; then
+                        printf '%-25s\n' "${FAKE_ROW_TIME-$time}"
+                    else
+                        printf '%-25s\t%s\n' "${FAKE_ROW_TIME-$time}" "$value"
+                    fi
+                done
+            } > "$1"
+        }
+        output="${case_dir}/postProcessing/m3MeanSpeed/${start}/volFieldValue.dat"
+        case "${FAKE_OUTPUT:-normal}" in
+            none) ;;
+            header-only) dat "$output" 0 ;;
+            two-rows) dat "$output" 2 ;;
+            second-file) dat "$output" 1; dat "${output%.dat}_${time}.dat" 1 ;;
+            other-time) dat "$output" 1; dat "${case_dir}/postProcessing/m3MeanSpeed/1/volFieldValue.dat" 1 ;;
+            region-folder) dat "${case_dir}/postProcessing/region1/m3MeanSpeed/${start}/volFieldValue.dat" 1 ;;
+            symlink) dat "${output%/*}/real.dat" 1; ln -s real.dat "$output" ;;
+            *) dat "$output" 1 ;;
+        esac
+        if [[ -n "${FAKE_STDOUT_BYTES:-}" ]]; then
+            head -c "$FAKE_STDOUT_BYTES" /dev/zero | tr '\0' 'x'
+        else
+            echo "    volAverage(region0) of m3MagU = ${value}"
+        fi ;;
+esac
+tamper
+exit 0
+METRIC_FAKE
+    } > "$1"
+    chmod +x "$1"
+}
+
+# ab_metric_fixture <workspace> - fake system commands, a fake OpenFOAM tree,
+# and the extracted workflow steps.
+ab_metric_fixture() {
+    local workspace="$1" name step tree
+    tree="${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin"
+    mkdir -p "${workspace}/runner_temp" "${workspace}/tmp" "${workspace}/fakebin" \
+             "${workspace}/openfoam/openfoam2512/etc" "$tree" "${workspace}/elsewhere"
+    : > "${workspace}/github_env"
+    : > "${workspace}/step_summary"
+    : > "${workspace}/calls.tsv"
+    : > "${workspace}/fake_pids"
+    ab_metric_write_mesh_awk "${workspace}/mesh_metric.awk"
+    ab_metric_write_fake "${workspace}/metric_fake" "${workspace}/mesh_metric.awk"
+    for name in curl sudo dpkg-query gcc uname; do
+        ln -s "${workspace}/metric_fake" "${workspace}/fakebin/${name}"
+    done
+    for name in foamListTimes checkMesh simpleFoam; do
+        ln -s "${workspace}/metric_fake" "${tree}/${name}"
+    done
+    ln -s "${workspace}/metric_fake" "${workspace}/elsewhere/simpleFoam"
+    cat > "${workspace}/openfoam/openfoam2512/etc/bashrc" <<METRIC_BASHRC
+if [[ -n "\${FAKE_BASHRC_STATUS:-}" ]]; then return "\${FAKE_BASHRC_STATUS}"; fi
+export WM_PROJECT_VERSION="\${FAKE_WM_VERSION-v2512}"
+export WM_OPTIONS=linux64GccDPInt32Opt
+export WM_COMPILER="\${FAKE_WM_COMPILER-Gcc}"
+export PATH="\${FAKE_EXTRA_PATH:+\${FAKE_EXTRA_PATH}:}${tree}:\${PATH}"
+METRIC_BASHRC
+    ab_step_run_body "Start the validation clock" "$METRIC_WORKFLOW" > "${workspace}/clock_step.sh"
+    ab_step_run_body "Run the metric validation" "$METRIC_WORKFLOW" > "${workspace}/run_step.sh"
+    ab_step_run_body "Package the validation evidence" "$METRIC_WORKFLOW" > "${workspace}/package_step.sh"
+    ab_step_run_body "Remove the task directory" "$METRIC_WORKFLOW" > "${workspace}/cleanup_step.sh"
+    for step in clock run package cleanup; do
+        [[ -s "${workspace}/${step}_step.sh" ]] ||
+            _fail "S56: the ${step} step body must be extracted from the metric workflow"
+        bash -n "${workspace}/${step}_step.sh" || _fail "S56: the extracted ${step} step must parse"
+    done
+}
+
+# ab_metric_base <workspace> - the runner environment of every step.
+ab_metric_base() {
+    printf '%s\n' "PATH=${1}/fakebin:${PATH}" "TMPDIR=${1}/tmp" "RUNNER_TEMP=${1}/runner_temp" \
+        "GITHUB_ENV=${1}/github_env" "GITHUB_STEP_SUMMARY=${1}/step_summary" "GITHUB_SHA=${AB_METRIC_SHA}" \
+        "GITHUB_REF=refs/heads/main" "GITHUB_RUN_ID=4343" "EXPECTED_MAIN_SHA=${AB_METRIC_SHA}" \
+        "METRIC_FAKE_CALLS=${1}/calls.tsv" "METRIC_FAKE_PIDS=${1}/fake_pids"
+}
+
+# ab_metric_run <workspace> [NAME=value ...] - run the extracted clock,
+# validation, and package steps in order. Values published through GITHUB_ENV
+# reach the later steps, as on the runner. The arguments override them, and
+# OPENFOAM_ROOT selects the fake OpenFOAM tree. Prints the validation step
+# status, its elapsed seconds, and the package step status.
+ab_metric_run() {
+    local workspace="$1" start elapsed status package base=() published=()
+    shift
+    mapfile -t base < <(ab_metric_base "$workspace")
+    env "${base[@]}" "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > "${workspace}/clock.out" 2>&1 ||
+        _fail "S56: the clock step must succeed"
+    mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
+    start="$(date +%s)"
+    env "${base[@]}" "${published[@]}" OPENFOAM_ROOT="${workspace}/openfoam" "$@" \
+        "${AB_STEP_BASH[@]}" "${workspace}/run_step.sh" > "${workspace}/run.out" 2>&1 && status=0 || status=$?
+    elapsed=$(( $(date +%s) - start ))
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/package_step.sh" \
+        > "${workspace}/package.out" 2>&1 && package=0 || package=$?
+    printf 'status=%s elapsed=%s package=%s\n' "$status" "$elapsed" "$package"
+}
+
+# ab_metric_package <workspace> [NAME=value ...] - run the extracted package
+# step again. Prints its status.
+ab_metric_package() {
+    local workspace="$1" status base=() published=()
+    shift
+    mapfile -t base < <(ab_metric_base "$workspace")
+    mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/package_step.sh" \
+        > "${workspace}/package.out" 2>&1 && status=0 || status=$?
+    printf '%s\n' "$status"
+}
+
+# ab_metric_cleanup <workspace> [NAME=value ...] - run the extracted cleanup
+# and summary step. Prints its status.
+ab_metric_cleanup() {
+    local workspace="$1" status base=() published=()
+    shift
+    mapfile -t base < <(ab_metric_base "$workspace")
+    mapfile -t published < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${workspace}/github_env")
+    env "${base[@]}" "${published[@]}" "$@" "${AB_STEP_BASH[@]}" "${workspace}/cleanup_step.sh" \
+        > "${workspace}/cleanup.out" 2>&1 && status=0 || status=$?
+    printf '%s\n' "$status"
+}
+
+# ab_metric_root <workspace> - the unique task directory of the last run.
+ab_metric_root() {
+    ab_file_value "${1}/github_env" METRIC_TASK_ROOT
+}
+
+# ab_metric_task <workspace> - the m3-mean-speed-validation directory.
+ab_metric_task() {
+    ab_file_value "${1}/github_env" METRIC_TASK_TEMP
+}
+
+# ab_metric_value <workspace> <key> - one value of the uploaded result file.
+ab_metric_value() {
+    ab_file_value "$(ab_metric_root "$1")/upload/result.env" "$2"
+}
+
+# ab_metric_calls <workspace> - the fake calls, one per line: name, then the
+# arguments, separated by single spaces.
+ab_metric_calls() {
+    awk -F '\t' '{ line = $1; for (i = 3; i <= NF; i++) line = line " " $i; print line }' "${1}/calls.tsv"
+}
+
+# ab_metric_count <workspace> <name> - the number of calls of one fake command.
+ab_metric_count() {
+    awk -F '\t' -v name="$2" '$1 == name' "${1}/calls.tsv" | wc -l
+}
+
+# ab_metric_library <workspace> - the validation script without its final
+# mode selection: the constants, the state, and every function.
+ab_metric_library() {
+    awk '/<<.METRIC_VALIDATION.$/ { inside = 1; next } /^METRIC_VALIDATION$/ { inside = 0 } inside' \
+        "${1}/run_step.sh" | awk '/^case "\$\{1:-\}" in$/ { exit } { print }'
+}
+
+# ab_metric_expect <label> <result> <stop-point> [NAME=value ...] - one run in
+# a new workspace. @WORKSPACE@ in a value names that workspace. The uploaded
+# result and the stop point must match, the validation step must fail, and
+# the package step must complete. Sets AB_METRIC_LAST to the workspace.
+ab_metric_expect() {
+    local label="$1" result="$2" point="$3" workspace run argument arguments=()
+    shift 3
+    workspace="$(new_workspace "${label//[^A-Za-z0-9_.-]/_}")"
+    ab_metric_fixture "$workspace"
+    for argument in "$@"; do
+        arguments+=("${argument//@WORKSPACE@/${workspace}}")
+    done
+    run="$(ab_metric_run "$workspace" "${arguments[@]}")"
+    [[ "$(ab_metric_value "$workspace" METRIC_RESULT)" == "$result" ]] ||
+        _fail "${label}: the result must be ${result}" "actual: $(ab_metric_value "$workspace" METRIC_RESULT)" \
+              "reason: $(ab_metric_value "$workspace" METRIC_REASON)" "$(tail -n 5 "${workspace}/run.out")"
+    assert_eq "$point" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "${label}: the stop point"
+    assert_contains "$run" "status=1 " "${label}: the validation step fails"
+    assert_contains "$run" "package=0" "${label}: the package step completes"
+    assert_file_exists "$(ab_metric_root "$workspace")/upload/m3-metric-validation-evidence.tar.gz" \
+        "${label}: the evidence archive is uploaded"
+    AB_METRIC_LAST="$workspace"
+}
+
+# ab_metric_no_command <workspace> <label> <name>... - no call of each name.
+ab_metric_no_command() {
+    local workspace="$1" label="$2" name
+    shift 2
+    for name in "$@"; do
+        assert_eq "0" "$(ab_metric_count "$workspace" "$name")" "${label}: no ${name} call"
+    done
+}
+
+# ab_metric_step_timeout <step-name> - the timeout-minutes value of one step.
+ab_metric_step_timeout() {
+    awk -v want="      - name: $1" '
+        $0 == want { found = 1; next }
+        found && /^      - name: / { exit }
+        found && /^        timeout-minutes: [0-9]+[[:space:]]*$/ { print $2; exit }
+    ' "$METRIC_WORKFLOW"
+}
+
+s56_metric_workflow_interface() {
+    local workflow script workspace step minutes total=0 job window first second name constant
+    assert_file_exists "$METRIC_WORKFLOW" "S56: the metric workflow exists"
+    workflow="$(cat "$METRIC_WORKFLOW")"
+    # workflow_dispatch with one required input is the only trigger.
+    assert_eq $'on:\n  workflow_dispatch:\n    inputs:\n      expected_main_sha:\n        description: The exact main commit SHA of the Architect execution admission\n        required: true\n        type: string' \
+        "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$METRIC_WORKFLOW")" \
+        "S56: workflow_dispatch with the required expected_main_sha input is the only trigger"
+    assert_contains "$workflow" $'permissions:\n  contents: read' "S56: the token can only read contents"
+    assert_contains "$workflow" "runs-on: ubuntu-24.04" "S56: the job runs on ubuntu-24.04"
+    assert_contains "$workflow" $'    defaults:\n      run:\n        shell: bash\n' \
+        "S56: each step runs as bash -eo pipefail, as the checks run it"
+    assert_contains "$workflow" "EXPECTED_MAIN_SHA: \${{ inputs.expected_main_sha }}" \
+        "S56: the input reaches the validation step only as an environment value"
+    assert_not_contains "$workflow" "continue-on-error" "S56: no step continues after an error"
+    assert_not_contains "$workflow" "actions/checkout" "S56: the fixture needs no checkout"
+    # The upload holds only the package.
+    assert_contains "$workflow" "uses: actions/upload-artifact@v4" "S56: the evidence is uploaded"
+    assert_contains "$workflow" "name: m3-metric-validation-evidence" "S56: the artifact name"
+    assert_contains "$workflow" "path: \${{ env.METRIC_TASK_ROOT }}/upload" "S56: only the package is uploaded"
+    assert_contains "$workflow" "if-no-files-found: error" "S56: a missing package fails the upload"
+    assert_contains "$workflow" "retention-days: 90" "S56: the artifact is kept for 90 days"
+    # batch-contract runs for the new workflow on push and on pull_request.
+    assert_eq "2" "$(grep -c "^      - '.github/workflows/openfoam-m3-metric-validation.yml'$" "$CONTRACT_WORKFLOW")" \
+        "S56: both batch-contract path filters name the metric workflow"
+    # The exact contract command, once, and the contract limits.
+    workspace="$(new_workspace s56_interface)"
+    ab_metric_fixture "$workspace"
+    script="$(awk '/<<.METRIC_VALIDATION.$/ { inside = 1; next } /^METRIC_VALIDATION$/ { inside = 0 } inside' \
+        "${workspace}/run_step.sh")"
+    [[ -n "$script" ]] || _fail "S56: the validation script must be extracted"
+    bash -n <<< "$script" || _fail "S56: the validation script must parse"
+    assert_eq "1" "$(grep -cF -- "$AB_METRIC_COMMAND" <<< "$script")" "S56: the exact contract command appears once"
+    assert_eq "1" "$(grep -cE '^[[:space:]]*simpleFoam[[:space:]]' <<< "$script")" \
+        "S56: the script runs simpleFoam in one place"
+    assert_eq "0" "$(grep -cE '^[[:space:]]*(postProcess|foamPostProcess|foamDictionary)[[:space:]]' <<< "$script")" \
+        "S56: the script runs no other post-processing command"
+    for constant in 'PACKAGE="openfoam2512-default"' 'PACKAGE_VERSION="2512.0-2"' 'PROJECT_VERSION="v2512"' \
+                    'ARCHITECTURE="x86_64"' 'KILL_GRACE=5' 'INSTALL_CAP=180' 'OPENFOAM_CAP=60' \
+                    'OPENFOAM_BUDGET=240' 'PHASE_CAP=30' 'LOG_LIMIT=1048576' 'LOGS_LIMIT=8388608' \
+                    'ARTIFACT_LIMIT=10485760' 'EXPECTED_VALUE="11/3"' 'TOLERANCE=1e-6' 'REGION="region0"' \
+                    'EXPECTED_REF="refs/heads/main"'; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$script")" "S56: the script sets ${constant}"
+    done
+    # The time limits: a 10-minute job, five step guards with a one-minute
+    # margin, and an active window inside the validation step guard.
+    job="$(awk '/^    timeout-minutes: [0-9]+[[:space:]]*$/ { print $2; exit }' "$METRIC_WORKFLOW")"
+    assert_eq "10" "$job" "S56: the hard job timeout is 10 minutes"
+    for step in "Start the validation clock" "Run the metric validation" "Package the validation evidence" \
+                "Upload the validation evidence" "Remove the task directory"; do
+        minutes="$(ab_metric_step_timeout "$step")"
+        [[ "$minutes" =~ ^[0-9]+$ ]] || { _fail "S56: the step '${step}' must have a timeout"; minutes=0; }
+        total=$(( total + minutes ))
+    done
+    (( total + 1 <= job )) || _fail "S56: the step timeouts must leave a one-minute job margin" "steps: ${total} min"
+    env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
+        "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
+    first="$(ab_metric_root "$workspace")"
+    window=$(( $(ab_file_value "${workspace}/github_env" METRIC_ACTIVE_DEADLINE) - \
+               $(ab_file_value "${workspace}/github_env" METRIC_CLOCK_START) ))
+    assert_eq "290" "$window" "S56: the active work ends 290 seconds after the clock starts"
+    (( window <= $(ab_metric_step_timeout "Run the metric validation") * 60 )) ||
+        _fail "S56: the validation step guard must not stop the work before the active-work deadline"
+    # The worst case: the clock guard, the window, the package budget, the
+    # upload guard, and the cleanup budget stay inside the job limit.
+    (( 60 + window + 30 + 60 + 30 <= job * 60 )) || _fail "S56: the worst case must fit in the job limit"
+    assert_eq "/usr/lib/openfoam" "$(ab_file_value "${workspace}/github_env" OPENFOAM_ROOT)" \
+        "S56: the clock step names the installed OpenFOAM root"
+    # Each run gets its own unique task directory under RUNNER_TEMP.
+    env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
+        "${AB_STEP_BASH[@]}" "${workspace}/clock_step.sh" > /dev/null 2>&1 || _fail "S56: the clock step must succeed"
+    second="$(ab_metric_root "$workspace")"
+    assert_ne "$first" "$second" "S56: each run has a unique task directory"
+    for name in "$first" "$second"; do
+        [[ "${name#"${workspace}/runner_temp/"}" =~ ^m3-metric-validation\.[A-Za-z0-9]{8}$ ]] ||
+            _fail "S56: the task directory must be a unique directory directly under RUNNER_TEMP" "$name"
+        assert_dir_exists "${name}/m3-mean-speed-validation/case" "S56: the task layout has case"
+        assert_dir_exists "${name}/m3-mean-speed-validation/config" "S56: the task layout has config"
+        assert_dir_exists "${name}/m3-mean-speed-validation/logs" "S56: the task layout has logs"
+        assert_dir_exists "${name}/m3-mean-speed-validation/evidence" "S56: the task layout has evidence"
+    done
+    assert_eq "FAIL_NOT_STARTED" "$(ab_file_value "${second}/m3-mean-speed-validation/evidence/result.env" METRIC_RESULT)" \
+        "S56: the clock step writes an early failure result"
+}
+
+s57_metric_fixture_is_two_cells_with_the_expected_mean() {
+    local workspace task case_dir out expected_files actual_files mean
+    workspace="$(new_workspace s57_fixture)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    task="$(ab_metric_task "$workspace")"
+    case_dir="${task}/case"
+    # Only the synthetic fixture: no Case 7 file, mesh tool input, or STL.
+    expected_files=$'case/1/U\ncase/1/p\ncase/2/U\ncase/2/p\ncase/constant/polyMesh/boundary\ncase/constant/polyMesh/faces\ncase/constant/polyMesh/neighbour\ncase/constant/polyMesh/owner\ncase/constant/polyMesh/points\ncase/constant/transportProperties\ncase/constant/turbulenceProperties\ncase/system/controlDict\ncase/system/fvSchemes\ncase/system/fvSolution\nconfig/metric-functions'
+    actual_files="$(cd "$task" && find case config -type f ! -path 'case/postProcessing/*' | LC_ALL=C sort)"
+    assert_eq "$expected_files" "$actual_files" "S57: the fixture has exactly the synthetic Case files"
+    # The mesh: two cells, volumes 1 and 2, total 3, every boundary face out.
+    out="$(awk -v dir="$case_dir" -v field="${case_dir}/2/U" -f "${workspace}/mesh_metric.awk")"
+    assert_contains "$out" $'cell 0 volume 1 speed 5\ncell 1 volume 2 speed 3' \
+        "S57: cell 0 has volume 1 and speed 5, and cell 1 has volume 2 and speed 3 at the latest time"
+    assert_contains "$out" "faces 11 internal 1 outward 10 values 6" \
+        "S57: one internal face, and each of the ten boundary faces points out of its cell"
+    mean="$(awk '$1 == "total" { print $2 " " $4 }' <<< "$out")"
+    awk -v t="${mean% *}" -v m="${mean#* }" 'BEGIN { d = m - 11/3; if (d < 0) d = -d; exit !(t == 3 && d <= 1e-12) }' ||
+        _fail "S57: the fixture total volume is 3 and its mean speed is 11/3" "total and mean: ${mean}"
+    # The earlier time gives another value, as do the two wrong formulas.
+    out="$(awk -v dir="$case_dir" -v field="${case_dir}/1/U" -f "${workspace}/mesh_metric.awk")"
+    mean="$(awk '$1 == "total" { print $4 }' <<< "$out")"
+    awk -v m="$mean" 'BEGIN { d = m - 11/3; if (d < 0) d = -d; exit !(d > 1e-6) }' ||
+        _fail "S57: the earlier time must give another mean speed" "mean: ${mean}"
+    awk 'BEGIN { a = sqrt(((3 - 6) / 3) ^ 2 + (4 / 3) ^ 2); m = (5 + 3) / 2; e = 11/3
+                 exit !((a - e) ^ 2 > 1e-12 && (m - e) ^ 2 > 1e-12) }' ||
+        _fail "S57: the magnitude of the mean vector and the arithmetic mean must differ from 11/3"
+    # The start time is the latest time, so the output is written under it.
+    assert_eq "1" "$(grep -cE '^startFrom[[:space:]]+latestTime;$' "${case_dir}/system/controlDict")" \
+        "S57: the fixture control dictionary starts from the latest time"
+    # The dictionary: one FoamFile header, then the exact contract block.
+    assert_eq "$AB_METRIC_FUNCTIONS" "$(awk '/^functions$/ { f = 1 } f' "${task}/config/metric-functions")" \
+        "S57: the dictionary holds the exact contract function block"
+    assert_eq "FoamFile" "$(head -n 1 "${task}/config/metric-functions")" "S57: the dictionary starts with its header"
+    assert_contains "$(cat "${task}/config/metric-functions")" "    class       dictionary;" \
+        "S57: the dictionary header names the dictionary class"
+    # The fixture manifest records each file with its size and checksum.
+    while IFS=$'\t' read -r path bytes sha; do
+        [[ "$path" == path ]] && continue
+        assert_eq "$(stat -c %s -- "${task}/${path}") $(ab_sha "${task}/${path}")" "${bytes} ${sha}" \
+            "S57: the fixture manifest row of ${path}"
+    done < "${task}/evidence/fixture.tsv"
+    assert_eq "15" "$(tail -n +2 "${task}/evidence/fixture.tsv" | wc -l)" "S57: the manifest has one row for each file"
+}
+
+s58_metric_pass_records_the_complete_evidence() {
+    local workspace run task root calls row labels extract file status summary
+    workspace="$(new_workspace s58_pass)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace")"
+    assert_contains "$run" "status=0 " "S58: the validation step passes"
+    assert_contains "$run" "package=0" "S58: the package step completes"
+    root="$(ab_metric_root "$workspace")"
+    task="$(ab_metric_task "$workspace")"
+    assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S58: the result is PASS"
+    assert_eq "NONE" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S58: no stop point"
+    assert_eq "$AB_METRIC_SHA" "$(ab_metric_value "$workspace" MAIN_SHA)" "S58: the main SHA"
+    assert_eq "$AB_METRIC_SHA" "$(ab_metric_value "$workspace" EXPECTED_MAIN_SHA_INPUT)" "S58: the input SHA"
+    assert_eq "refs/heads/main" "$(ab_metric_value "$workspace" WORKFLOW_REF)" "S58: the ref"
+    assert_eq "2512.0-2" "$(ab_metric_value "$workspace" INSTALLED_PACKAGE_VERSION)" "S58: the package version"
+    assert_eq "v2512" "$(ab_metric_value "$workspace" LOADED_PROJECT_VERSION)" "S58: the project version"
+    assert_eq "linux64GccDPInt32Opt" "$(ab_metric_value "$workspace" LOADED_WM_OPTIONS)" "S58: WM_OPTIONS"
+    assert_eq "2" "$(ab_metric_value "$workspace" SELECTED_TIME)" "S58: the selected time is the latest time"
+    assert_eq "region0" "$(ab_metric_value "$workspace" SELECTED_REGION)" "S58: the selected region"
+    assert_eq "2" "$(ab_metric_value "$workspace" MESH_CELLS)" "S58: the checkMesh cell count"
+    assert_eq "1 2" "$(ab_metric_value "$workspace" CELL_VOLUMES)" "S58: the cell volumes"
+    assert_eq "3" "$(ab_metric_value "$workspace" MESH_TOTAL_VOLUME)" "S58: the checkMesh total volume"
+    assert_eq "MESH_OK" "$(ab_metric_value "$workspace" MESH_CHECK)" "S58: the checkMesh result"
+    assert_eq "YES" "$(ab_metric_value "$workspace" INPUTS_UNCHANGED)" "S58: the inputs are unchanged"
+    assert_eq "$(ab_sha "${task}/case/2/U")" "$(ab_metric_value "$workspace" U_LATEST_SHA256)" "S58: the latest U hash"
+    assert_eq "$(ab_sha "${task}/case/1/U")" "$(ab_metric_value "$workspace" U_EARLIER_SHA256)" "S58: the earlier U hash"
+    assert_eq "$(ab_sha "${task}/config/metric-functions")" "$(ab_metric_value "$workspace" DICTIONARY_SHA256)" \
+        "S58: the dictionary hash"
+    assert_eq "$(stat -c %s -- "${task}/config/metric-functions")" "$(ab_metric_value "$workspace" DICTIONARY_BYTES)" \
+        "S58: the dictionary size"
+    assert_eq "$(printf '%q ' simpleFoam -case "${task}/case" -postProcess -time 2 -fields '(U)' -dict \
+        "${task}/config/metric-functions" | sed -e 's/ $//')" "$(ab_metric_value "$workspace" METRIC_VECTOR)" \
+        "S58: the exact metric command vector"
+    assert_eq "postProcessing/m3MeanSpeed/2/volFieldValue.dat" "$(ab_metric_value "$workspace" OUTPUT_PATH)" \
+        "S58: the exact output path"
+    assert_eq "$(ab_sha "${task}/case/postProcessing/m3MeanSpeed/2/volFieldValue.dat")" \
+        "$(ab_metric_value "$workspace" OUTPUT_SHA256)" "S58: the output hash"
+    assert_eq "2" "$(ab_metric_value "$workspace" OUTPUT_TIME)" "S58: the output time"
+    assert_eq "all region0" "$(ab_metric_value "$workspace" OUTPUT_REGION)" "S58: the output region"
+    assert_eq "volAverage(m3MagU)" "$(ab_metric_value "$workspace" OUTPUT_FIELD)" "S58: the output field"
+    assert_eq "2" "$(ab_metric_value "$workspace" OUTPUT_CELLS)" "S58: the output cell count"
+    assert_eq "3.00000000000000000e+00" "$(ab_metric_value "$workspace" OUTPUT_VOLUME)" "S58: the output volume"
+    assert_eq "3.66666666666666652e+00" "$(ab_metric_value "$workspace" OUTPUT_VALUE)" "S58: the parsed value"
+    assert_eq "3.6666666666666665" "$(ab_metric_value "$workspace" EXPECTED_VALUE_DECIMAL)" "S58: the expected value"
+    awk -v e="$(ab_metric_value "$workspace" ABSOLUTE_ERROR)" 'BEGIN { exit !(e + 0 <= 1e-15) }' ||
+        _fail "S58: the absolute error is recorded" "$(ab_metric_value "$workspace" ABSOLUTE_ERROR)"
+    assert_eq "1e-6" "$(ab_metric_value "$workspace" TOLERANCE)" "S58: the tolerance"
+    for row in INSTALL_SECONDS OPENFOAM_SECONDS SETUP_SECONDS EVIDENCE_SECONDS ACTIVE_ELAPSED_SECONDS; do
+        [[ "$(ab_metric_value "$workspace" "$row")" =~ ^[0-9]+$ ]] || _fail "S58: ${row} is recorded"
+    done
+    # The identity.
+    for row in "PACKAGE=openfoam2512-default" "PACKAGE_VERSION=2512.0-2" "CORE_PACKAGE_VERSION=2512.0-2" \
+               "ARCHITECTURE=x86_64" "GCC_VERSION=13.3.0" "WM_PROJECT_VERSION=v2512" "WM_COMPILER=Gcc" \
+               "WM_OPTIONS=linux64GccDPInt32Opt" "OPENFOAM_BASHRC=${workspace}/openfoam/openfoam2512/etc/bashrc" \
+               "PATH_simpleFoam=${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin/simpleFoam"; do
+        assert_contains "$(cat "${task}/evidence/identity.txt")" "$row" "S58: the identity records ${row%%=*}"
+    done
+    # The exact command vectors, in order, each once.
+    calls="$(ab_metric_calls "$workspace" | grep -vE '^(dpkg-query|uname|gcc) ')"
+    # The two sides of `curl ... | sudo bash` start together, in either order.
+    calls="$(head -n 2 <<< "$calls" | LC_ALL=C sort; tail -n +3 <<< "$calls")"
+    assert_eq "curl -fsSL https://dl.openfoam.com/add-debian-repo.sh
+sudo bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends openfoam2512-default=2512.0-2
+foamListTimes -case ${task}/case -latestTime
+checkMesh -case ${task}/case -allGeometry -allTopology -time 2
+simpleFoam -case ${task}/case -postProcess -time 2 -fields (U) -dict ${task}/config/metric-functions" \
+        "$calls" "S58: the install pins the package version, and each OpenFOAM command runs once"
+    # Each bounded operation, its class, cap, and outcome.
+    labels="$(awk -F '\t' 'NR > 1 { print $2 ":" $3 ":" $4 ":" $9 }' "${task}/evidence/commands.tsv" | tr '\n' ' ')"
+    assert_eq "install:INSTALL:180:COMPLETED fixture:SETUP:30:COMPLETED fixture-manifest:SETUP:30:COMPLETED copy-dictionaries:SETUP:30:COMPLETED foamListTimes:OPENFOAM:60:COMPLETED checkMesh:OPENFOAM:60:COMPLETED parse-checkMesh:EVIDENCE:30:COMPLETED hash-inputs-before:EVIDENCE:30:COMPLETED metric:OPENFOAM:60:COMPLETED hash-inputs-after:EVIDENCE:30:COMPLETED list-output:EVIDENCE:30:COMPLETED copy-output:EVIDENCE:30:COMPLETED hash-output:EVIDENCE:30:COMPLETED parse-output:EVIDENCE:30:COMPLETED " \
+        "$labels" "S58: every operation is bounded and completes"
+    awk -F '\t' 'NR > 1 && !($10 ~ /^[0-9]+$/ && $5 <= $4 && $7 - $6 <= $5) { bad++ } END { exit bad > 0 }' \
+        "${task}/evidence/commands.tsv" || _fail "S58: each operation records its group and stays in its limit"
+    # The archive: the evidence, the logs, and the dictionary only.
+    extract="${workspace}/extract"
+    mkdir -p "$extract"
+    tar -xzf "${root}/upload/m3-metric-validation-evidence.tar.gz" -C "$extract"
+    assert_eq "" "$(cd "$extract" && find . -type f | grep -vE '^\./(evidence|logs)/|^\./config/metric-functions$')" \
+        "S58: the archive holds only evidence, logs, and the metric dictionary"
+    assert_eq "" "$(cd "$extract" && find . -type f -name '*.vtu' -o -type f -path '*polyMesh*' -o -type f -name U -o -type f -name p)" \
+        "S58: the archive holds no mesh, field, or VTU file"
+    for file in controlDict fvSchemes fvSolution transportProperties turbulenceProperties; do
+        assert_file_exists "${extract}/evidence/dictionaries/${file}" "S58: the archive keeps the ${file} dictionary"
+    done
+    cmp -s "${extract}/evidence/output/volFieldValue.dat" "${task}/case/postProcessing/m3MeanSpeed/2/volFieldValue.dat" ||
+        _fail "S58: the archive keeps the exact output"
+    cmp -s "${root}/upload/result.env" "${extract}/evidence/result.env" || _fail "S58: the upload result is the archive result"
+    cmp -s "${root}/upload/inventory.txt" "${extract}/evidence/inventory.txt" ||
+        _fail "S58: the upload inventory is the archive inventory"
+    while IFS=$'\t' read -r kind bytes sha path; do
+        [[ "$kind" == FILE ]] || continue
+        assert_eq "${bytes} ${sha}" "$(stat -c %s -- "${extract}/${path}") $(ab_sha "${extract}/${path}")" \
+            "S58: the inventory row of ${path}"
+    done < "${extract}/evidence/inventory.txt"
+    assert_eq "$(( $(cd "$extract" && find . -type f | wc -l) - 1 ))" \
+        "$(awk -F '\t' '$1 == "FILE"' "${extract}/evidence/inventory.txt" | wc -l)" \
+        "S58: the inventory lists every other archive file"
+    # The cleanup and the summary.
+    status="$(ab_metric_cleanup "$workspace")"
+    assert_eq "0" "$status" "S58: the cleanup step passes for PASS and a completed removal"
+    assert_dir_missing "$root" "S58: the cleanup removes the task directory"
+    summary="$(cat "${workspace}/step_summary")"
+    assert_contains "$summary" "| Result | \`PASS\` |" "S58: the summary shows the result"
+    assert_contains "$summary" "| Mean speed (m/s) | 3.66666666666666652e+00 |" "S58: the summary shows the value"
+    assert_contains "$summary" "| Cleanup | \`REMOVED\` |" "S58: the summary shows the cleanup"
+    assert_contains "$summary" "does not accept M3" "S58: the summary states the evidence limit"
+}
+
+s59_metric_dispatch_gates() {
+    local label sha upper
+    upper="$(tr '[:lower:]' '[:upper:]' <<< "$AB_METRIC_SHA")"
+    ab_metric_expect "S59 wrong ref" FAIL_REF dispatch GITHUB_REF=refs/heads/feat/80-m3-metric-validation
+    ab_metric_no_command "$AB_METRIC_LAST" "S59 wrong ref" curl sudo foamListTimes checkMesh simpleFoam
+    assert_eq "1" "$(ab_metric_cleanup "$AB_METRIC_LAST")" "S59: the job fails for a refused dispatch"
+    assert_dir_missing "$(ab_metric_root "$AB_METRIC_LAST")" "S59: the cleanup still removes the task directory"
+    for sha in 1111111111111111111111111111111111111111 "${AB_METRIC_SHA:0:7}" "$upper" ""; do
+        label="S59 input sha '${sha}'"
+        ab_metric_expect "$label" FAIL_SHA dispatch EXPECTED_MAIN_SHA="$sha"
+        ab_metric_no_command "$AB_METRIC_LAST" "$label" curl sudo foamListTimes checkMesh simpleFoam
+    done
+}
+
+s60_metric_package_and_environment_gates() {
+    local label
+    ab_metric_expect "S60 package version" FAIL_PACKAGE identity FAKE_PACKAGE_VERSION=2512.0-1
+    ab_metric_no_command "$AB_METRIC_LAST" "S60 package version" foamListTimes checkMesh simpleFoam
+    ab_metric_expect "S60 no package" FAIL_PACKAGE identity FAKE_FAIL=dpkg-query
+    ab_metric_expect "S60 install failure" FAIL_INSTALL install FAKE_FAIL=sudo
+    ab_metric_no_command "$AB_METRIC_LAST" "S60 install failure" dpkg-query foamListTimes checkMesh simpleFoam
+    # A simpleFoam outside the installed tree comes first in PATH.
+    for label in "FAKE_WM_VERSION=v2506" "FAKE_ARCH=aarch64" "FAKE_WM_COMPILER=Clang" "FAKE_BASHRC_STATUS=1" \
+                 "FAKE_EXTRA_PATH=@WORKSPACE@/elsewhere"; do
+        ab_metric_expect "S60 ${label}" FAIL_ENVIRONMENT identity "$label"
+        ab_metric_no_command "$AB_METRIC_LAST" "S60 ${label}" foamListTimes checkMesh simpleFoam
+    done
+}
+
+s61_metric_time_and_region_fail_closed() {
+    ab_metric_expect "S61 earlier latest time" FAIL_TIME latest-time FAKE_LIST_TIMES='1\n'
+    ab_metric_no_command "$AB_METRIC_LAST" "S61 earlier latest time" checkMesh simpleFoam
+    ab_metric_expect "S61 two time lines" FAIL_PARSE latest-time FAKE_LIST_TIMES='1\n2\n'
+    ab_metric_expect "S61 no time line" FAIL_PARSE latest-time FAKE_LIST_TIMES=''
+    ab_metric_expect "S61 output time" FAIL_TIME output FAKE_ROW_TIME=1
+    ab_metric_expect "S61 earlier-time values" FAIL_TOLERANCE output FAKE_VALUE_TIME=1
+    assert_eq "9.33333333333333393e+00" "$(ab_metric_value "$AB_METRIC_LAST" OUTPUT_VALUE)" \
+        "S61: the earlier-time values give 28/3 and fail"
+    ab_metric_expect "S61 other region" FAIL_REGION output FAKE_REGION='all region1'
+    ab_metric_expect "S61 cell zone" FAIL_REGION output FAKE_REGION='cellZone region0'
+    ab_metric_expect "S61 region type only" FAIL_REGION output FAKE_REGION='all'
+    ab_metric_expect "S61 region folder" FAIL_OUTPUT_MISSING output FAKE_OUTPUT=region-folder
+}
+
+s62_metric_mesh_evidence_fail_closed() {
+    ab_metric_expect "S62 three cells" FAIL_CELL_COUNT mesh FAKE_CELLS=3
+    ab_metric_no_command "$AB_METRIC_LAST" "S62 three cells" simpleFoam
+    ab_metric_expect "S62 one cell" FAIL_CELL_COUNT mesh FAKE_CELLS=1
+    ab_metric_expect "S62 negative volume" FAIL_CELL_VOLUME mesh FAKE_NEGATIVE_VOLUME=1
+    ab_metric_expect "S62 zero volume" FAIL_CELL_VOLUME mesh FAKE_MIN_VOLUME=0
+    ab_metric_expect "S62 wrong volumes" FAIL_CELL_VOLUME mesh FAKE_MIN_VOLUME=1.5 FAKE_MAX_VOLUME=1.5
+    ab_metric_expect "S62 total volume" FAIL_TOTAL_VOLUME mesh FAKE_TOTAL_VOLUME=4
+    ab_metric_expect "S62 no volume line" FAIL_PARSE mesh FAKE_NO_VOLUME_LINE=1
+    ab_metric_expect "S62 non-finite volume" FAIL_NON_FINITE mesh FAKE_MAX_VOLUME=nan
+    ab_metric_expect "S62 checkMesh failure" FAIL_COMMAND mesh FAKE_FAIL=checkMesh
+    ab_metric_no_command "$AB_METRIC_LAST" "S62 checkMesh failure" simpleFoam
+    ab_metric_expect "S62 output cells" FAIL_CELL_COUNT output FAKE_DAT_CELLS=3
+    ab_metric_expect "S62 output volume" FAIL_TOTAL_VOLUME output FAKE_DAT_VOLUME=4.00000000000000000e+00
+    ab_metric_expect "S62 output zero volume" FAIL_CELL_VOLUME output FAKE_DAT_VOLUME=0.00000000000000000e+00
+    ab_metric_expect "S62 output infinite volume" FAIL_NON_FINITE output FAKE_DAT_VOLUME=inf
+}
+
+s63_metric_inputs_and_output_fail_closed() {
+    ab_metric_expect "S63 missing U" FAIL_MISSING_U inputs FAKE_TAMPER=checkMesh:remove-U
+    ab_metric_no_command "$AB_METRIC_LAST" "S63 missing U" simpleFoam
+    ab_metric_expect "S63 linked U" FAIL_MISSING_U inputs FAKE_TAMPER=checkMesh:link-U
+    ab_metric_expect "S63 changed U" FAIL_FIELD_HASH inputs FAKE_TAMPER=checkMesh:edit-U
+    ab_metric_no_command "$AB_METRIC_LAST" "S63 changed U" simpleFoam
+    ab_metric_expect "S63 changed earlier U" FAIL_FIELD_HASH inputs FAKE_TAMPER=checkMesh:edit-earlier-U
+    ab_metric_expect "S63 U changed by the metric command" FAIL_FIELD_HASH output FAKE_TAMPER=simpleFoam:edit-U
+    ab_metric_expect "S63 U removed by the metric command" FAIL_MISSING_U output FAKE_TAMPER=simpleFoam:remove-U
+    ab_metric_expect "S63 output before the command" FAIL_OUTPUT_DUPLICATE metric FAKE_TAMPER=checkMesh:make-output
+    ab_metric_no_command "$AB_METRIC_LAST" "S63 output before the command" simpleFoam
+    ab_metric_expect "S63 no output" FAIL_OUTPUT_MISSING output FAKE_OUTPUT=none
+    ab_metric_expect "S63 header only" FAIL_OUTPUT_MISSING output FAKE_OUTPUT=header-only
+    ab_metric_expect "S63 two rows" FAIL_OUTPUT_DUPLICATE output FAKE_OUTPUT=two-rows
+    ab_metric_expect "S63 second file" FAIL_OUTPUT_DUPLICATE output FAKE_OUTPUT=second-file
+    ab_metric_expect "S63 other time folder" FAIL_OUTPUT_DUPLICATE output FAKE_OUTPUT=other-time
+    ab_metric_expect "S63 linked output" FAIL_OUTPUT_MISSING output FAKE_OUTPUT=symlink
+    # A failed command is not retried, and nothing runs after it.
+    ab_metric_expect "S63 metric command failure" FAIL_COMMAND metric FAKE_FAIL=simpleFoam
+    assert_eq "1" "$(ab_metric_count "$AB_METRIC_LAST" simpleFoam)" "S63: the failed metric command runs once"
+    assert_eq "1" "$(ab_metric_count "$AB_METRIC_LAST" foamListTimes)" "S63: foamListTimes runs once"
+    assert_eq "1" "$(ab_metric_count "$AB_METRIC_LAST" checkMesh)" "S63: checkMesh runs once"
+    assert_eq "1" "$(ab_metric_calls "$AB_METRIC_LAST" | grep -c '^sudo apt-get install ')" "S63: the install runs once"
+    assert_not_contains "$(awk -F '\t' 'NR > 1 { print $2 }' "$(ab_metric_task "$AB_METRIC_LAST")/evidence/commands.tsv")" \
+        "hash-inputs-after" "S63: no operation runs after the failed command"
+}
+
+s64_metric_value_fail_closed() {
+    local value
+    for value in nan -nan inf -inf; do
+        ab_metric_expect "S64 value ${value}" FAIL_NON_FINITE output FAKE_VALUE="$value"
+    done
+    ab_metric_expect "S64 text value" FAIL_PARSE output FAKE_VALUE=abc
+    ab_metric_expect "S64 partial number" FAIL_PARSE output FAKE_VALUE=3.67x
+    ab_metric_expect "S64 no value" FAIL_PARSE output FAKE_OUTPUT=no-value
+    ab_metric_expect "S64 other field" FAIL_PARSE output 'FAKE_COLUMN=volAverage(U)'
+    ab_metric_expect "S64 above the tolerance" FAIL_TOLERANCE output FAKE_VALUE=3.6666677
+    ab_metric_expect "S64 magnitude of the mean vector" FAIL_TOLERANCE output FAKE_VALUE=1.6666666666666667
+    ab_metric_expect "S64 arithmetic mean" FAIL_TOLERANCE output FAKE_VALUE=4
+    # A value inside the tolerance passes.
+    local workspace run
+    workspace="$(new_workspace s64_inside)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_VALUE=3.6666675)"
+    assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S64: a value 8.3e-7 from 11/3 passes"
+    assert_contains "$run" "status=0 " "S64: the validation step passes inside the tolerance"
+}
+
+s65_metric_limits_and_process_cleanup() {
+    local workspace library now out run elapsed task row pid re status probe=()
+    workspace="$(new_workspace s65_limits)"
+    ab_metric_fixture "$workspace"
+    library="$(ab_metric_library "$workspace")"
+    probe=(METRIC_TASK_ROOT="${workspace}/probe" METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    # op_limit: the contract caps, the budgets left, and the active window.
+    now="$(date +%s)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        METRIC_ACTIVE_DEADLINE=$(( now + 1000 ))
+        echo \$(op_limit INSTALL 180) \$(op_limit OPENFOAM 60) \$(op_limit SETUP 30) \$(op_limit EVIDENCE 30) \$(op_limit PACKAGE 30)
+        OPENFOAM_USED=236; echo \$(op_limit OPENFOAM 60)
+        OPENFOAM_USED=240; echo \$(op_limit OPENFOAM 60)
+        SETUP_USED=25 EVIDENCE_USED=29 PACKAGE_USED=30; echo \$(op_limit SETUP 30) \$(op_limit EVIDENCE 30) \$(op_limit PACKAGE 30)")"
+    assert_eq $'180 60 30 30 30\n4\n0\n5 1 0' "$out" "S65: the caps are 180, 60, and 30 s, the OpenFOAM commands share 240 s"
+    out="$(env "${probe[@]}" bash -c "${library}
+        METRIC_ACTIVE_DEADLINE=\$(( \$(date +%s) + 100 ))
+        echo \$(op_limit INSTALL 180) \$(op_limit OPENFOAM 60) \$(op_limit EVIDENCE 30) \$(op_limit PACKAGE 30)
+        METRIC_ACTIVE_DEADLINE=\$(( \$(date +%s) + 50 ))
+        echo \$(op_limit INSTALL 180) \$(op_limit OPENFOAM 60) \$(op_limit SETUP 30) \$(op_limit EVIDENCE 30)
+        METRIC_ACTIVE_DEADLINE=\$(( \$(date +%s) + 10 ))
+        echo \$(op_limit INSTALL 180) \$(op_limit EVIDENCE 30) \$(op_limit PACKAGE 30)")"
+    re="^(69|70) 60 30 30"$'\n'"(19|20) (19|20) (19|20) 30"$'\n'"0 (9|10) 30$"
+    [[ "$out" =~ $re ]] ||
+        _fail "S65: install, setup, and OpenFOAM keep the evidence budget before the deadline" "$out"
+    # bounded: SIGTERM at the limit less the kill grace, and SIGKILL to a
+    # child that ignores SIGTERM at the limit. The command exits 4 seconds
+    # after SIGTERM. The function returns only after the child stops.
+    ab_write_term_ignoring_command "${workspace}/term_ignoring_command" 4
+    out="$(cd "$workspace" && env "${probe[@]}" bash -c "${library}
+        bounded probe 7 '${workspace}/probe.out' '${workspace}/probe.err' ./term_ignoring_command
+        echo \"outcome=\${OP_OUTCOME} elapsed=\$(( OP_END - OP_START )) group=\${OP_GROUP}\"")"
+    pid="$(ab_file_value "${workspace}/probe.out" CHILD_PID)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || _fail "S65: the probe child must start" "$(cat "${workspace}/probe.out")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        _fail "S65: the TERM-ignoring child must stop before bounded returns"
+    fi
+    [[ "$out" =~ outcome=TIMEOUT\ elapsed=(6|7|8)\  ]] ||
+        _fail "S65: the operation ends with SIGKILL at its 7-second limit" "$out"
+    # A blocked metric command stops at its limit, and the evidence remains.
+    workspace="$(new_workspace s65_blocked)"
+    ab_metric_fixture "$workspace"
+    now="$(date +%s)"
+    run="$(ab_metric_run "$workspace" FAKE_BLOCK=simpleFoam METRIC_ACTIVE_DEADLINE="$(( now + 30 + 9 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    assert_eq "FAIL_TIMEOUT" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S65: a blocked command is FAIL_TIMEOUT"
+    assert_eq "metric" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S65: the run stops at the metric command"
+    (( elapsed <= 10 )) || _fail "S65: the blocked command must stop before the evidence budget" "elapsed: ${elapsed}"
+    task="$(ab_metric_task "$workspace")"
+    row="$(awk -F '\t' '$2 == "metric" { print $5 " " $9 " " ($7 - $6) }' "${task}/evidence/commands.tsv")"
+    [[ "$row" =~ ^([0-9]+)\ TIMEOUT\ ([0-9]+)$ ]] && (( BASH_REMATCH[1] < 60 && BASH_REMATCH[2] <= BASH_REMATCH[1] )) ||
+        _fail "S65: the metric row shows the window limit and the timeout" "$row"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            _fail "S65: the blocked fake must stop" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    assert_contains "$run" "package=0" "S65: the package step completes after a timeout"
+    # No time left: no operation starts.
+    ab_metric_expect "S65 no time" FAIL_TIMEOUT install METRIC_ACTIVE_DEADLINE="$(( $(date +%s) - 1 ))"
+    ab_metric_no_command "$AB_METRIC_LAST" "S65 no time" curl sudo foamListTimes checkMesh simpleFoam
+    assert_contains "$(cat "$(ab_metric_task "$AB_METRIC_LAST")/evidence/commands.tsv")" $'\tNOT_STARTED\t-\t-\t' \
+        "S65: the install row shows NOT_STARTED"
+    # The package budget: a blocked archive stops at the budget, and only the
+    # result and the reason are uploaded.
+    workspace="$(new_workspace s65_package)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    ln -s "${workspace}/metric_fake" "${workspace}/fakebin/tar"
+    now="$(date +%s)"
+    env PATH="${workspace}/fakebin:${PATH}" FAKE_BLOCK=tar METRIC_FAKE_CALLS="${workspace}/calls.tsv" \
+        METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="$(ab_metric_root "$workspace")" \
+        METRIC_TASK_TEMP="$(ab_metric_task "$workspace")" bash -c "${library}
+        PHASE_CAP=7
+        main_package" > "${workspace}/package_probe.out" 2>&1 && status=0 || status=$?
+    elapsed=$(( $(date +%s) - now ))
+    assert_eq "1" "$status" "S65: an incomplete package fails"
+    (( elapsed <= 8 )) || _fail "S65: the package stops at its budget" "elapsed: ${elapsed}"
+    assert_eq "FAIL_EVIDENCE_PACKAGE" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S65: an incomplete evidence package fails closed"
+    assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_PRIOR_RESULT)" "S65: the prior result stays recorded"
+    assert_file_exists "$(ab_metric_root "$workspace")/upload/reason.txt" "S65: the upload keeps the reason"
+    assert_file_missing "$(ab_metric_root "$workspace")/upload/m3-metric-validation-evidence.tar.gz" \
+        "S65: no partial archive"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            _fail "S65: the blocked archive must stop" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+}
+
+s66_metric_log_and_artifact_limits() {
+    local workspace task root file extract
+    ab_metric_expect "S66 log above the limit" FAIL_OUTPUT_LIMIT metric FAKE_STDOUT_BYTES=1048577
+    task="$(ab_metric_task "$AB_METRIC_LAST")"
+    root="$(ab_metric_root "$AB_METRIC_LAST")"
+    assert_contains "$(cat "${task}/evidence/excluded.tsv")" $'logs/09-metric.stdout.log\t1048577\t' \
+        "S66: the excluded log keeps its size and checksum"
+    assert_contains "$(cat "${root}/upload/inventory.txt")" $'EXCLUDED\t1048577\t' "S66: the inventory lists the excluded log"
+    assert_not_contains "$(tar -tzf "${root}/upload/m3-metric-validation-evidence.tar.gz")" "09-metric.stdout.log" \
+        "S66: the archive does not hold the excluded log"
+    # A log of exactly 1 MiB stays.
+    workspace="$(new_workspace s66_log_limit)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" FAKE_STDOUT_BYTES=1048576 > /dev/null
+    assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S66: a log of exactly 1 MiB stays"
+    # The kept logs together: at most 8 MiB.
+    for file in 1 2 3 4 5 6 7 8; do
+        head -c 1048576 /dev/zero > "$(ab_metric_task "$workspace")/logs/9${file}-extra.stdout.log"
+    done
+    assert_eq "0" "$(ab_metric_package "$workspace")" "S66: the package step completes"
+    assert_eq "FAIL_OUTPUT_LIMIT" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S66: logs above 8 MiB together fail"
+    assert_eq "PASS" "$(ab_metric_value "$workspace" METRIC_PRIOR_RESULT)" "S66: the prior result stays recorded"
+    assert_contains "$(cat "$(ab_metric_task "$workspace")/evidence/excluded.tsv")" "above 8388608 bytes together" \
+        "S66: the excluded logs keep the reason"
+    extract="${workspace}/extract"
+    mkdir -p "$extract"
+    tar -xzf "$(ab_metric_root "$workspace")/upload/m3-metric-validation-evidence.tar.gz" -C "$extract"
+    (( $(find "${extract}/logs" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }') <= 8388608 )) ||
+        _fail "S66: the archive keeps at most 8 MiB of logs"
+    # The artifact: at most 10 MiB, or only the result, the inventory, and the reason.
+    workspace="$(new_workspace s66_artifact)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    head -c 11534336 /dev/urandom > "$(ab_metric_task "$workspace")/evidence/extra.bin"
+    assert_eq "0" "$(ab_metric_package "$workspace")" "S66: the package step completes"
+    root="$(ab_metric_root "$workspace")"
+    assert_eq "FAIL_ARTIFACT_LIMIT" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S66: an artifact above 10 MiB fails"
+    (( $(find "${root}/upload" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }') <= 10485760 )) ||
+        _fail "S66: the upload stays at or below 10 MiB"
+    assert_eq $'evidence/\nevidence/inventory.txt\nevidence/reason.txt\nevidence/result.env' \
+        "$(tar -tzf "${root}/upload/m3-metric-validation-evidence.tar.gz" | LC_ALL=C sort)" \
+        "S66: the reduced archive holds only the result, the inventory, and the reason"
+}
+
+s67_metric_task_directory_and_cleanup() {
+    local workspace before after root status sleeper group
+    # Every file of the run is inside the unique task directory, and the
+    # cleanup removes only that directory.
+    workspace="$(new_workspace s67_tree)"
+    ab_metric_fixture "$workspace"
+    # The harness writes its own step outputs (*.out) at the workspace top.
+    before="$(cd "$workspace" && find . -mindepth 1 ! -path './*.out' | LC_ALL=C sort)"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    after="$(cd "$workspace" && find . -mindepth 1 ! -path './*.out' ! -path "./runner_temp/${root##*/}" \
+        ! -path "./runner_temp/${root##*/}/*" | LC_ALL=C sort)"
+    assert_eq "$before" "$after" "S67: the run writes no file outside the task directory"
+    assert_eq "0" "$(ab_metric_cleanup "$workspace")" "S67: the cleanup passes"
+    assert_eq "$before" "$(cd "$workspace" && find . -mindepth 1 ! -path './*.out' | LC_ALL=C sort)" \
+        "S67: after the cleanup, only the task directory is gone"
+    # A process with its working directory in the task directory stops the
+    # removal.
+    workspace="$(new_workspace s67_active)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    (cd "${root}/m3-mean-speed-validation" && exec sleep 30) &
+    sleeper=$!
+    sleep 0.2
+    status="$(ab_metric_cleanup "$workspace")"
+    kill "$sleeper" 2>/dev/null
+    wait "$sleeper" 2>/dev/null || true
+    assert_eq "1" "$status" "S67: the cleanup fails while a process uses the task directory"
+    assert_dir_exists "$root" "S67: the task directory stays while a process uses it"
+    assert_contains "$(cat "${workspace}/step_summary")" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" \
+        "S67: the summary shows the active process"
+    assert_eq "0" "$(ab_metric_cleanup "$workspace")" "S67: the cleanup passes after the process stops"
+    assert_dir_missing "$root" "S67: the cleanup then removes the task directory"
+    # A process in a recorded operation group stops the removal.
+    workspace="$(new_workspace s67_group)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    setsid sleep 30 < /dev/null > /dev/null 2>&1 &
+    sleeper=$!
+    sleep 0.2
+    group="$(ps -o pgid= -p "$sleeper" | tr -d ' ')"
+    printf '99\tprobe\tEVIDENCE\t30\t30\t0\t0\t0\tCOMPLETED\t%s\t-\tprobe\n' "$group" \
+        >> "$(ab_metric_task "$workspace")/evidence/commands.tsv"
+    status="$(ab_metric_cleanup "$workspace")"
+    kill "$sleeper" 2>/dev/null
+    wait "$sleeper" 2>/dev/null || true
+    assert_eq "1" "$status" "S67: the cleanup fails while a recorded group has a process"
+    assert_dir_exists "$root" "S67: the task directory stays while a recorded group has a process"
+    # Only the unique task directory under RUNNER_TEMP.
+    workspace="$(new_workspace s67_path)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    mkdir -p "${workspace}/runner_temp/other"
+    for root in "${workspace}/runner_temp" "${workspace}/runner_temp/other" "${workspace}/elsewhere"; do
+        status="$(ab_metric_cleanup "$workspace" METRIC_TASK_ROOT="$root")"
+        assert_eq "1" "$status" "S67: the cleanup refuses ${root#"${workspace}/"}"
+        assert_dir_exists "$root" "S67: the refused directory stays: ${root#"${workspace}/"}"
+        assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: REFUSED_UNEXPECTED_PATH" \
+            "S67: the refusal is explicit for ${root#"${workspace}/"}"
+    done
+}
+
+# ---- S68 to S70: root processes and the process checks (PR #97) ------------
+#
+# The install runs the repository script and apt-get as root through sudo. The
+# runner user may not signal a root process, and kill -0 fails for it with
+# EPERM, so a check with kill -0 takes a group of root processes as empty
+# (Architect review 5453307998). S68 uses the fake sudo: the install leaves a
+# process that ignores SIGTERM, the stop must signal the install group through
+# sudo -n kill, and when sudo refuses, the process stays, as a root process
+# stays for a runner-user signal. S69 uses real host processes of another
+# user: a process group for which kill -0 fails with EPERM, and /proc entries
+# that the test user may not read. No signal reaches a process of another
+# user: each attempt fails with EPERM, as the kill -0 check shows first.
+
+# ab_metric_foreign_group - one process group of the test host with a live
+# process, for which kill -0 fails with EPERM for the test user.
+ab_metric_foreign_group() {
+    local group out
+    for group in $(ps -eo pgid=,stat= | awk '$1 > 1 && $2 !~ /^Z/ { print $1 }' | sort -un); do
+        if out="$(LC_ALL=C kill -0 -- "-${group}" 2>&1)"; then
+            continue
+        fi
+        if [[ "$out" == *"Operation not permitted"* ]]; then
+            printf '%s\n' "$group"
+            return 0
+        fi
+    done
+    return 0
+}
+
+s68_metric_install_stop_reaches_root_processes() {
+    local workspace run elapsed task group child calls status alive summary library out outcome probe=()
+    # sudo is available: SIGTERM, then SIGKILL at the limit, both to the
+    # recorded install group through sudo -n kill.
+    workspace="$(new_workspace s68_root_stop)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S68: the install must start the TERM-ignoring child" \
+        "$(tail -n 5 "${workspace}/run.out")"
+    if kill -0 "$child" 2>/dev/null; then
+        kill -KILL "$child" 2>/dev/null || true
+        _fail "S68: the install stop must end the TERM-ignoring child"
+    fi
+    assert_eq "FAIL_TIMEOUT" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S68: the install timeout is FAIL_TIMEOUT"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S68: the run stops at the install"
+    task="$(ab_metric_task "$workspace")"
+    group="$(awk -F '\t' '$2 == "install" { print $10 }' "${task}/evidence/commands.tsv")"
+    [[ "$group" =~ ^[0-9]+$ ]] || _fail "S68: the install row records its group" "$group"
+    assert_eq "TIMEOUT" "$(awk -F '\t' '$2 == "install" { print $9 }' "${task}/evidence/commands.tsv")" \
+        "S68: the install row shows the timeout"
+    calls="$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)"
+    assert_eq "sudo -n kill -TERM -- -${group}
+sudo -n kill -KILL -- -${group}" "$calls" "S68: SIGTERM, then SIGKILL, go to the install group through sudo"
+    (( elapsed <= 15 )) || _fail "S68: the install stops at its 12-second limit" "elapsed: ${elapsed}"
+    assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job fails for the timeout"
+    assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup removes the task directory after the stop"
+    # sudo refuses: the child stays, as a root process stays. The run fails
+    # closed in a bounded time, and the cleanup keeps the task directory while
+    # the child runs in it.
+    workspace="$(new_workspace s68_root_survivor)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" FAKE_SUDO=deny \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S68: the install must start the TERM-ignoring child" \
+        "$(tail -n 5 "${workspace}/run.out")"
+    alive=no
+    if kill -0 "$child" 2>/dev/null; then alive=yes; fi
+    status="$(ab_metric_cleanup "$workspace")"
+    summary="$(cat "${workspace}/step_summary")"
+    if kill -0 "$child" 2>/dev/null; then alive="${alive} yes"; else alive="${alive} no"; fi
+    kill -KILL "$child" 2>/dev/null || true
+    task="$(ab_metric_task "$workspace")"
+    assert_eq "yes yes" "$alive" "S68: the child survives the refused signals, and the cleanup sends no signal"
+    assert_eq "FAIL_PROCESS_STOP" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S68: a process that does not stop is FAIL_PROCESS_STOP"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S68: the run stops at the install"
+    assert_eq "NOT_STOPPED" "$(awk -F '\t' '$2 == "install" { print $9 }' "${task}/evidence/commands.tsv")" \
+        "S68: the install row shows NOT_STOPPED"
+    (( elapsed <= 20 )) || _fail "S68: the stop is bounded: the limit, then at most the kill grace" "elapsed: ${elapsed}"
+    assert_eq "1" "$status" "S68: the cleanup fails while the child runs"
+    assert_dir_exists "$(ab_metric_root "$workspace")" "S68: the task directory stays while the child runs"
+    assert_contains "$summary" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" "S68: the summary shows the active process"
+    sleep 0.2
+    assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job still fails after the child stops"
+    assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup then removes the task directory"
+    # A log above the limit does not hide a process that did not stop.
+    library="$(ab_metric_library "$workspace")"
+    probe=(METRIC_TASK_ROOT="${workspace}/probe" METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation"
+           METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 100 ))")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation/logs" "${workspace}/probe/m3-mean-speed-validation/evidence" \
+             "${workspace}/probe/excluded" "${workspace}/probe/scratch"
+    for outcome in NOT_STOPPED COMPLETED; do
+        head -c 1048577 /dev/zero > "${workspace}/probe/m3-mean-speed-validation/logs/01-probe.stdout.log"
+        out="$(env "${probe[@]}" bash -c "${library}
+            OP_OUTCOME=${outcome}
+            log_limit '${workspace}/probe/m3-mean-speed-validation/logs/01-probe.stdout.log'
+            echo outcome=\${OP_OUTCOME}" 2>&1 || true)"
+        if [[ "$outcome" == NOT_STOPPED ]]; then
+            assert_contains "$out" "outcome=NOT_STOPPED" "S68: a log above the limit keeps NOT_STOPPED"
+        else
+            assert_contains "$out" "outcome=OUTPUT_LIMIT" "S68: a log above the limit gives OUTPUT_LIMIT"
+        fi
+    done
+}
+
+s69_metric_process_checks_do_not_depend_on_permission() {
+    local workspace library root group out status summary start elapsed pid holder zombie tick probe=()
+    # A recorded group that the test user may not signal: kill -0 fails with
+    # EPERM, but the group has a live process.
+    group="$(ab_metric_foreign_group)"
+    [[ -n "$group" ]] || _fail "S69: the test host must have a process group that the test user may not signal" \
+        "Run the contract tests as a user other than root."
+    workspace="$(new_workspace s69_foreign_group)"
+    ab_metric_fixture "$workspace"
+    library="$(ab_metric_library "$workspace")"
+    probe=(PATH="${workspace}/fakebin:${PATH}" FAKE_SUDO=deny METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    # The stop of an operation group does not take that group as empty. The
+    # signals fail with EPERM, so the group stays, and the stop says so after
+    # the kill grace.
+    start="$(date +%s)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        stop_operation_group ${group} probe \$(( \$(date +%s%3N) + 1000 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    elapsed=$(( $(date +%s) - start ))
+    assert_contains "$out" "status=1" "S69: the stop does not take a group of another user as empty" "$out"
+    assert_contains "$out" "stop=NOT_STOPPED" "S69: the stop records NOT_STOPPED"
+    (( elapsed <= 9 )) || _fail "S69: the stop of a group that stays is bounded" "elapsed: ${elapsed}"
+    # A group with only a zombie is empty: a zombie has stopped. Its parent
+    # sleeps in another group and does not reap it.
+    bash -c 'setsid sleep 0 & echo "$!" > "$1"; exec sleep 30' _ "${workspace}/zombie" \
+        < /dev/null > /dev/null 2>&1 &
+    holder=$!
+    zombie=""
+    for (( tick = 0; tick < 50; tick++ )); do
+        zombie="$(cat "${workspace}/zombie" 2>/dev/null || true)"
+        if [[ "$zombie" =~ ^[0-9]+$ && "$(awk '{ print $3 }' "/proc/${zombie}/stat" 2>/dev/null || true)" == Z ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ ! "$zombie" =~ ^[0-9]+$ || "$(awk '{ print $3 }' "/proc/${zombie}/stat" 2>/dev/null || true)" != Z ]]; then
+        kill "$holder" 2>/dev/null || true
+        _fail "S69: the probe must make a zombie in its own group" "pid: ${zombie}"
+    fi
+    out="$(env "${probe[@]}" bash -c "${library}
+        stop_operation_group ${zombie} probe \$(( \$(date +%s%3N) + 1000 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    assert_contains "$out" "status=0" "S69: a group with only a zombie is empty" "$out"
+    assert_contains "$out" "stop=EMPTY" "S69: the stop records EMPTY for a group with only a zombie"
+    # The cleanup does not take that group as empty.
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    printf '99\tprobe\tEVIDENCE\t30\t30\t0\t0\t0\tCOMPLETED\t%s\t-\tprobe\n' "$group" \
+        >> "$(ab_metric_task "$workspace")/evidence/commands.tsv"
+    status="$(ab_metric_cleanup "$workspace")"
+    assert_eq "1" "$status" "S69: the cleanup fails while a recorded group of another user has a process"
+    assert_dir_exists "$root" "S69: the task directory stays while a recorded group of another user has a process"
+    assert_contains "$(cat "${workspace}/step_summary")" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" \
+        "S69: the summary shows the active group"
+    # Every started operation records its group, also the package operation,
+    # which has no commands.tsv row. A live group in that record keeps the
+    # task directory.
+    workspace="$(new_workspace s69_group_record)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    out="$(awk -F '\t' 'NR > 1 { print $10 " " $2 }' "$(ab_metric_task "$workspace")/evidence/commands.tsv")"
+    assert_eq "$out" "$(head -n -1 "${root}/process-groups.tsv" 2>/dev/null | tr '\t' ' ')" \
+        "S69: the group record lists the group of each command row"
+    [[ "$(tail -n 1 "${root}/process-groups.tsv" 2>/dev/null)" =~ ^[0-9]+$'\t'package$ ]] ||
+        _fail "S69: the group record lists the package group last"
+    setsid sleep 30 < /dev/null > /dev/null 2>&1 &
+    pid=$!
+    sleep 0.2
+    printf '%s\tpackage\n' "$(ps -o pgid= -p "$pid" | tr -d ' ')" >> "${root}/process-groups.tsv"
+    status="$(ab_metric_cleanup "$workspace")"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    assert_eq "1" "$status" "S69: the cleanup fails while a group of the record has a process"
+    assert_dir_exists "$root" "S69: the task directory stays while a group of the record has a process"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_ACTIVE" \
+        "S69: the cleanup result is the active group of the record"
+    # A /proc entry that the scan cannot read makes the check incomplete. The
+    # test user may not read the working directory of a root process.
+    if readlink /proc/1/cwd > /dev/null 2>&1; then
+        _fail "S69: the test user must not be able to read /proc/1/cwd" "Run the contract tests as a user other than root."
+    fi
+    workspace="$(new_workspace s69_scan)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    status="$(ab_metric_cleanup "$workspace" FAKE_SUDO=user)"
+    assert_eq "1" "$status" "S69: the cleanup fails when the scan cannot read a /proc entry"
+    assert_dir_exists "$root" "S69: the task directory stays after an incomplete scan"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_INCOMPLETE" \
+        "S69: the cleanup result is the incomplete scan"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "Permission denied" "S69: the log shows the unreadable entry"
+    # Without root access the scan does not run.
+    status="$(ab_metric_cleanup "$workspace" FAKE_SUDO=deny)"
+    assert_eq "1" "$status" "S69: the cleanup fails without root access"
+    assert_dir_exists "$root" "S69: the task directory stays without root access"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_FAILED" \
+        "S69: the cleanup result is the failed scan"
+    # The scan is bounded.
+    ln -s "${workspace}/metric_fake" "${workspace}/fakebin/find"
+    start="$(date +%s)"
+    status="$(ab_metric_cleanup "$workspace" FAKE_BLOCK=find)"
+    elapsed=$(( $(date +%s) - start ))
+    rm -f -- "${workspace}/fakebin/find"
+    assert_eq "1" "$status" "S69: the cleanup fails when the scan does not end"
+    assert_dir_exists "$root" "S69: the task directory stays after a scan timeout"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_TIMEOUT" \
+        "S69: the cleanup result is the scan timeout"
+    (( elapsed <= 10 )) || _fail "S69: the scan stops at its limit" "elapsed: ${elapsed}"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S69: the blocked scan must stop" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    # With the root view and no user, the cleanup removes the directory.
+    status="$(ab_metric_cleanup "$workspace")"
+    summary="$(cat "${workspace}/step_summary")"
+    assert_eq "0" "$status" "S69: the cleanup passes after a complete scan"
+    assert_dir_missing "$root" "S69: the cleanup removes the task directory after a complete scan"
+    assert_contains "$summary" "| Cleanup | \`REMOVED\` |" "S69: the summary shows the removal"
+}
+
+s70_metric_stop_ends_by_the_operation_deadline() {
+    local workspace run elapsed task row child pid library out start sleeper group probe=()
+    # sudo hangs: each sudo -n kill helper ignores SIGTERM and sends no signal
+    # (review 5454383774). The helpers, the SIGKILL, and the check must end by
+    # the absolute deadline of the install, and the run fails closed.
+    workspace="$(new_workspace s70_slow_helper)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" FAKE_SUDO=slow \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    if [[ "$child" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$child" 2>/dev/null || true
+    else
+        _fail "S70: the install must start the TERM-ignoring child" "$(tail -n 5 "${workspace}/run.out")"
+    fi
+    task="$(ab_metric_task "$workspace")"
+    row="$(awk -F '\t' '$2 == "install" { print $5 " " ($7 - $6) " " $9 }' "${task}/evidence/commands.tsv")"
+    assert_eq "FAIL_PROCESS_STOP" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S70: a group that does not stop by its deadline is FAIL_PROCESS_STOP"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S70: the run stops at the install"
+    [[ "$row" =~ ^([0-9]+)\ ([0-9]+)\ NOT_STOPPED$ ]] && (( BASH_REMATCH[2] <= BASH_REMATCH[1] )) ||
+        _fail "S70: the install with its stop ends by its limit" "limit, elapsed, outcome: ${row}"
+    (( elapsed <= 13 )) || _fail "S70: the validation step ends at the 12-second install limit" "elapsed: ${elapsed}"
+    assert_contains "$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)" "sudo -n kill -KILL -- -" \
+        "S70: the SIGKILL helper starts before the deadline"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S70: each slow helper must stop by the deadline" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    # stop_operation_group alone, for a live group of the test with a deadline
+    # 3 seconds ahead: it returns by the deadline although each helper hangs.
+    library="$(ab_metric_library "$workspace")"
+    : > "${workspace}/fake_pids"
+    probe=(PATH="${workspace}/fakebin:${PATH}" FAKE_SUDO=slow METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    setsid bash -c "trap '' TERM; exec sleep 300" < /dev/null > /dev/null 2>&1 &
+    sleeper=$!
+    sleep 0.2
+    group="$(ps -o pgid= -p "$sleeper" | tr -d ' ')"
+    start="$(date +%s%3N)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        OP_CLASS=INSTALL
+        stop_operation_group ${group} probe \$(( \$(date +%s%3N) + 3000 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    kill -KILL "$sleeper" 2>/dev/null || true
+    wait "$sleeper" 2>/dev/null || true
+    assert_contains "$out" "status=1" "S70: the probe group stays"
+    assert_contains "$out" "stop=NOT_STOPPED" "S70: the stop records NOT_STOPPED"
+    (( elapsed <= 4000 )) ||
+        _fail "S70: the stop ends by its absolute deadline although each helper hangs" \
+              "elapsed: ${elapsed} ms for a deadline 3000 ms after the probe start"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S70: each slow helper of the probe must stop by the deadline" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    # SIGKILL comes STOP_RESERVE (1 second) before the deadline. A command that
+    # ignores SIGTERM ends about 1 second before its 7-second limit, and the
+    # stop then finds an empty group.
+    start="$(date +%s%3N)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        bounded probe 7 '${workspace}/probe.out' '${workspace}/probe.err' bash -c \"trap '' TERM; exec sleep 300\"
+        echo outcome=\${OP_OUTCOME} stop=\${OP_STOP}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    assert_contains "$out" "outcome=TIMEOUT stop=EMPTY" "S70: timeout kills the TERM-ignoring command"
+    (( elapsed >= 5500 && elapsed <= 6600 )) ||
+        _fail "S70: SIGKILL comes 1 second before the 7-second limit" "elapsed: ${elapsed} ms"
+    # The same when the command exits 4 seconds after SIGTERM and leaves a
+    # child that ignores SIGTERM: the stop sends SIGKILL 1 second before the
+    # cap, not at the cap.
+    ab_write_term_ignoring_command "${workspace}/term_ignoring_command" 4
+    start="$(date +%s%3N)"
+    out="$(cd "$workspace" && env "${probe[@]}" bash -c "${library}
+        bounded probe 7 '${workspace}/late.out' '${workspace}/late.err' ./term_ignoring_command
+        echo outcome=\${OP_OUTCOME} stop=\${OP_STOP}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    pid="$(ab_file_value "${workspace}/late.out" CHILD_PID)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        _fail "S70: the TERM-ignoring child must stop before bounded returns"
+    fi
+    assert_contains "$out" "outcome=TIMEOUT stop=STOPPED" "S70: the stop ends the TERM-ignoring child"
+    (( elapsed >= 5500 && elapsed <= 6600 )) ||
+        _fail "S70: the stop sends SIGKILL 1 second before the 7-second limit" "elapsed: ${elapsed} ms"
+}
+
+s71_metric_root_signal_vector_takes_a_small_group_id() {
+    local workspace library out calls candidate group probe=()
+    workspace="$(new_workspace s71_vector)"
+    ab_metric_fixture "$workspace"
+    library="$(ab_metric_library "$workspace")"
+    # A small group ID that is also a signal number, and that no process group
+    # of the host uses: kill -0 fails with ESRCH and sends no signal. Linux
+    # gives a PID below 300 only at boot, so no new process gets this ID.
+    group=""
+    for candidate in 58 34 15 9 3; do
+        if [[ "$(LC_ALL=C bash -c "kill -0 -- -${candidate}" 2>&1)" == *"No such process"* ]]; then
+            group="$candidate"
+            break
+        fi
+    done
+    [[ -n "$group" ]] || _fail "S71: the test host must have a free small process group ID"
+    probe=(PATH="${workspace}/fakebin:${PATH}" LC_ALL=C METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    # The install helper runs the real external kill through the fake sudo.
+    : > "${workspace}/calls.tsv"
+    out="$(env "${probe[@]}" bash -c "${library}
+        OP_CLASS=INSTALL
+        signal_group TERM ${group} \$(( \$(date +%s%3N) + 3000 ))
+        signal_group KILL ${group} \$(( \$(date +%s%3N) + 3000 ))" 2>&1 || true)"
+    calls="$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)"
+    assert_eq "sudo -n kill -TERM -- -${group}
+sudo -n kill -KILL -- -${group}" "$calls" "S71: the signal comes first, and the group is the operand"
+    assert_not_contains "$out" "Usage" "S71: the external kill accepts the vector"
+    assert_eq "2" "$(grep -c -- "(-${group}): No such process" <<< "$out")" \
+        "S71: each signal goes to the free group -${group}"
+    # A group ID below 2 is refused: kill to -1 reaches every process, and kill
+    # to -0 reaches the group of the caller. The fake sudo refuses, so no kill
+    # runs in this part.
+    : > "${workspace}/calls.tsv"
+    out="$(env "${probe[@]}" FAKE_SUDO=deny bash -c "${library}
+        OP_CLASS=INSTALL
+        signal_group TERM 1 \$(( \$(date +%s%3N) + 3000 ))
+        signal_group KILL 0 \$(( \$(date +%s%3N) + 3000 ))" 2>&1 || true)"
+    assert_eq "" "$(ab_metric_calls "$workspace" | grep -E '^sudo ' || true)" "S71: no signal helper starts for group 1 or 0"
+    assert_eq "2" "$(grep -c 'refused' <<< "$out")" "S71: each refusal is in the log"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -4450,6 +5917,22 @@ AB_OBSERVATIONS=(
     s53_capture_term_ignoring_child_is_killed
     s54_run_bounded_stops_the_command_group
     s55_capture_cleanup_stays_in_the_reserve
+    s56_metric_workflow_interface
+    s57_metric_fixture_is_two_cells_with_the_expected_mean
+    s58_metric_pass_records_the_complete_evidence
+    s59_metric_dispatch_gates
+    s60_metric_package_and_environment_gates
+    s61_metric_time_and_region_fail_closed
+    s62_metric_mesh_evidence_fail_closed
+    s63_metric_inputs_and_output_fail_closed
+    s64_metric_value_fail_closed
+    s65_metric_limits_and_process_cleanup
+    s66_metric_log_and_artifact_limits
+    s67_metric_task_directory_and_cleanup
+    s68_metric_install_stop_reaches_root_processes
+    s69_metric_process_checks_do_not_depend_on_permission
+    s70_metric_stop_ends_by_the_operation_deadline
+    s71_metric_root_signal_vector_takes_a_small_group_id
 )
 
 # One observation runs in this process when the caller names it. The scenario

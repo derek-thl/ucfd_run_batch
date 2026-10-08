@@ -1,0 +1,1730 @@
+name: openfoam-m3-metric-validation
+
+# Manual fixture-only validation of the M3 mean-speed command (Issue #80,
+# Architect contract 6043302440 with correction 6043318728).
+#
+# One run proves, or fails to prove, that the exact OpenCFD OpenFOAM v2512
+# command
+#   simpleFoam -case "$CASE_DIR" -postProcess -time "$SELECTED_TIME"
+#              -fields '(U)' -dict "$TASK_TEMP/config/metric-functions"
+# gives sum(V_i |U_i|) / sum(V_i) = 11/3 m/s within 1e-6 m/s on a synthetic
+# two-cell Case: cell volumes 1 and 2 m3 in region0, U = (3 4 0) and (-3 0 0)
+# m/s at the latest time 2, and other values at the earlier time 1. The run
+# never solves flow, never advances time, and uses no Case 7 or other
+# production data. A passing fixture is not a Case 7 result and does not
+# accept M3.
+#
+# The workflow starts only through workflow_dispatch on refs/heads/main, and
+# the input expected_main_sha must equal the exact workflow commit. Only the
+# Architect dispatches it, once, after a separate exact-main admission. No
+# step retries a command.
+#
+# Fail closed: a wrong ref or SHA, a package or environment identity other
+# than openfoam2512-default 2512.0-2 and v2512, a missing or changed U, a
+# missing or duplicate output, a wrong time or region, a cell count other
+# than 2, a zero or negative cell volume, a total volume other than 3 m3, a
+# non-finite value, a parse failure, a timeout, a process that does not
+# stop, a limit, or a value outside the tolerance gives one explicit
+# FAIL_<CAUSE> result and a failed job.
+# Nothing falls back to another command, field, time, region, or path.
+#
+# Output path (v2512 source): writeFile names the time folder from the Case
+# start time (writeFile.C, newFileAtStartTime), and the fixture control
+# dictionary starts from the latest time (Time.C, setControls). So the only
+# accepted output is postProcessing/m3MeanSpeed/<SELECTED_TIME>/
+# volFieldValue.dat. region0 adds no region folder (polyMesh.C, regionName).
+#
+# Time: the job limit is 10 minutes. Each cap is an absolute deadline from
+# the start of its operation, and the operation with its stop ends by it:
+# SIGTERM at the cap less 6 seconds, SIGKILL to the whole process group 5
+# seconds later, and a 1-second stop reserve for the last signal and the
+# check. No stop signal or check starts a new limit. A group that is not
+# empty at the cap gives FAIL_PROCESS_STOP. The package update and install
+# have 180 seconds. Each OpenFOAM command has 60 seconds, and the OpenFOAM
+# commands have 240 seconds together. The fixture setup, the evidence
+# collection, the package, and the cleanup have 30 seconds each, 120 seconds
+# together. The active work ends 290 seconds after the clock starts, and the
+# install, setup, and OpenFOAM operations keep the evidence budget before
+# that deadline. The five step timeouts sum to 9 minutes
+# (1 + 5 + 1 + 1 + 1), so they are only final guards.
+#
+# Limits: each command log at most 1 MiB, all logs at most 8 MiB, and the
+# artifact at most 10 MiB. A log above a limit leaves the evidence with its
+# size and checksum, and the result fails. The artifact holds only text
+# evidence, dictionaries, checksums, and bounded logs: no mesh, field, VTU,
+# package, or Case archive.
+#
+# Every file is written inside one unique task directory under RUNNER_TEMP.
+# The last step removes only that directory, after the upload, and only when
+# no process of a recorded operation group and no process that uses the
+# directory remains.
+#
+# Root processes (PR #97 review 5453307998): the install runs the repository
+# script and apt-get as root through sudo, and the runner user may not
+# signal a root process. So the stop signals of the install group go through
+# sudo -n kill -<signal> -- -<group>, inside the deadline of the install
+# (PR #97 reviews 5454383774 and 5455232932), and every process check reads
+# /proc: kill -0 fails with EPERM for a root process, and that is not an
+# empty group. The scan for processes that use the task directory runs as
+# root through sudo -n. A refused, incomplete, or slow scan keeps the
+# directory.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: The exact main commit SHA of the Architect execution admission
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: OpenFOAM v2512 two-cell mean-speed validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. The clock and the unique task directory. The early result keeps an
+      #    explicit failure in the upload if the validation step does not run.
+      # ---------------------------------------------------------------------
+      - name: Start the validation clock
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          start="$(date +%s)"
+          root="$(mktemp -d "${RUNNER_TEMP}/m3-metric-validation.XXXXXXXX")"
+          task="${root}/m3-mean-speed-validation"
+          mkdir -p "${task}/case" "${task}/config" "${task}/logs" "${task}/evidence"
+          {
+            echo "METRIC_TASK_ROOT=${root}"
+            echo "METRIC_TASK_TEMP=${task}"
+            echo "METRIC_CLOCK_START=${start}"
+            echo "METRIC_ACTIVE_DEADLINE=$(( start + 290 ))"
+            echo "OPENFOAM_ROOT=/usr/lib/openfoam"
+          } >> "$GITHUB_ENV"
+          {
+            echo "METRIC_RESULT=FAIL_NOT_STARTED"
+            echo "METRIC_REASON=the validation step did not start"
+            echo "CLOCK_START=${start}"
+            echo "ACTIVE_DEADLINE=$(( start + 290 ))"
+          } > "${task}/evidence/result.env"
+          echo "task directory       : ${root}"
+          echo "clock start          : ${start}"
+          echo "active-work deadline : $(( start + 290 ))"
+
+      # ---------------------------------------------------------------------
+      # 2. The validation. The step writes one script into the task directory
+      #    and runs it. The step ends with status 0 only for PASS.
+      # ---------------------------------------------------------------------
+      - name: Run the metric validation
+        if: always()
+        timeout-minutes: 5
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: |
+          set -uo pipefail
+          script="${METRIC_TASK_ROOT:?the clock step did not publish the task directory}/validation.sh"
+          cat > "$script" <<'METRIC_VALIDATION'
+          set -uo pipefail
+
+          # ---- constants --------------------------------------------------
+
+          EXPECTED_REF="refs/heads/main"
+          PACKAGE="openfoam2512-default"
+          PACKAGE_VERSION="2512.0-2"
+          PROJECT_VERSION="v2512"
+          ARCHITECTURE="x86_64"
+          # The fixture: two hexahedral cells with volumes 1 and 2 m3 in the one flow
+          # region region0. The latest time 2 holds U = (3 4 0) and (-3 0 0) m/s. The
+          # earlier time 1 holds other values, so an earlier-time selection fails.
+          LATEST_TIME="2"
+          EARLIER_TIME="1"
+          REGION="region0"
+          CELL_COUNT=2
+          MIN_VOLUME=1
+          MAX_VOLUME=2
+          TOTAL_VOLUME=3
+          VOLUME_TOLERANCE=1e-9
+          # sum(V_i |U_i|) / sum(V_i) = (1 * 5 + 2 * 3) / 3 = 11/3 m/s.
+          EXPECTED_VALUE="11/3"
+          TOLERANCE=1e-6
+          # The SHA-256 of the generated fixture fields and of the generated metric
+          # dictionary. Any other byte stream fails closed.
+          EXPECTED_U_LATEST_SHA256="6c0d30e57137916312cba4f16bc603da82bb581a48d9c0f50b1001d1bb5d5820"
+          EXPECTED_U_EARLIER_SHA256="707f40153c57473ac0f6f9e3294a381d5a81bce4e60615f673cee4135afbf948"
+          EXPECTED_DICTIONARY_SHA256="ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef"
+          # Limits in seconds. A cap is an absolute deadline from the start of the
+          # operation: SIGTERM at the cap less KILL_GRACE and STOP_RESERVE, SIGKILL to
+          # the process group KILL_GRACE seconds later, and the stop and its check end
+          # by the cap.
+          KILL_GRACE=5
+          STOP_RESERVE=1
+          INSTALL_CAP=180
+          OPENFOAM_CAP=60
+          OPENFOAM_BUDGET=240
+          # Setup, evidence, package, and cleanup: 30 seconds each, 120 together.
+          PHASE_CAP=30
+          LOG_LIMIT=1048576
+          LOGS_LIMIT=8388608
+          ARTIFACT_LIMIT=10485760
+          ARCHIVE_NAME="m3-metric-validation-evidence.tar.gz"
+
+          TASK_ROOT="${METRIC_TASK_ROOT}"
+          TASK_TEMP="${METRIC_TASK_TEMP}"
+          SCRIPT="${TASK_ROOT}/validation.sh"
+          CASE_DIR="${TASK_TEMP}/case"
+          CONFIG_DIR="${TASK_TEMP}/config"
+          LOG_DIR="${TASK_TEMP}/logs"
+          EVIDENCE="${TASK_TEMP}/evidence"
+          UPLOAD="${TASK_ROOT}/upload"
+          EXCLUDED="${TASK_ROOT}/excluded"
+          SCRATCH="${TASK_ROOT}/scratch"
+          # The process group of each started operation, for the cleanup step.
+          GROUPS_FILE="${TASK_ROOT}/process-groups.tsv"
+
+          # The fixture files, relative to the task directory.
+          FIXTURE_FILES=(
+              case/system/controlDict
+              case/system/fvSchemes
+              case/system/fvSolution
+              case/constant/transportProperties
+              case/constant/turbulenceProperties
+              case/constant/polyMesh/points
+              case/constant/polyMesh/faces
+              case/constant/polyMesh/owner
+              case/constant/polyMesh/neighbour
+              case/constant/polyMesh/boundary
+              "case/${EARLIER_TIME}/p"
+              "case/${EARLIER_TIME}/U"
+              "case/${LATEST_TIME}/p"
+              "case/${LATEST_TIME}/U"
+              config/metric-functions
+          )
+          # The Case dictionaries that the evidence keeps. No mesh or field file is kept.
+          CASE_DICTIONARIES=(
+              case/system/controlDict
+              case/system/fvSchemes
+              case/system/fvSolution
+              case/constant/transportProperties
+              case/constant/turbulenceProperties
+          )
+          # The input files that the metric command must not change.
+          INPUT_FILES=(
+              "case/${LATEST_TIME}/U"
+              "case/${EARLIER_TIME}/U"
+              config/metric-functions
+          )
+          RESULT_KEYS=(
+              MAIN_SHA RUN_ID WORKFLOW_REF EXPECTED_MAIN_SHA_INPUT
+              INSTALLED_PACKAGE_VERSION LOADED_PROJECT_VERSION LOADED_WM_OPTIONS
+              SELECTED_TIME SELECTED_REGION
+              MESH_CELLS MESH_MIN_VOLUME MESH_MAX_VOLUME MESH_TOTAL_VOLUME CELL_VOLUMES MESH_CHECK
+              U_LATEST_SHA256 U_EARLIER_SHA256 DICTIONARY_BYTES DICTIONARY_SHA256 INPUTS_UNCHANGED
+              METRIC_VECTOR OUTPUT_PATH OUTPUT_BYTES OUTPUT_SHA256
+              OUTPUT_TIME OUTPUT_REGION OUTPUT_FIELD OUTPUT_CELLS OUTPUT_VOLUME OUTPUT_VALUE
+              EXPECTED_VALUE_DECIMAL ABSOLUTE_ERROR
+          )
+
+          SEQ=0
+          OP_CLASS=""
+          OP_STOP=""
+          INSTALL_USED=0
+          OPENFOAM_USED=0
+          SETUP_USED=0
+          EVIDENCE_USED=0
+          PACKAGE_USED=0
+          FINISHED=0
+          METRIC_RESULT=""
+          METRIC_REASON=""
+          METRIC_STOP_POINT="NONE"
+          for key in "${RESULT_KEYS[@]}"; do
+              printf -v "$key" '%s' UNAVAILABLE
+          done
+          NUMBER_RE='^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$'
+
+          # ---- result record ----------------------------------------------
+
+          write_result() {
+              local end key
+              end="$EPOCHSECONDS"
+              {
+                echo "METRIC_RESULT=${METRIC_RESULT:-FAIL_INTERNAL_ERROR}"
+                echo "METRIC_REASON=${METRIC_REASON:-no result was selected}"
+                echo "METRIC_STOP_POINT=${METRIC_STOP_POINT}"
+                for key in "${RESULT_KEYS[@]}"; do
+                    echo "${key}=${!key}"
+                done
+                echo "EXPECTED_VALUE=${EXPECTED_VALUE}"
+                echo "TOLERANCE=${TOLERANCE}"
+                echo "INSTALL_SECONDS=${INSTALL_USED}"
+                echo "OPENFOAM_SECONDS=${OPENFOAM_USED}"
+                echo "SETUP_SECONDS=${SETUP_USED}"
+                echo "EVIDENCE_SECONDS=${EVIDENCE_USED}"
+                echo "CLOCK_START=${METRIC_CLOCK_START}"
+                echo "ACTIVE_DEADLINE=${METRIC_ACTIVE_DEADLINE}"
+                echo "ACTIVE_END=${end}"
+                echo "ACTIVE_ELAPSED_SECONDS=$(( end - METRIC_CLOCK_START ))"
+              } > "${EVIDENCE}/result.env.tmp"
+              mv -f -- "${EVIDENCE}/result.env.tmp" "${EVIDENCE}/result.env"
+          }
+
+          # finish - write the result and end the run. Only PASS ends with status 0.
+          finish() {
+              FINISHED=1
+              write_result
+              echo "result: ${METRIC_RESULT}: ${METRIC_REASON}"
+              [[ "$METRIC_RESULT" == PASS ]] && exit 0
+              exit 1
+          }
+
+          # fail <cause> <reason> <stop-point> - fail closed. The first cause is the
+          # result. Nothing falls back to another command, time, region, field, or path.
+          fail() {
+              if [[ -z "$METRIC_RESULT" ]]; then
+                  METRIC_RESULT="FAIL_$1"
+                  METRIC_REASON="$2"
+                  METRIC_STOP_POINT="$3"
+              fi
+              echo "fail: $1: $2"
+              finish
+          }
+
+          identity() {
+              printf '%s=%s\n' "$1" "$2" >> "${EVIDENCE}/identity.txt"
+          }
+
+          # ---- the bounded operations -------------------------------------
+
+          # op_limit <class> <cap> - the hard limit in seconds of one operation: the
+          # smallest of the cap, the budget left in its class, and the time left before
+          # the active-work deadline. The install, setup, and OpenFOAM operations keep
+          # the evidence budget before that deadline. The package class has only its
+          # budget, because it runs in a later step.
+          op_limit() {
+              local class="$1" limit="$2" left now
+              now="$EPOCHSECONDS"
+              case "$class" in
+                  INSTALL) left=$(( INSTALL_CAP - INSTALL_USED )) ;;
+                  OPENFOAM) left=$(( OPENFOAM_BUDGET - OPENFOAM_USED )) ;;
+                  SETUP) left=$(( PHASE_CAP - SETUP_USED )) ;;
+                  EVIDENCE) left=$(( PHASE_CAP - EVIDENCE_USED )) ;;
+                  PACKAGE) left=$(( PHASE_CAP - PACKAGE_USED )) ;;
+                  *) left=0 ;;
+              esac
+              if (( left < limit )); then limit="$left"; fi
+              case "$class" in
+                  INSTALL|SETUP|OPENFOAM) left=$(( METRIC_ACTIVE_DEADLINE - now - (PHASE_CAP - EVIDENCE_USED) )) ;;
+                  EVIDENCE) left=$(( METRIC_ACTIVE_DEADLINE - now )) ;;
+                  *) left="$limit" ;;
+              esac
+              if (( left < limit )); then limit="$left"; fi
+              if (( limit < 0 )); then limit=0; fi
+              printf '%s\n' "$limit"
+          }
+
+          # charge <class> <seconds> - add the elapsed seconds of one operation to the
+          # budget of its class.
+          charge() {
+              case "$1" in
+                  INSTALL) INSTALL_USED=$(( INSTALL_USED + $2 )) ;;
+                  OPENFOAM) OPENFOAM_USED=$(( OPENFOAM_USED + $2 )) ;;
+                  SETUP) SETUP_USED=$(( SETUP_USED + $2 )) ;;
+                  EVIDENCE) EVIDENCE_USED=$(( EVIDENCE_USED + $2 )) ;;
+                  PACKAGE) PACKAGE_USED=$(( PACKAGE_USED + $2 )) ;;
+              esac
+          }
+
+          # now_ms - the time in milliseconds since the epoch.
+          now_ms() {
+              local t="${EPOCHREALTIME//[!0-9]/}"
+              printf '%s\n' "$(( 10#$t / 1000 ))"
+          }
+
+          # seconds_text <milliseconds> - a timeout duration in seconds, with three
+          # decimals.
+          seconds_text() {
+              printf '%d.%03d\n' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"
+          }
+
+          # bounded <label> <limit> <stdout> <stderr> <command> [args...] - run one
+          # command with standard input from /dev/null. The operation deadline is the
+          # start plus the limit. timeout makes a new process group, and its PID is
+          # the group ID. GROUPS_FILE records the group. The command gets SIGTERM at
+          # the deadline less KILL_GRACE and STOP_RESERVE, and SIGKILL KILL_GRACE
+          # seconds later. stop_operation_group then stops what remains of the group,
+          # and it ends by the same deadline. A group that is not empty at the
+          # deadline gives NOT_STOPPED. A limit at or below KILL_GRACE plus
+          # STOP_RESERVE starts nothing. Sets OP_STATUS, OP_OUTCOME (COMPLETED,
+          # FAILED, TIMEOUT, NOT_STOPPED, or NOT_STARTED), OP_START, OP_END, OP_LIMIT,
+          # OP_GROUP, and OP_STOP.
+          bounded() {
+              local label="$1" out="$3" err="$4" start term
+              OP_LIMIT="$2"
+              start="$(now_ms)"
+              OP_START=$(( start / 1000 ))
+              OP_GROUP="-"
+              OP_STOP=EMPTY
+              shift 4
+              term=$(( (OP_LIMIT - KILL_GRACE - STOP_RESERVE) * 1000 ))
+              if (( term <= 0 )); then
+                  OP_STATUS=124
+                  OP_OUTCOME=NOT_STARTED
+                  OP_END="$OP_START"
+                  echo "${label}: NOT_STARTED, limit ${OP_LIMIT} s"
+                  return 0
+              fi
+              timeout --kill-after="${KILL_GRACE}s" "$(seconds_text "$term")" "$@" > "$out" 2> "$err" < /dev/null &
+              OP_GROUP=$!
+              printf '%s\t%s\n' "$OP_GROUP" "$label" >> "$GROUPS_FILE"
+              wait "$OP_GROUP"
+              OP_STATUS=$?
+              stop_operation_group "$OP_GROUP" "$label" "$(( start + OP_LIMIT * 1000 ))"
+              OP_END="$EPOCHSECONDS"
+              case "$OP_STATUS" in
+                  0) OP_OUTCOME=COMPLETED ;;
+                  124|137) OP_OUTCOME=TIMEOUT ;;
+                  *) OP_OUTCOME=FAILED ;;
+              esac
+              if [[ "$OP_STOP" == NOT_STOPPED ]]; then
+                  OP_OUTCOME=NOT_STOPPED
+              fi
+          }
+
+          # group_members <group> - print the PID of each live process in one process
+          # group. Every /proc/<pid>/stat file is readable for every user, also for a
+          # root process, so the check does not depend on the permission to signal:
+          # kill -0 fails with EPERM for a root process. A zombie has stopped and is
+          # not listed. Returns 1 when the stat file of a listed process cannot be
+          # read, because the check is then not complete.
+          group_members() {
+              local file line rest state
+              for file in /proc/[0-9]*/stat; do
+                  if ! { read -r line < "$file"; } 2>/dev/null; then
+                      [[ -e "$file" ]] && return 1
+                      continue
+                  fi
+                  # After the command name: the state, the parent PID, the group ID.
+                  [[ "$line" == *" $1 "* ]] || continue
+                  rest="${line##*") "}"
+                  state="${rest%% *}"
+                  rest="${rest#* }"
+                  rest="${rest#* }"
+                  if [[ "${rest%% *}" == "$1" && "$state" != Z ]]; then
+                      printf '%s\n' "${file:6:-5}"
+                  fi
+              done
+              return 0
+          }
+
+          # group_empty <group> - status 0 only when the check is complete and the
+          # group has no live process.
+          group_empty() {
+              local members
+              members="$(group_members "$1")" || return 1
+              [[ -z "$members" ]]
+          }
+
+          # signal_group <signal> <group> <until> - send one signal to each process of
+          # one group. A group ID below 2 is refused: kill to -1 reaches every
+          # process, and kill to -0 reaches the group of the caller. The install runs
+          # root processes through sudo, and the runner user may not signal them, so
+          # each signal to the install group goes through sudo -n kill. That kill is
+          # the procps kill. It takes the first argument of the form -<number> or
+          # -<name> as the signal, also after --, so "kill -s TERM -- -58" fails for
+          # group 58 (PR #97 review 5455232932). The vector is therefore
+          # "kill -<signal> -- -<group>": the signal comes first, and the group stays
+          # the operand for each group ID. That helper ends by <until>, in
+          # milliseconds since the epoch: timeout stops it 200 milliseconds before
+          # <until> and kills it 100 milliseconds later. With less than 300
+          # milliseconds left, no helper starts. A refused, failed, or stopped signal
+          # is not an error here: the group check after the signal decides.
+          signal_group() {
+              local left
+              if [[ ! "$2" =~ ^[0-9]+$ ]] || (( 10#$2 < 2 )); then
+                  echo "refused: SIG$1 to process group '$2'"
+                  return 0
+              fi
+              if [[ "$OP_CLASS" == INSTALL ]]; then
+                  left=$(( $3 - $(now_ms) - 200 ))
+                  if (( left < 100 )); then
+                      echo "no time is left for sudo -n kill -s $1"
+                      return 0
+                  fi
+                  timeout --kill-after=0.1s "$(seconds_text "$left")" sudo -n kill "-$1" -- "-$2" \
+                      < /dev/null 2>&1 || true
+              else
+                  kill -s "$1" -- "-$2" 2>/dev/null || true
+              fi
+          }
+
+          # stop_operation_group <group> <label> <deadline> - stop each process that is
+          # still in the process group of one operation after timeout returns.
+          # <deadline> is the absolute end of the operation, in milliseconds since the
+          # epoch. timeout sends SIGKILL only while its direct child runs, and it may
+          # not signal a root process, so a descendant can remain after the direct
+          # child exits. Each remaining process gets SIGTERM, and SIGKILL at the kill
+          # time: the deadline less STOP_RESERVE, or KILL_GRACE seconds after an
+          # early return. The stop and its check end STOP_RESERVE seconds after the
+          # kill time, which is never after the deadline. Each signal helper gets only
+          # the time that is left before its point, so no step starts a new limit.
+          # Sets OP_STOP to EMPTY, STOPPED, or NOT_STOPPED, and returns 1 for
+          # NOT_STOPPED. Linux does not give a group ID to a new process while the
+          # group has a process, so no other process gets a signal.
+          stop_operation_group() {
+              local group="$1" label="$2" end="$3" kill_at now members
+              OP_STOP=EMPTY
+              group_empty "$group" && return 0
+              OP_STOP=STOPPED
+              now="$(now_ms)"
+              kill_at=$(( end - STOP_RESERVE * 1000 ))
+              if (( kill_at > now + KILL_GRACE * 1000 )); then
+                  kill_at=$(( now + KILL_GRACE * 1000 ))
+                  end=$(( kill_at + STOP_RESERVE * 1000 ))
+              fi
+              if (( now < kill_at )); then
+                  signal_group TERM "$group" "$kill_at"
+                  while (( $(now_ms) < kill_at )); do
+                      group_empty "$group" && return 0
+                      sleep 0.1
+                  done
+              fi
+              signal_group KILL "$group" "$end"
+              # The last check starts at least 150 milliseconds before the end.
+              while :; do
+                  if members="$(group_members "$group")" && [[ -z "$members" ]]; then
+                      echo "${label}: process group ${group} stopped with SIGKILL"
+                      return 0
+                  fi
+                  (( $(now_ms) + 150 < end )) || break
+                  sleep 0.1
+              done
+              OP_STOP=NOT_STOPPED
+              echo "${label}: process group ${group} did not stop by its deadline: $(tr '\n' ' ' <<< "$members")"
+              return 1
+          }
+
+          # run_op <label> <class> <cap> <command> [args...] - one bounded operation
+          # with its two logs in the log directory and one row in commands.tsv. The
+          # elapsed seconds count against the class budget. A log above LOG_LIMIT bytes
+          # leaves the evidence, and the outcome is OUTPUT_LIMIT. Sets OP_STDOUT,
+          # OP_STDERR, and OP_VECTOR.
+          run_op() {
+              local label="$1" class="$2" cap="$3" prefix limit log_ref
+              shift 3
+              SEQ=$(( SEQ + 1 ))
+              prefix="${LOG_DIR}/$(printf '%02d' "$SEQ")-${label}"
+              OP_STDOUT="${prefix}.stdout.log"
+              OP_STDERR="${prefix}.stderr.log"
+              OP_VECTOR="$(printf '%q ' "$@")"
+              OP_VECTOR="${OP_VECTOR% }"
+              limit="$(op_limit "$class" "$cap")"
+              OP_CLASS="$class"
+              bounded "$label" "$limit" "$OP_STDOUT" "$OP_STDERR" "$@"
+              OP_CLASS=""
+              charge "$class" "$(( OP_END - OP_START ))"
+              log_ref="-"
+              if [[ "$OP_OUTCOME" != NOT_STARTED ]]; then
+                  log_ref="${prefix#"${TASK_TEMP}/"}"
+                  log_limit "$OP_STDOUT"
+                  log_limit "$OP_STDERR"
+              fi
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$SEQ" "$label" "$class" "$cap" "$OP_LIMIT" \
+                  "$OP_START" "$OP_END" "$OP_STATUS" "$OP_OUTCOME" "$OP_GROUP" "$log_ref" "$OP_VECTOR" \
+                  >> "${EVIDENCE}/commands.tsv"
+              echo "${class} ${label}: ${OP_OUTCOME}, status ${OP_STATUS}, limit ${OP_LIMIT} s, $(( OP_END - OP_START )) s"
+          }
+
+          # log_limit <log> - a log above LOG_LIMIT bytes leaves the evidence. It is not
+          # cut. Its size and checksum stay in excluded.tsv, and OP_OUTCOME becomes
+          # OUTPUT_LIMIT, but NOT_STOPPED stays. The checksum is one bounded evidence
+          # operation. The values of the logged operation stay as they were.
+          log_limit() {
+              local file="$1" bytes sha=UNAVAILABLE saved
+              [[ -f "$file" ]] || return 0
+              bytes="$(stat -c %s -- "$file")"
+              (( bytes > LOG_LIMIT )) || return 0
+              mv -f -- "$file" "${EXCLUDED}/"
+              file="${EXCLUDED}/${file##*/}"
+              saved=("${OP_STATUS:-}" "${OP_START:-}" "${OP_END:-}" "${OP_LIMIT:-}" "${OP_GROUP:-}" "${OP_OUTCOME:-}")
+              bounded hash-excluded "$(op_limit EVIDENCE "$PHASE_CAP")" "${SCRATCH}/excluded-hash" /dev/null \
+                  sha256sum -- "$file"
+              charge EVIDENCE "$(( OP_END - OP_START ))"
+              if [[ "$OP_OUTCOME" == COMPLETED ]]; then
+                  IFS=' ' read -r sha _ < "${SCRATCH}/excluded-hash" || sha=UNAVAILABLE
+              fi
+              OP_STATUS="${saved[0]}" OP_START="${saved[1]}" OP_END="${saved[2]}" OP_LIMIT="${saved[3]}" OP_GROUP="${saved[4]}"
+              OP_OUTCOME=OUTPUT_LIMIT
+              if [[ "${saved[5]}" == NOT_STOPPED ]]; then
+                  OP_OUTCOME=NOT_STOPPED
+              fi
+              printf '%s\t%s\t%s\t%s\n' "logs/${file##*/}" "$bytes" "${sha:-UNAVAILABLE}" \
+                  "the log is above ${LOG_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
+          }
+
+          # require_op <label> <cause> <stop-point> - stop unless the last operation
+          # completed with status 0, kept its logs, and left no process.
+          require_op() {
+              case "$OP_OUTCOME" in
+                  COMPLETED) return 0 ;;
+                  NOT_STOPPED) fail PROCESS_STOP "process group ${OP_GROUP} of the $1 operation still had a process, or could not be checked, at the end of its ${OP_LIMIT}-second limit" "$3" ;;
+                  TIMEOUT) fail TIMEOUT "the $1 operation did not complete within its ${OP_LIMIT}-second limit" "$3" ;;
+                  NOT_STARTED) fail TIMEOUT "no time was left for the $1 operation" "$3" ;;
+                  OUTPUT_LIMIT) fail OUTPUT_LIMIT "a $1 log is above ${LOG_LIMIT} bytes" "$3" ;;
+                  *) fail "$2" "the $1 operation ended with status ${OP_STATUS}" "$3" ;;
+              esac
+          }
+
+          # ---- values -----------------------------------------------------
+
+          # manifest <output> <root> <path>... - one row for each regular file: the
+          # path, the byte count, and the SHA-256. The output appears only when every
+          # row is complete.
+          manifest() {
+              local output="$1" root="$2" path
+              shift 2
+              {
+                printf 'path\tbytes\tsha256\n'
+                for path in "$@"; do
+                    if [[ ! -f "${root}/${path}" || -L "${root}/${path}" ]]; then
+                        echo "not a regular file: ${path}" >&2
+                        return 1
+                    fi
+                    printf '%s\t%s\t%s\n' "$path" "$(stat -c %s -- "${root}/${path}")" \
+                        "$(sha256sum < "${root}/${path}" | cut -d' ' -f1)"
+                done
+              } > "${output}.tmp" || return 1
+              mv -f -- "${output}.tmp" "$output"
+          }
+
+          # manifest_value <manifest> <path> <bytes|sha256> - one value of one row.
+          manifest_value() {
+              local path bytes sha
+              while IFS=$'\t' read -r path bytes sha; do
+                  if [[ "$path" == "$2" ]]; then
+                      case "$3" in
+                          bytes) printf '%s' "$bytes" ;;
+                          sha256) printf '%s' "$sha" ;;
+                      esac
+                      return 0
+                  fi
+              done < "$1"
+          }
+
+          # read_values <prefix> <file> - set <prefix><KEY> for each KEY=value line.
+          read_values() {
+              local line key
+              while IFS= read -r line || [[ -n "$line" ]]; do
+                  key="${line%%=*}"
+                  [[ "$line" == *=* && "$key" =~ ^[A-Z_]+$ ]] || continue
+                  printf -v "${1}${key}" '%s' "${line#*=}"
+              done < "$2"
+          }
+
+          number() {
+              [[ "$1" =~ $NUMBER_RE ]]
+          }
+
+          non_finite() {
+              local value="${1,,}"
+              [[ "$value" =~ ^[-+]?(nan|inf|infinity)([(].*[)])?$ ]]
+          }
+
+          # within <value> <expected> <tolerance> - |value - expected| <= tolerance.
+          # <expected> is a constant expression of this script.
+          within() {
+              awk -v v="$1" -v t="$3" "BEGIN { d = (v + 0) - ($2); if (d < 0) d = -d; exit !(d <= t + 0) }"
+          }
+
+          positive() {
+              awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }'
+          }
+
+          # ---- parsers ----------------------------------------------------
+
+          # parse_check <log> - the cell count, the volume line, the zero or negative
+          # volume line, and the mesh result of one checkMesh log (v2512 checkTools.C
+          # printMeshStats and primitiveMeshCheck.C checkCellVolumes).
+          parse_check() {
+              awk '
+                  /^[ \t]*cells:[ \t]+[0-9]+[ \t]*$/ { cells_lines++; cells = $2 }
+                  /^[ \t]*Min volume = / {
+                      volume_lines++
+                      line = $0
+                      sub(/^[ \t]*Min volume = /, "", line)
+                      i = index(line, ". Max volume = ")
+                      if (i) { min = substr(line, 1, i - 1); line = substr(line, i + 15) } else format++
+                      i = index(line, ".  Total volume = ")
+                      if (i) { max = substr(line, 1, i - 1); line = substr(line, i + 18) } else format++
+                      i = index(line, ".  Cell volumes OK.")
+                      if (i) total = substr(line, 1, i - 1); else format++
+                  }
+                  /\*\*\*Zero or negative cell volume detected/ { negative++ }
+                  /^[ \t]*Mesh OK\.[ \t]*$/ { ok++ }
+                  /^[ \t]*Failed [0-9]+ mesh checks\.[ \t]*$/ { failed++; failed_checks = $2 }
+                  END {
+                      print "CELLS_LINES=" cells_lines + 0
+                      print "CELLS=" cells
+                      print "VOLUME_LINES=" volume_lines + 0
+                      print "VOLUME_FORMAT_ERRORS=" format + 0
+                      print "MIN_VOLUME=" min
+                      print "MAX_VOLUME=" max
+                      print "TOTAL_VOLUME=" total
+                      print "NEGATIVE_LINES=" negative + 0
+                      if (ok + failed != 1) print "MESH_CHECK=UNAVAILABLE"
+                      else if (ok) print "MESH_CHECK=MESH_OK"
+                      else print "MESH_CHECK=FAILED_" failed_checks
+                  }' "$1"
+          }
+
+          # parse_output <file> - the header and the value rows of one volFieldValue
+          # file (v2512 volRegion::writeFileHeader, volFieldValue::writeFileHeader, and
+          # volFieldValue::writeValues): "# Region : all region0", "# Cells : N",
+          # "# Volume : V", "# Time <tab> volAverage(m3MagU)", and one row of time and
+          # value.
+          parse_output() {
+              awk '
+                  function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+                  function after_colon(s) { sub(/^[^:]*:/, "", s); return trim(s) }
+                  /^#/ {
+                      if ($0 ~ /^#[ \t]*Region[ \t]*:/) { region_lines++; region = after_colon($0) }
+                      else if ($0 ~ /^#[ \t]*Cells[ \t]*:/) { cells_lines++; cells = after_colon($0) }
+                      else if ($0 ~ /^#[ \t]*Volume[ \t]*:/) { volume_lines++; volume = after_colon($0) }
+                      else if ($0 ~ /^#[ \t]*Time([ \t]|$)/) {
+                          time_lines++
+                          columns = $0
+                          sub(/^#[ \t]*Time/, "", columns)
+                          columns = trim(columns)
+                          gsub(/[ \t]+/, " ", columns)
+                      }
+                      next
+                  }
+                  /^[ \t]*$/ { next }
+                  { rows++; row_fields = NF; row_time = $1; row_value = $2 }
+                  END {
+                      words = split(region, part, /[ \t]+/)
+                      print "REGION_LINES=" region_lines + 0
+                      print "REGION_WORDS=" words
+                      print "REGION_TYPE=" part[1]
+                      print "REGION_NAME=" part[2]
+                      print "CELLS_LINES=" cells_lines + 0
+                      print "CELLS=" cells
+                      print "VOLUME_LINES=" volume_lines + 0
+                      print "VOLUME=" volume
+                      print "TIME_LINES=" time_lines + 0
+                      print "COLUMNS=" columns
+                      print "ROWS=" rows + 0
+                      print "ROW_FIELDS=" row_fields + 0
+                      print "ROW_TIME=" row_time
+                      print "ROW_VALUE=" row_value
+                  }' "$1"
+          }
+
+          # ---- the fixture ------------------------------------------------
+
+          # foam_header <class> <location> <object> - the FoamFile header that OpenFOAM
+          # requires before a dictionary or field (v2512 IOobjectReadHeader.C).
+          foam_header() {
+              printf 'FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       %s;\n' "$1"
+              if [[ -n "$2" ]]; then
+                  printf '    location    "%s";\n' "$2"
+              fi
+              printf '    object      %s;\n}\n\n' "$3"
+          }
+
+          # write_fixture - the synthetic two-cell Case and the metric dictionary. Cell
+          # 0 spans x 0..1 and cell 1 spans x 1..3, both with y and z 0..1, so the
+          # volumes are 1 and 2 m3. The internal face points from cell 0 to cell 1, and
+          # each boundary face points out of its cell. The control dictionary starts
+          # from the latest time, so the metric file is written under that time (v2512
+          # Time::setControls and writeFile::newFileAtStartTime). No Case 7 or other
+          # production data is used.
+          write_fixture() {
+              local case="$CASE_DIR" time
+              mkdir -p "${case}/system" "${case}/constant/polyMesh" "${case}/${EARLIER_TIME}" \
+                       "${case}/${LATEST_TIME}" "$CONFIG_DIR"
+
+              { foam_header dictionary system controlDict; cat <<'FIXTURE_FILE'; } > "${case}/system/controlDict"
+          application       simpleFoam;
+          startFrom         latestTime;
+          stopAt            endTime;
+          endTime           2;
+          deltaT            1;
+          writeControl      timeStep;
+          writeInterval     1;
+          purgeWrite        0;
+          writeFormat       ascii;
+          writePrecision    17;
+          writeCompression  off;
+          timeFormat        general;
+          timePrecision     6;
+          runTimeModifiable false;
+          FIXTURE_FILE
+
+              { foam_header dictionary system fvSchemes; cat <<'FIXTURE_FILE'; } > "${case}/system/fvSchemes"
+          ddtSchemes
+          {
+              default         steadyState;
+          }
+
+          gradSchemes
+          {
+              default         Gauss linear;
+          }
+
+          divSchemes
+          {
+              default         none;
+              div(phi,U)      bounded Gauss linear;
+              div((nuEff*dev2(T(grad(U))))) Gauss linear;
+          }
+
+          laplacianSchemes
+          {
+              default         Gauss linear corrected;
+          }
+
+          interpolationSchemes
+          {
+              default         linear;
+          }
+
+          snGradSchemes
+          {
+              default         corrected;
+          }
+          FIXTURE_FILE
+
+              { foam_header dictionary system fvSolution; cat <<'FIXTURE_FILE'; } > "${case}/system/fvSolution"
+          solvers
+          {
+              p
+              {
+                  solver          PCG;
+                  preconditioner  DIC;
+                  tolerance       1e-06;
+                  relTol          0.1;
+              }
+
+              U
+              {
+                  solver          smoothSolver;
+                  smoother        GaussSeidel;
+                  tolerance       1e-05;
+                  relTol          0.1;
+              }
+          }
+
+          SIMPLE
+          {
+              nNonOrthogonalCorrectors 0;
+              pRefCell        0;
+              pRefValue       0;
+          }
+
+          relaxationFactors
+          {
+              fields
+              {
+                  p               0.3;
+              }
+              equations
+              {
+                  U               0.7;
+              }
+          }
+          FIXTURE_FILE
+
+              { foam_header dictionary constant transportProperties; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/transportProperties"
+          transportModel  Newtonian;
+          nu              [0 2 -1 0 0 0 0] 1e-05;
+          FIXTURE_FILE
+
+              { foam_header dictionary constant turbulenceProperties; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/turbulenceProperties"
+          simulationType  laminar;
+          FIXTURE_FILE
+
+              { foam_header vectorField constant/polyMesh points; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/polyMesh/points"
+          12
+          (
+          (0 0 0)
+          (1 0 0)
+          (3 0 0)
+          (0 1 0)
+          (1 1 0)
+          (3 1 0)
+          (0 0 1)
+          (1 0 1)
+          (3 0 1)
+          (0 1 1)
+          (1 1 1)
+          (3 1 1)
+          )
+          FIXTURE_FILE
+
+              { foam_header faceList constant/polyMesh faces; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/polyMesh/faces"
+          11
+          (
+          4(1 4 10 7)
+          4(0 6 9 3)
+          4(0 1 7 6)
+          4(3 9 10 4)
+          4(0 3 4 1)
+          4(6 7 10 9)
+          4(2 5 11 8)
+          4(1 2 8 7)
+          4(4 10 11 5)
+          4(1 4 5 2)
+          4(7 8 11 10)
+          )
+          FIXTURE_FILE
+
+              { foam_header labelList constant/polyMesh owner; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/polyMesh/owner"
+          11
+          (
+          0
+          0
+          0
+          0
+          0
+          0
+          1
+          1
+          1
+          1
+          1
+          )
+          FIXTURE_FILE
+
+              { foam_header labelList constant/polyMesh neighbour; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/polyMesh/neighbour"
+          1
+          (
+          1
+          )
+          FIXTURE_FILE
+
+              { foam_header polyBoundaryMesh constant/polyMesh boundary; cat <<'FIXTURE_FILE'; } \
+                  > "${case}/constant/polyMesh/boundary"
+          1
+          (
+              outside
+              {
+                  type            patch;
+                  nFaces          10;
+                  startFace       1;
+              }
+          )
+          FIXTURE_FILE
+
+              for time in "$EARLIER_TIME" "$LATEST_TIME"; do
+                  { foam_header volScalarField "$time" p; cat <<'FIXTURE_FILE'; } > "${case}/${time}/p"
+          dimensions      [0 2 -2 0 0 0 0];
+
+          internalField   uniform 0;
+
+          boundaryField
+          {
+              outside
+              {
+                  type            zeroGradient;
+              }
+          }
+          FIXTURE_FILE
+              done
+
+              { foam_header volVectorField "$EARLIER_TIME" U; cat <<'FIXTURE_FILE'; } > "${case}/${EARLIER_TIME}/U"
+          dimensions      [0 1 -1 0 0 0 0];
+
+          internalField   nonuniform List<vector> 2((6 8 0) (0 0 9));
+
+          boundaryField
+          {
+              outside
+              {
+                  type            zeroGradient;
+              }
+          }
+          FIXTURE_FILE
+
+              { foam_header volVectorField "$LATEST_TIME" U; cat <<'FIXTURE_FILE'; } > "${case}/${LATEST_TIME}/U"
+          dimensions      [0 1 -1 0 0 0 0];
+
+          internalField   nonuniform List<vector> 2((3 4 0) (-3 0 0));
+
+          boundaryField
+          {
+              outside
+              {
+                  type            zeroGradient;
+              }
+          }
+          FIXTURE_FILE
+
+              # The exact function block of the Architect contract (comment 6043302440).
+              { foam_header dictionary "" metric-functions; cat <<'FIXTURE_FILE'; } > "${CONFIG_DIR}/metric-functions"
+          functions
+          {
+              m3MagU
+              {
+                  type    mag;
+                  libs    (fieldFunctionObjects);
+                  field   U;
+                  result  m3MagU;
+              }
+
+              m3MeanSpeed
+              {
+                  type            volFieldValue;
+                  libs            (fieldFunctionObjects);
+                  fields           (m3MagU);
+                  operation        volAverage;
+                  regionType       all;
+                  region           region0;
+                  writeToFile      true;
+                  writeFields      false;
+                  writePrecision   17;
+                  log              true;
+              }
+          }
+          FIXTURE_FILE
+          }
+
+          # ---- 1. the dispatch gates --------------------------------------
+
+          gate_dispatch() {
+              MAIN_SHA="${GITHUB_SHA:-UNAVAILABLE}"
+              RUN_ID="${GITHUB_RUN_ID:-UNAVAILABLE}"
+              WORKFLOW_REF="${GITHUB_REF:-UNAVAILABLE}"
+              EXPECTED_MAIN_SHA_INPUT="${EXPECTED_MAIN_SHA:-UNAVAILABLE}"
+              identity MAIN_SHA "$MAIN_SHA"
+              identity RUN_ID "$RUN_ID"
+              identity WORKFLOW_REF "$WORKFLOW_REF"
+              identity EXPECTED_MAIN_SHA "$EXPECTED_MAIN_SHA_INPUT"
+              if [[ "${GITHUB_REF:-}" != "$EXPECTED_REF" ]]; then
+                  fail REF "the workflow ref is '${GITHUB_REF:-}', not ${EXPECTED_REF}" dispatch
+              fi
+              if [[ ! "${EXPECTED_MAIN_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+                  fail SHA "the input expected_main_sha '${EXPECTED_MAIN_SHA:-}' is not a full lower-case commit SHA" dispatch
+              fi
+              if [[ "$EXPECTED_MAIN_SHA" != "${GITHUB_SHA:-}" ]]; then
+                  fail SHA "the input expected_main_sha ${EXPECTED_MAIN_SHA} is not the workflow commit ${GITHUB_SHA:-UNAVAILABLE}" dispatch
+              fi
+          }
+
+          # ---- 2. installation and identity -------------------------------
+
+          install_package() {
+              run_op install INSTALL "$INSTALL_CAP" bash -c '
+                  set -euo pipefail
+                  curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends "$1"
+              ' _ "${PACKAGE}=${PACKAGE_VERSION}"
+              require_op install INSTALL install
+          }
+
+          check_identity() {
+              local bashrc="${OPENFOAM_ROOT}/openfoam2512/etc/bashrc" status command path
+              INSTALLED_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' "$PACKAGE" 2>/dev/null || true)"
+              identity PACKAGE "$PACKAGE"
+              identity PACKAGE_VERSION "${INSTALLED_PACKAGE_VERSION:-UNAVAILABLE}"
+              identity CORE_PACKAGE_VERSION "$(dpkg-query -W -f='${Version}' openfoam2512 2>/dev/null || echo UNAVAILABLE)"
+              if [[ "$INSTALLED_PACKAGE_VERSION" != "$PACKAGE_VERSION" ]]; then
+                  fail PACKAGE "the installed ${PACKAGE} version is '${INSTALLED_PACKAGE_VERSION}', not ${PACKAGE_VERSION}" identity
+              fi
+              identity ARCHITECTURE "$(uname -m 2>/dev/null || echo UNAVAILABLE)"
+              if [[ "$(uname -m 2>/dev/null)" != "$ARCHITECTURE" ]]; then
+                  fail ENVIRONMENT "the machine architecture is not ${ARCHITECTURE}" identity
+              fi
+              identity OS_IDENTITY "$( ( . /etc/os-release && printf '%s' "${PRETTY_NAME:-UNAVAILABLE}" ) 2>/dev/null || echo UNAVAILABLE)"
+              identity GCC_VERSION "$(gcc -dumpfullversion 2>/dev/null || echo UNAVAILABLE)"
+              identity OPENFOAM_BASHRC "$bashrc"
+              if [[ ! -f "$bashrc" ]]; then
+                  fail ENVIRONMENT "the OpenFOAM environment file is missing: ${bashrc}" identity
+              fi
+              set +u
+              # shellcheck disable=SC1090
+              source "$bashrc" > "${LOG_DIR}/00-environment.log" 2>&1
+              status=$?
+              set -u
+              LOADED_PROJECT_VERSION="${WM_PROJECT_VERSION:-UNAVAILABLE}"
+              LOADED_WM_OPTIONS="${WM_OPTIONS:-UNAVAILABLE}"
+              identity WM_PROJECT_VERSION "$LOADED_PROJECT_VERSION"
+              identity WM_OPTIONS "$LOADED_WM_OPTIONS"
+              identity WM_COMPILER "${WM_COMPILER:-UNAVAILABLE}"
+              log_limit "${LOG_DIR}/00-environment.log"
+              if [[ "${OP_OUTCOME:-}" == OUTPUT_LIMIT ]]; then
+                  fail OUTPUT_LIMIT "the environment log is above ${LOG_LIMIT} bytes" identity
+              fi
+              if (( status != 0 )) || [[ "$LOADED_PROJECT_VERSION" != "$PROJECT_VERSION" ]]; then
+                  fail ENVIRONMENT "the loaded environment is not ${PROJECT_VERSION}: source status ${status}, WM_PROJECT_VERSION '${LOADED_PROJECT_VERSION}'" identity
+              fi
+              if [[ "${WM_COMPILER:-}" != Gcc* ]]; then
+                  fail ENVIRONMENT "the OpenFOAM compiler is '${WM_COMPILER:-}', not GCC" identity
+              fi
+              for command in foamListTimes checkMesh simpleFoam; do
+                  path="$(command -v "$command" || true)"
+                  identity "PATH_${command}" "${path:-UNAVAILABLE}"
+                  if [[ "$path" != "${OPENFOAM_ROOT}/openfoam2512/"* ]]; then
+                      fail ENVIRONMENT "the ${command} command '${path}' is not in the installed openfoam2512 tree" identity
+                  fi
+              done
+          }
+
+          # ---- 3. the fixture ---------------------------------------------
+
+          setup_fixture() {
+              local path
+              run_op fixture SETUP "$PHASE_CAP" bash "$SCRIPT" fixture
+              require_op fixture SETUP setup
+              run_op fixture-manifest SETUP "$PHASE_CAP" bash "$SCRIPT" manifest \
+                  "${EVIDENCE}/fixture.tsv" "$TASK_TEMP" "${FIXTURE_FILES[@]}"
+              require_op fixture-manifest SETUP setup
+              U_LATEST_SHA256="$(manifest_value "${EVIDENCE}/fixture.tsv" "case/${LATEST_TIME}/U" sha256)"
+              U_EARLIER_SHA256="$(manifest_value "${EVIDENCE}/fixture.tsv" "case/${EARLIER_TIME}/U" sha256)"
+              DICTIONARY_BYTES="$(manifest_value "${EVIDENCE}/fixture.tsv" config/metric-functions bytes)"
+              DICTIONARY_SHA256="$(manifest_value "${EVIDENCE}/fixture.tsv" config/metric-functions sha256)"
+              if [[ "$U_LATEST_SHA256" != "$EXPECTED_U_LATEST_SHA256" ]]; then
+                  fail FIELD_HASH "the time ${LATEST_TIME} U has SHA-256 ${U_LATEST_SHA256}, not ${EXPECTED_U_LATEST_SHA256}" setup
+              fi
+              if [[ "$U_EARLIER_SHA256" != "$EXPECTED_U_EARLIER_SHA256" ]]; then
+                  fail FIELD_HASH "the time ${EARLIER_TIME} U has SHA-256 ${U_EARLIER_SHA256}, not ${EXPECTED_U_EARLIER_SHA256}" setup
+              fi
+              if [[ "$DICTIONARY_SHA256" != "$EXPECTED_DICTIONARY_SHA256" ]]; then
+                  fail SETUP "the metric dictionary has SHA-256 ${DICTIONARY_SHA256}, not ${EXPECTED_DICTIONARY_SHA256}" setup
+              fi
+              mkdir -p "${EVIDENCE}/dictionaries"
+              run_op copy-dictionaries SETUP "$PHASE_CAP" cp -- \
+                  "${CASE_DICTIONARIES[@]/#/${TASK_TEMP}/}" "${EVIDENCE}/dictionaries/"
+              require_op copy-dictionaries SETUP setup
+              for path in "${CASE_DICTIONARIES[@]}"; do
+                  [[ -f "${EVIDENCE}/dictionaries/${path##*/}" ]] ||
+                      fail SETUP "the dictionary copy of ${path} is missing" setup
+              done
+          }
+
+          # ---- 4. the latest time and the mesh ----------------------------
+
+          select_time() {
+              local line count=0 value=""
+              run_op foamListTimes OPENFOAM "$OPENFOAM_CAP" foamListTimes -case "$CASE_DIR" -latestTime
+              require_op foamListTimes COMMAND latest-time
+              while IFS= read -r line || [[ -n "$line" ]]; do
+                  [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+                  count=$(( count + 1 ))
+                  value="$line"
+              done < "$OP_STDOUT"
+              if (( count != 1 )); then
+                  fail PARSE "foamListTimes printed ${count} time lines, not one" latest-time
+              fi
+              value="${value#"${value%%[![:space:]]*}"}"
+              value="${value%"${value##*[![:space:]]}"}"
+              SELECTED_TIME="$value"
+              if [[ "$SELECTED_TIME" != "$LATEST_TIME" ]]; then
+                  fail TIME "the latest time is '${SELECTED_TIME}', not the fixture latest time ${LATEST_TIME}" latest-time
+              fi
+          }
+
+          check_mesh() {
+              local check_log value
+              run_op checkMesh OPENFOAM "$OPENFOAM_CAP" checkMesh -case "$CASE_DIR" -allGeometry -allTopology -time "$SELECTED_TIME"
+              require_op checkMesh COMMAND mesh
+              check_log="$OP_STDOUT"
+              run_op parse-checkMesh EVIDENCE "$PHASE_CAP" bash "$SCRIPT" parse-check "$check_log"
+              require_op parse-checkMesh EVIDENCE mesh
+              local C_CELLS_LINES="" C_CELLS="" C_VOLUME_LINES="" C_VOLUME_FORMAT_ERRORS="" C_MIN_VOLUME="" \
+                    C_MAX_VOLUME="" C_TOTAL_VOLUME="" C_NEGATIVE_LINES="" C_MESH_CHECK=""
+              read_values C_ "$OP_STDOUT"
+              MESH_CHECK="${C_MESH_CHECK:-UNAVAILABLE}"
+              if [[ "$C_CELLS_LINES" != 1 ]]; then
+                  fail PARSE "the checkMesh log has ${C_CELLS_LINES} cell-count lines, not one" mesh
+              fi
+              MESH_CELLS="$C_CELLS"
+              if [[ "$C_CELLS" != "$CELL_COUNT" ]]; then
+                  fail CELL_COUNT "checkMesh reports ${C_CELLS} cells, not ${CELL_COUNT}" mesh
+              fi
+              if [[ "$C_NEGATIVE_LINES" != 0 ]]; then
+                  fail CELL_VOLUME "checkMesh reports a zero or negative cell volume" mesh
+              fi
+              if [[ "$C_VOLUME_LINES" != 1 || "$C_VOLUME_FORMAT_ERRORS" != 0 ]]; then
+                  fail PARSE "the checkMesh log has no single complete cell-volume line" mesh
+              fi
+              MESH_MIN_VOLUME="$C_MIN_VOLUME"
+              MESH_MAX_VOLUME="$C_MAX_VOLUME"
+              MESH_TOTAL_VOLUME="$C_TOTAL_VOLUME"
+              for value in "$C_MIN_VOLUME" "$C_MAX_VOLUME" "$C_TOTAL_VOLUME"; do
+                  if non_finite "$value"; then
+                      fail NON_FINITE "checkMesh reports the cell volume '${value}'" mesh
+                  fi
+                  number "$value" || fail PARSE "the checkMesh cell volume '${value}' is not a number" mesh
+              done
+              if ! positive "$C_MIN_VOLUME"; then
+                  fail CELL_VOLUME "the smallest cell volume ${C_MIN_VOLUME} is zero or negative" mesh
+              fi
+              # Two cells: the smallest and the largest volume are the two cell volumes.
+              if ! within "$C_MIN_VOLUME" "$MIN_VOLUME" "$VOLUME_TOLERANCE" || \
+                 ! within "$C_MAX_VOLUME" "$MAX_VOLUME" "$VOLUME_TOLERANCE"; then
+                  fail CELL_VOLUME "the cell volumes are ${C_MIN_VOLUME} and ${C_MAX_VOLUME} m3, not ${MIN_VOLUME} and ${MAX_VOLUME}" mesh
+              fi
+              CELL_VOLUMES="${C_MIN_VOLUME} ${C_MAX_VOLUME}"
+              if ! within "$C_TOTAL_VOLUME" "$TOTAL_VOLUME" "$VOLUME_TOLERANCE"; then
+                  fail TOTAL_VOLUME "the total volume is ${C_TOTAL_VOLUME} m3, not ${TOTAL_VOLUME}" mesh
+              fi
+          }
+
+          # ---- 5. the inputs before and after the metric command ----------
+
+          check_inputs() {
+              local point="$1" stage="$2" record="${EVIDENCE}/inputs-$2.tsv" path sha
+              for path in "${INPUT_FILES[@]}"; do
+                  if [[ ! -f "${TASK_TEMP}/${path}" || -L "${TASK_TEMP}/${path}" ]]; then
+                      case "$path" in
+                          */U) fail MISSING_U "${path} is missing or is not a regular file ${stage} the metric command" "$point" ;;
+                          *) fail SETUP "${path} is missing or is not a regular file ${stage} the metric command" "$point" ;;
+                      esac
+                  fi
+              done
+              run_op "hash-inputs-${stage}" EVIDENCE "$PHASE_CAP" bash "$SCRIPT" manifest "$record" "$TASK_TEMP" "${INPUT_FILES[@]}"
+              require_op "hash-inputs-${stage}" EVIDENCE "$point"
+              for path in "${INPUT_FILES[@]}"; do
+                  sha="$(manifest_value "$record" "$path" sha256)"
+                  case "$path" in
+                      "case/${LATEST_TIME}/U") [[ "$sha" == "$EXPECTED_U_LATEST_SHA256" ]] ;;
+                      "case/${EARLIER_TIME}/U") [[ "$sha" == "$EXPECTED_U_EARLIER_SHA256" ]] ;;
+                      *) [[ "$sha" == "$EXPECTED_DICTIONARY_SHA256" ]] ;;
+                  esac || fail FIELD_HASH "${path} has SHA-256 ${sha} ${stage} the metric command, not the fixture checksum" "$point"
+              done
+              if [[ "$stage" == after ]]; then
+                  INPUTS_UNCHANGED=YES
+              fi
+          }
+
+          # ---- 6. the metric command --------------------------------------
+
+          run_metric() {
+              if [[ -e "${CASE_DIR}/postProcessing" || -L "${CASE_DIR}/postProcessing" ]]; then
+                  fail OUTPUT_DUPLICATE "postProcessing exists before the metric command" metric
+              fi
+              # The exact command of the Architect contract. No other command, time,
+              # region, field, or dictionary is tried.
+              run_op metric OPENFOAM "$OPENFOAM_CAP" \
+                  simpleFoam -case "$CASE_DIR" -postProcess -time "$SELECTED_TIME" -fields '(U)' -dict "$TASK_TEMP/config/metric-functions"
+              METRIC_VECTOR="$OP_VECTOR"
+              require_op metric COMMAND metric
+          }
+
+          # ---- 7. the output ----------------------------------------------
+
+          check_output() {
+              local expected="m3MeanSpeed/${SELECTED_TIME}/volFieldValue.dat" type bytes path found=0 others="" copy
+              OUTPUT_PATH="postProcessing/${expected}"
+              if [[ ! -d "${CASE_DIR}/postProcessing" || -L "${CASE_DIR}/postProcessing" ]]; then
+                  fail OUTPUT_MISSING "the metric command wrote no postProcessing directory" output
+              fi
+              run_op list-output EVIDENCE "$PHASE_CAP" find "${CASE_DIR}/postProcessing" -mindepth 1 -printf '%y\t%s\t%P\n'
+              require_op list-output EVIDENCE output
+              while IFS=$'\t' read -r type bytes path; do
+                  [[ "$type" == d ]] && continue
+                  if [[ "$path" == "$expected" && "$type" == f ]]; then
+                      found=1
+                      OUTPUT_BYTES="$bytes"
+                      continue
+                  fi
+                  case "$path" in
+                      m3MeanSpeed/*|volFieldValue*|*/volFieldValue*) others="${others} ${path}" ;;
+                  esac
+              done < "$OP_STDOUT"
+              if (( found == 0 )); then
+                  fail OUTPUT_MISSING "the exact output ${OUTPUT_PATH} is missing or is not a regular file" output
+              fi
+              if [[ -n "$others" ]]; then
+                  fail OUTPUT_DUPLICATE "other metric output exists:${others}" output
+              fi
+              if (( OUTPUT_BYTES > LOG_LIMIT )); then
+                  fail OUTPUT_LIMIT "the output has ${OUTPUT_BYTES} bytes, above ${LOG_LIMIT}" output
+              fi
+              # The copy appears in the evidence only when cp completes.
+              copy="${SCRATCH}/volFieldValue.dat"
+              run_op copy-output EVIDENCE "$PHASE_CAP" cp -- "${CASE_DIR}/${OUTPUT_PATH}" "$copy"
+              require_op copy-output EVIDENCE output
+              mkdir -p "${EVIDENCE}/output"
+              mv -f -- "$copy" "${EVIDENCE}/output/volFieldValue.dat"
+              run_op hash-output EVIDENCE "$PHASE_CAP" bash "$SCRIPT" manifest "${EVIDENCE}/output.tsv" "$TASK_TEMP" \
+                  "case/${OUTPUT_PATH}" evidence/output/volFieldValue.dat
+              require_op hash-output EVIDENCE output
+              OUTPUT_SHA256="$(manifest_value "${EVIDENCE}/output.tsv" "case/${OUTPUT_PATH}" sha256)"
+              if [[ "$(manifest_value "${EVIDENCE}/output.tsv" evidence/output/volFieldValue.dat sha256)" != "$OUTPUT_SHA256" ]]; then
+                  fail EVIDENCE "the evidence copy of the output differs from the output" output
+              fi
+              run_op parse-output EVIDENCE "$PHASE_CAP" bash "$SCRIPT" parse-output "${EVIDENCE}/output/volFieldValue.dat"
+              require_op parse-output EVIDENCE output
+              check_values "$OP_STDOUT"
+          }
+
+          # check_values <parsed> - the explicit region, field, cells, volume, time, and
+          # finite value of the output, in this order.
+          check_values() {
+              local O_REGION_LINES="" O_REGION_WORDS="" O_REGION_TYPE="" O_REGION_NAME="" O_CELLS_LINES="" O_CELLS="" \
+                    O_VOLUME_LINES="" O_VOLUME="" O_TIME_LINES="" O_COLUMNS="" O_ROWS="" O_ROW_FIELDS="" O_ROW_TIME="" \
+                    O_ROW_VALUE=""
+              read_values O_ "$1"
+              if [[ "$O_ROWS" == 0 ]]; then
+                  fail OUTPUT_MISSING "the output has no value row" output
+              fi
+              if [[ "$O_ROWS" != 1 ]]; then
+                  fail OUTPUT_DUPLICATE "the output has ${O_ROWS} value rows, not one" output
+              fi
+              if [[ "$O_REGION_LINES" != 1 ]]; then
+                  fail PARSE "the output has ${O_REGION_LINES} region lines, not one" output
+              fi
+              OUTPUT_REGION="${O_REGION_TYPE} ${O_REGION_NAME}"
+              if [[ "$O_REGION_WORDS" != 2 || "$O_REGION_TYPE" != all || "$O_REGION_NAME" != "$REGION" ]]; then
+                  fail REGION "the output region is not 'all ${REGION}'" output
+              fi
+              SELECTED_REGION="$O_REGION_NAME"
+              if [[ "$O_TIME_LINES" != 1 ]]; then
+                  fail PARSE "the output has ${O_TIME_LINES} column lines, not one" output
+              fi
+              OUTPUT_FIELD="$O_COLUMNS"
+              if [[ "$O_COLUMNS" != "volAverage(m3MagU)" ]]; then
+                  fail PARSE "the output columns are '${O_COLUMNS}', not 'volAverage(m3MagU)'" output
+              fi
+              if [[ "$O_CELLS_LINES" != 1 || ! "$O_CELLS" =~ ^[0-9]+$ ]]; then
+                  fail PARSE "the output has no single integer cell count" output
+              fi
+              OUTPUT_CELLS="$O_CELLS"
+              if [[ "$O_CELLS" != "$CELL_COUNT" ]]; then
+                  fail CELL_COUNT "the output reports ${O_CELLS} cells, not ${CELL_COUNT}" output
+              fi
+              if [[ "$O_VOLUME_LINES" != 1 ]]; then
+                  fail PARSE "the output has ${O_VOLUME_LINES} volume lines, not one" output
+              fi
+              OUTPUT_VOLUME="$O_VOLUME"
+              if non_finite "$O_VOLUME"; then
+                  fail NON_FINITE "the output volume is '${O_VOLUME}'" output
+              fi
+              number "$O_VOLUME" || fail PARSE "the output volume '${O_VOLUME}' is not a number" output
+              if ! positive "$O_VOLUME"; then
+                  fail CELL_VOLUME "the output volume ${O_VOLUME} is zero or negative" output
+              fi
+              if ! within "$O_VOLUME" "$TOTAL_VOLUME" "$VOLUME_TOLERANCE"; then
+                  fail TOTAL_VOLUME "the output volume is ${O_VOLUME} m3, not ${TOTAL_VOLUME}" output
+              fi
+              if [[ "$O_ROW_FIELDS" != 2 ]]; then
+                  fail PARSE "the value row has ${O_ROW_FIELDS} fields, not a time and a value" output
+              fi
+              OUTPUT_TIME="$O_ROW_TIME"
+              number "$O_ROW_TIME" || fail PARSE "the output time '${O_ROW_TIME}' is not a number" output
+              if ! within "$O_ROW_TIME" "$SELECTED_TIME" 0; then
+                  fail TIME "the output time is ${O_ROW_TIME}, not ${SELECTED_TIME}" output
+              fi
+              OUTPUT_VALUE="$O_ROW_VALUE"
+              if non_finite "$O_ROW_VALUE"; then
+                  fail NON_FINITE "the output value is '${O_ROW_VALUE}'" output
+              fi
+              number "$O_ROW_VALUE" || fail PARSE "the output value '${O_ROW_VALUE}' is not a number" output
+              ABSOLUTE_ERROR="$(awk -v v="$O_ROW_VALUE" "BEGIN { d = (v + 0) - (${EXPECTED_VALUE}); if (d < 0) d = -d; printf \"%.17g\", d }")"
+              if ! within "$O_ROW_VALUE" "$EXPECTED_VALUE" "$TOLERANCE"; then
+                  fail TOLERANCE "the mean speed ${O_ROW_VALUE} m/s differs from ${EXPECTED_VALUE} by ${ABSOLUTE_ERROR}, above ${TOLERANCE}" output
+              fi
+          }
+
+          # ---- the run ----------------------------------------------------
+
+          main_run() {
+              mkdir -p "$CASE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$EVIDENCE" "$EXCLUDED" "$SCRATCH"
+              : > "${EVIDENCE}/identity.txt"
+              printf 'seq\tlabel\tclass\tcap_seconds\tlimit_seconds\tstart\tend\tstatus\toutcome\tgroup\tlog\tvector\n' \
+                  > "${EVIDENCE}/commands.tsv"
+              printf 'path\tbytes\tsha256\treason\n' > "${EVIDENCE}/excluded.tsv"
+              trap 'if (( FINISHED == 0 )); then
+                        METRIC_RESULT="${METRIC_RESULT:-FAIL_INTERNAL_ERROR}"
+                        METRIC_REASON="${METRIC_REASON:-the validation script ended before its result}"
+                        write_result
+                    fi' EXIT
+              cd "$TASK_TEMP" || fail INTERNAL_ERROR "the task directory is not available" start
+              EXPECTED_VALUE_DECIMAL="$(awk "BEGIN { printf \"%.17g\", ${EXPECTED_VALUE} }")"
+
+              gate_dispatch
+              install_package
+              check_identity
+              setup_fixture
+              select_time
+              check_mesh
+              check_inputs inputs before
+              run_metric
+              check_inputs output after
+              check_output
+              METRIC_RESULT=PASS
+              METRIC_REASON="the exact v2512 command gives ${OUTPUT_VALUE} m/s at time ${SELECTED_TIME} in ${SELECTED_REGION} for ${MESH_CELLS} cells and ${MESH_TOTAL_VOLUME} m3; the absolute error is ${ABSOLUTE_ERROR}, within ${TOLERANCE}; this is not a Case 7 result and does not accept M3"
+              finish
+          }
+
+          # ---- the package ------------------------------------------------
+
+          # result_value <file> <key> - one value of one result file.
+          result_value() {
+              awk -v key="$2" 'index($0, key "=") == 1 { v = substr($0, length(key) + 2) } END { print v }' "$1"
+          }
+
+          # set_value <file> <key> <value> - replace or add one line of a result file.
+          set_value() {
+              awk -v key="$2" -v value="$3" '
+                  index($0, key "=") == 1 { if (!done) print key "=" value; done = 1; next }
+                  { print }
+                  END { if (!done) print key "=" value }' "$1" > "${1}.tmp"
+              mv -f -- "${1}.tmp" "$1"
+          }
+
+          # limit_result <file> <cause> <reason> - a PASS cannot stand without its
+          # evidence. Another FAIL result keeps its first cause.
+          limit_result() {
+              local prior
+              prior="$(result_value "$1" METRIC_RESULT)"
+              if [[ "$prior" == PASS ]]; then
+                  set_value "$1" METRIC_PRIOR_RESULT "$prior"
+                  set_value "$1" METRIC_RESULT "FAIL_$2"
+                  set_value "$1" METRIC_REASON "$3"
+              else
+                  set_value "$1" METRIC_LIMIT_NOTE "$3"
+              fi
+          }
+
+          # exclude <file> <reason> - move one log out of the evidence. Its size and
+          # checksum stay in excluded.tsv.
+          exclude() {
+              printf '%s\t%s\t%s\t%s\n' "${1#"${TASK_TEMP}/"}" "$(stat -c %s -- "$1")" \
+                  "$(sha256sum < "$1" | cut -d' ' -f1)" "$2" >> "${EVIDENCE}/excluded.tsv"
+              mv -f -- "$1" "${EXCLUDED}/"
+          }
+
+          write_inventory() {
+              {
+                printf 'kind\tbytes\tsha256\tpath\n'
+                find "${TASK_TEMP}/evidence" "${TASK_TEMP}/logs" "${TASK_TEMP}/config" -type f \
+                    ! -path "${EVIDENCE}/inventory.txt" -print0 | sort -z |
+                    while IFS= read -r -d '' file; do
+                        printf 'FILE\t%s\t%s\t%s\n' "$(stat -c %s -- "$file")" \
+                            "$(sha256sum < "$file" | cut -d' ' -f1)" "${file#"${TASK_TEMP}/"}"
+                    done
+                tail -n +2 "${EVIDENCE}/excluded.tsv" |
+                    while IFS=$'\t' read -r path bytes sha reason; do
+                        printf 'EXCLUDED\t%s\t%s\t%s\t%s\n' "$bytes" "$sha" "$path" "$reason"
+                    done
+              } > "${EVIDENCE}/inventory.txt"
+          }
+
+          # package_work - the log limits, the inventory, the archive, and the artifact
+          # limit. A log above LOG_LIMIT, or every log after the kept logs reach
+          # LOGS_LIMIT, leaves the evidence. The archive holds the evidence, the logs,
+          # and the metric dictionary: no mesh, field, VTU, package, or Case archive.
+          package_work() {
+              local result="${EVIDENCE}/result.env" file bytes total=0 excluded_before upload_bytes
+              mkdir -p "$EVIDENCE" "$LOG_DIR" "$CONFIG_DIR" "$EXCLUDED" "$UPLOAD"
+              if [[ ! -f "$result" ]]; then
+                  printf 'METRIC_RESULT=FAIL_NOT_STARTED\nMETRIC_REASON=no result file was written\n' > "$result"
+              fi
+              [[ -f "${EVIDENCE}/excluded.tsv" ]] || printf 'path\tbytes\tsha256\treason\n' > "${EVIDENCE}/excluded.tsv"
+              excluded_before="$(wc -l < "${EVIDENCE}/excluded.tsv")"
+              while IFS= read -r -d '' file; do
+                  bytes="$(stat -c %s -- "$file")"
+                  if (( bytes > LOG_LIMIT )); then
+                      exclude "$file" "the log is above ${LOG_LIMIT} bytes"
+                  elif (( total + bytes > LOGS_LIMIT )); then
+                      exclude "$file" "the kept logs are above ${LOGS_LIMIT} bytes together"
+                  else
+                      total=$(( total + bytes ))
+                  fi
+              done < <(find "$LOG_DIR" -type f -print0 | sort -z)
+              if (( $(wc -l < "${EVIDENCE}/excluded.tsv") > 1 )); then
+                  limit_result "$result" OUTPUT_LIMIT "a log is above ${LOG_LIMIT} bytes, or the logs are above ${LOGS_LIMIT} bytes together"
+              fi
+              if (( $(wc -l < "${EVIDENCE}/excluded.tsv") > excluded_before )); then
+                  echo "the package excluded $(( $(wc -l < "${EVIDENCE}/excluded.tsv") - excluded_before )) logs"
+              fi
+              write_inventory
+              tar -czf "${UPLOAD}/${ARCHIVE_NAME}" -C "$TASK_TEMP" evidence logs config
+              cp -- "$result" "${EVIDENCE}/inventory.txt" "$UPLOAD/"
+              upload_bytes="$(( $(stat -c %s -- "${UPLOAD}/${ARCHIVE_NAME}") + $(stat -c %s -- "${UPLOAD}/result.env") \
+                                + $(stat -c %s -- "${UPLOAD}/inventory.txt") ))"
+              if (( upload_bytes > ARTIFACT_LIMIT )); then
+                  rm -f -- "${UPLOAD}/${ARCHIVE_NAME}"
+                  limit_result "$result" ARTIFACT_LIMIT "the artifact has ${upload_bytes} bytes, above ${ARTIFACT_LIMIT}; only the result, the inventory, and the reason are uploaded"
+                  rm -rf -- "${SCRATCH:?}/reduced"
+                  mkdir -p "${SCRATCH}/reduced/evidence"
+                  cp -- "$result" "${EVIDENCE}/inventory.txt" "${SCRATCH}/reduced/evidence/"
+                  printf 'The artifact had %s bytes, above the %s-byte limit.\n' "$upload_bytes" "$ARTIFACT_LIMIT" \
+                      > "${SCRATCH}/reduced/evidence/reason.txt"
+                  tar -czf "${UPLOAD}/${ARCHIVE_NAME}" -C "${SCRATCH}/reduced" evidence
+                  cp -- "$result" "${EVIDENCE}/inventory.txt" "$UPLOAD/"
+              fi
+              ls -l "$UPLOAD"
+              cat "${UPLOAD}/result.env"
+          }
+
+          # main_package - run package_work as one bounded operation with the package
+          # budget. If it does not complete, only the result and the reason are
+          # uploaded.
+          main_package() {
+              local result="${EVIDENCE}/result.env"
+              PACKAGE_USED=0
+              rm -rf -- "${UPLOAD:?}"
+              mkdir -p "$UPLOAD" "$EXCLUDED" "$SCRATCH"
+              OP_STDOUT="${SCRATCH}/package.stdout.log"
+              OP_STDERR="${SCRATCH}/package.stderr.log"
+              bounded package "$(op_limit PACKAGE "$PHASE_CAP")" "$OP_STDOUT" "$OP_STDERR" bash "$SCRIPT" package-work
+              charge PACKAGE "$(( OP_END - OP_START ))"
+              cat -- "$OP_STDOUT" "$OP_STDERR" 2>/dev/null
+              echo "package: ${OP_OUTCOME}, status ${OP_STATUS}, limit ${OP_LIMIT} s, ${PACKAGE_USED} s"
+              if [[ "$OP_OUTCOME" == COMPLETED && -f "${UPLOAD}/result.env" && -f "${UPLOAD}/${ARCHIVE_NAME}" ]]; then
+                  return 0
+              fi
+              rm -rf -- "${UPLOAD:?}"
+              mkdir -p "$UPLOAD"
+              if [[ -f "$result" ]]; then
+                  cp -- "$result" "${UPLOAD}/result.env"
+              else
+                  printf 'METRIC_RESULT=FAIL_NOT_STARTED\nMETRIC_REASON=no result file was written\n' > "${UPLOAD}/result.env"
+              fi
+              limit_result "${UPLOAD}/result.env" EVIDENCE_PACKAGE \
+                  "the evidence package ended with ${OP_OUTCOME} (status ${OP_STATUS}) within its ${OP_LIMIT}-second limit"
+              printf 'The evidence package ended with %s, status %s.\n' "$OP_OUTCOME" "$OP_STATUS" > "${UPLOAD}/reason.txt"
+              return 1
+          }
+
+          case "${1:-}" in
+              run) main_run ;;
+              fixture) set -e; write_fixture ;;
+              manifest) shift; manifest "$@" ;;
+              parse-check) parse_check "$2" ;;
+              parse-output) parse_output "$2" ;;
+              package) main_package ;;
+              package-work) package_work ;;
+              *) echo "usage: validation.sh run|package" >&2; exit 2 ;;
+          esac
+          METRIC_VALIDATION
+          if ! bash -n "$script"; then
+              echo "the validation script does not parse" >&2
+              {
+                echo "METRIC_RESULT=FAIL_INTERNAL_ERROR"
+                echo "METRIC_REASON=the validation script does not parse"
+              } > "${METRIC_TASK_TEMP}/evidence/result.env"
+              exit 1
+          fi
+          bash "$script" run
+
+      # ---------------------------------------------------------------------
+      # 3. The package. The log and artifact limits, the inventory, and one
+      #    archive, in one bounded operation of at most 30 seconds.
+      # ---------------------------------------------------------------------
+      - name: Package the validation evidence
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -uo pipefail
+          root="${METRIC_TASK_ROOT:?the clock step did not publish the task directory}"
+          if [[ ! -f "${root}/validation.sh" ]]; then
+              mkdir -p "${root}/upload"
+              {
+                echo "METRIC_RESULT=FAIL_INTERNAL_ERROR"
+                echo "METRIC_REASON=the validation script was not written"
+              } > "${root}/upload/result.env"
+              exit 1
+          fi
+          bash "${root}/validation.sh" package
+
+      - name: Upload the validation evidence
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-metric-validation-evidence
+          # Only the package: one archive, the result, and the inventory.
+          path: ${{ env.METRIC_TASK_ROOT }}/upload
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      # ---------------------------------------------------------------------
+      # 4. The cleanup and the summary, after the upload. The step removes
+      #    only the unique task directory, in at most 30 seconds, and ends
+      #    with status 0 only for PASS and a completed removal. The step runs
+      #    as bash -eo pipefail, so each expected non-zero status is caught.
+      #    The step sends no signal: it only checks the recorded groups and
+      #    the processes that use the directory, also the root processes.
+      # ---------------------------------------------------------------------
+      - name: Remove the task directory
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -uo pipefail
+          root="${METRIC_TASK_ROOT:-}"
+          task="${METRIC_TASK_TEMP:-}"
+          result_file="${root}/upload/result.env"
+          [[ -f "$result_file" ]] || result_file="${task}/evidence/result.env"
+          value() {
+              local v=""
+              if [[ -f "$result_file" ]]; then
+                  v="$(awk -v key="$1" 'index($0, key "=") == 1 { v = substr($0, length(key) + 2) } END { print v }' "$result_file")"
+              fi
+              printf '%s' "${v:-UNAVAILABLE}"
+          }
+          # group_active <group> - status 0 while /proc lists a live process of
+          # the group, or while a stat file cannot be read. Every /proc/<pid>/stat
+          # file is readable for every user, so the check does not depend on the
+          # permission to signal: kill -0 fails with EPERM for a root process.
+          group_active() {
+              local file line rest state
+              for file in /proc/[0-9]*/stat; do
+                  if ! { read -r line < "$file"; } 2>/dev/null; then
+                      if [[ -e "$file" ]]; then return 0; fi
+                      continue
+                  fi
+                  # After the command name: the state, the parent PID, the group ID.
+                  [[ "$line" == *" $1 "* ]] || continue
+                  rest="${line##*") "}"
+                  state="${rest%% *}"
+                  rest="${rest#* }"
+                  rest="${rest#* }"
+                  if [[ "${rest%% *}" == "$1" && "$state" != Z ]]; then
+                      return 0
+                  fi
+              done
+              return 1
+          }
+          # Every reported value is read before the removal.
+          declare -A shown=()
+          for key in METRIC_RESULT METRIC_REASON METRIC_PRIOR_RESULT METRIC_STOP_POINT MAIN_SHA \
+                     EXPECTED_MAIN_SHA_INPUT WORKFLOW_REF INSTALLED_PACKAGE_VERSION LOADED_PROJECT_VERSION \
+                     LOADED_WM_OPTIONS SELECTED_TIME SELECTED_REGION MESH_CELLS CELL_VOLUMES MESH_TOTAL_VOLUME \
+                     MESH_CHECK INPUTS_UNCHANGED OUTPUT_PATH OUTPUT_VALUE EXPECTED_VALUE_DECIMAL ABSOLUTE_ERROR \
+                     TOLERANCE INSTALL_SECONDS OPENFOAM_SECONDS SETUP_SECONDS EVIDENCE_SECONDS ACTIVE_ELAPSED_SECONDS; do
+              shown[$key]="$(value "$key")"
+          done
+          archive_bytes="$(stat -c %s -- "${root}/upload/m3-metric-validation-evidence.tar.gz" 2>/dev/null || echo UNAVAILABLE)"
+          groups=()
+          if [[ -f "${task}/evidence/commands.tsv" ]]; then
+              mapfile -t groups < <(awk -F '\t' 'NR > 1 && $10 ~ /^[0-9]+$/ { print $10 }' "${task}/evidence/commands.tsv")
+          fi
+          if [[ -f "${root}/process-groups.tsv" ]]; then
+              mapfile -t -O "${#groups[@]}" groups < <(awk -F '\t' '$1 ~ /^[0-9]+$/ { print $1 }' "${root}/process-groups.tsv")
+          fi
+
+          # Only the unique task directory under RUNNER_TEMP, and only when no
+          # process of a recorded operation group and no process with its
+          # working directory or an open file in the directory remains.
+          cleanup=NOT_RUN
+          name="${root#"${RUNNER_TEMP:-}/"}"
+          if [[ -z "${RUNNER_TEMP:-}" || "$name" == "$root" || ! "$name" =~ ^m3-metric-validation\.[A-Za-z0-9]{8}$ ]]; then
+              cleanup=REFUSED_UNEXPECTED_PATH
+          elif [[ ! -d "$root" || -L "$root" ]]; then
+              cleanup=REFUSED_NOT_A_DIRECTORY
+          fi
+          if [[ "$cleanup" == NOT_RUN ]]; then
+              active=""
+              for group in "${groups[@]}"; do
+                  if group_active "$group"; then
+                      active="${active} group ${group}"
+                  fi
+              done
+              # The users of the directory: a process with its working directory
+              # or an open file in it. The runner user may not read the /proc
+              # entries of a root process, so find runs as root through sudo -n,
+              # with a 5-second bound inside the 8-second bound of sudo. The last
+              # line gives the find status; no last line means that the scan did
+              # not run. A process that ends during the scan gives "No such file
+              # or directory" or "No such process" and is not a user. Any other
+              # message makes the check incomplete.
+              scan="$(timeout --kill-after=1s 8s sudo -n sh -c \
+                        'LC_ALL=C; export LC_ALL; exec 2>&1; timeout --kill-after=1s 5s find "$@"; echo "scan-status $?"' \
+                        scan /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \( -lname "$root" -o -lname "${root}/*" \) -print \
+                        < /dev/null)" && check=0 || check=$?
+              vanished="^([^ ]*/)?find: '/proc/[0-9]+/(cwd|fd)(/[0-9]+)?': (No such file or directory|No such process)$"
+              users=""
+              problems=""
+              scan_status=""
+              while IFS= read -r line; do
+                  [[ -n "$line" ]] || continue
+                  case "$line" in
+                      "scan-status "*) scan_status="${line#scan-status }" ;;
+                      /proc/*) users="${users} ${line}" ;;
+                      *)
+                          if [[ ! "$line" =~ $vanished ]]; then
+                              problems="${problems}${line}"$'\n'
+                          fi ;;
+                  esac
+              done <<< "$scan"
+              if [[ -n "$active" || -n "$users" ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_ACTIVE
+                  echo "processes remain:${active}${users}"
+              elif (( check == 124 || check == 137 )) || [[ "$scan_status" == 124 || "$scan_status" == 137 ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_TIMEOUT
+              elif [[ "$scan_status" != 0 && "$scan_status" != 1 ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_FAILED
+                  echo "the process scan did not complete: status ${check}, find status '${scan_status}'"
+              elif [[ -n "$problems" ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_INCOMPLETE
+                  echo "the process scan could not read every /proc entry; the first messages:"
+                  head -n 5 <<< "$problems"
+              else
+                  timeout --kill-after=5s 15s rm -rf -- "$root" && status=0 || status=$?
+                  if (( status == 0 )) && [[ ! -e "$root" ]]; then
+                      cleanup=REMOVED
+                  else
+                      cleanup="FAILED_STATUS_${status}"
+                  fi
+              fi
+          fi
+          echo "cleanup: ${cleanup}"
+          {
+            echo "## OpenFOAM v2512 two-cell mean-speed validation"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Result | \`${shown[METRIC_RESULT]}\` |"
+            echo "| Reason | ${shown[METRIC_REASON]} |"
+            echo "| Prior result | \`${shown[METRIC_PRIOR_RESULT]}\` |"
+            echo "| Stop point | \`${shown[METRIC_STOP_POINT]}\` |"
+            echo "| Main SHA | \`${shown[MAIN_SHA]}\` |"
+            echo "| Input expected_main_sha | \`${shown[EXPECTED_MAIN_SHA_INPUT]}\` |"
+            echo "| Ref | \`${shown[WORKFLOW_REF]}\` |"
+            echo "| Package version | \`${shown[INSTALLED_PACKAGE_VERSION]}\` |"
+            echo "| WM_PROJECT_VERSION | \`${shown[LOADED_PROJECT_VERSION]}\` |"
+            echo "| WM_OPTIONS | \`${shown[LOADED_WM_OPTIONS]}\` |"
+            echo "| Selected time | \`${shown[SELECTED_TIME]}\` |"
+            echo "| Region | \`${shown[SELECTED_REGION]}\` |"
+            echo "| Cells | ${shown[MESH_CELLS]} |"
+            echo "| Cell volumes (m3) | ${shown[CELL_VOLUMES]} |"
+            echo "| Total volume (m3) | ${shown[MESH_TOTAL_VOLUME]} |"
+            echo "| checkMesh result | \`${shown[MESH_CHECK]}\` |"
+            echo "| Inputs unchanged | \`${shown[INPUTS_UNCHANGED]}\` |"
+            echo "| Output | \`${shown[OUTPUT_PATH]}\` |"
+            echo "| Mean speed (m/s) | ${shown[OUTPUT_VALUE]} |"
+            echo "| Expected (m/s) | ${shown[EXPECTED_VALUE_DECIMAL]} |"
+            echo "| Absolute error | ${shown[ABSOLUTE_ERROR]} |"
+            echo "| Tolerance | ${shown[TOLERANCE]} |"
+            echo "| Install seconds | ${shown[INSTALL_SECONDS]} |"
+            echo "| OpenFOAM seconds | ${shown[OPENFOAM_SECONDS]} |"
+            echo "| Setup seconds | ${shown[SETUP_SECONDS]} |"
+            echo "| Evidence seconds | ${shown[EVIDENCE_SECONDS]} |"
+            echo "| Active elapsed seconds | ${shown[ACTIVE_ELAPSED_SECONDS]} |"
+            echo "| Archive bytes | ${archive_bytes} |"
+            echo "| Cleanup | \`${cleanup}\` |"
+            echo
+            echo "A passing fixture is not a Case 7 result and does not accept M3. The Architect reviews this evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${shown[METRIC_RESULT]}" != PASS || "$cleanup" != REMOVED ]]; then
+              exit 1
+          fi
