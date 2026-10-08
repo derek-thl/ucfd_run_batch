@@ -126,6 +126,12 @@
 # separate product, mesh, convergence, and PointData verdicts, and the
 # unchanged workflow interface.
 #
+# Checks S82 to S86 cover PR #98 review 5461418991: a failed log inventory or
+# log copy (F1), a transient file above the task byte limit (F2), an
+# incomplete process check before the removal (F3), a slow read of the
+# post-processing time record (F4), and a value or volume that does not
+# convert to a finite double (F5).
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4730,8 +4736,32 @@ CHECK_LOG
             printf '%s\n' "$!" > "$FAKE_ESCAPE"
         fi
         # FAKE_BIG_FILE=<bytes>: a sparse file of that apparent size in the Case.
+        # A writer that a file limit stops ends with the status of that stop.
         if [[ -n "${FAKE_BIG_FILE:-}" ]]; then
-            truncate -s "$FAKE_BIG_FILE" "${case_dir}/big.bin"
+            truncate -s "$FAKE_BIG_FILE" "${case_dir}/big.bin" || exit $?
+        fi
+        # FAKE_TRANSIENT_BYTES=<bytes>: a sparse file of that apparent size
+        # exists for a moment; the task bytes at that moment go to
+        # FAKE_TRANSIENT_RECORD.
+        if [[ -n "${FAKE_TRANSIENT_BYTES:-}" ]]; then
+            truncate -s "$FAKE_TRANSIENT_BYTES" "${case_dir}/transient.bin" || exit $?
+            du -sb -- "${case_dir%/case}" | cut -f 1 > "$FAKE_TRANSIENT_RECORD"
+            rm -f -- "${case_dir}/transient.bin"
+        fi
+        # FAKE_HIDDEN_USER=<file>: a process of the test user that leaves its
+        # group, keeps its working directory in the Case, and makes its /proc
+        # entries unreadable (PR_SET_DUMPABLE 0). Its PID goes to the file.
+        if [[ -n "${FAKE_HIDDEN_USER:-}" ]]; then
+            setsid python3 -c 'import ctypes, os, sys, time
+os.chdir(sys.argv[1])
+if ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(2)
+print(os.getpid(), flush=True)
+time.sleep(30)' "$case_dir" < /dev/null > "$FAKE_HIDDEN_USER" 2> /dev/null &
+            for (( wait_tick = 0; wait_tick < 200; wait_tick++ )); do
+                [[ -s "$FAKE_HIDDEN_USER" ]] && break
+                sleep 0.01
+            done
         fi
         start_from="$(awk '$1 == "startFrom" { sub(/;$/, "", $2); print $2 }' "${case_dir}/system/controlDict")"
         if [[ "$start_from" == latestTime ]]; then
@@ -6491,6 +6521,95 @@ s81_collect_keeps_the_workflow_interface() {
     done
 }
 
+s82_collect_failed_log_evidence_fails_closed() {
+    # F1: the log inventory or the log copy fails. The evidence is incomplete,
+    # so no value is accepted.
+    ab_collect_expect "S82 log inventory" COMMAND_FAILURE ab_collect_fail_log_sizes
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
+    ab_collect_expect "S82 log copy" COMMAND_FAILURE ab_collect_fail_log_copy
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
+}
+ab_collect_fail_log_sizes() { ab_fake_fail "$1" find '*m3-metric-collection.*/logs'; }
+ab_collect_fail_log_copy() { ab_fake_fail "$1" cp '*m3-mean-speed/logs/'; }
+
+s83_collect_task_bytes_stay_in_the_limit() {
+    local workspace observed
+    # F2: a file that would take the task directory above 4294967296 apparent
+    # bytes for a moment is stopped, so the task directory never holds it.
+    workspace="$(new_workspace s83_transient)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_TRANSIENT_BYTES=4294967297 \
+        FAKE_TRANSIENT_RECORD="${workspace}/observed_task_bytes" > /dev/null
+    observed="$(cat "${workspace}/observed_task_bytes" 2>/dev/null || true)"
+    if [[ "$observed" =~ ^[0-9]+$ ]] && (( observed > 4294967296 )); then
+        _fail "S83: the task directory must never hold more than 4294967296 bytes" "observed: ${observed}"
+    fi
+    assert_eq "RESOURCE_LIMIT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S83: a file above the task byte limit is RESOURCE_LIMIT"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S83: no value is accepted"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S83: the capture is incomplete"
+}
+
+s84_collect_cleanup_needs_a_complete_process_check() {
+    local workspace pid
+    # F3: a process check that cannot read a process of the test user keeps
+    # the task directory.
+    workspace="$(new_workspace s84_failed_scan)"
+    ab_collect_fixture "$workspace"
+    ab_fake_fail "$workspace" find '/proc/*'
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S84: a failed process check stops the removal"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: the refusal names the process check"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays after a failed process check"
+    workspace="$(new_workspace s84_hidden_user)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_HIDDEN_USER="${workspace}/hidden_user" > /dev/null
+    pid="$(cat "${workspace}/hidden_user" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        _fail "S84: the hidden process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+    fi
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S84: an unreadable process of the test user stops the removal"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: the refusal names the incomplete process check"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S84: no value is accepted"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays while the process check is incomplete"
+}
+
+s85_collect_time_record_read_is_bounded() {
+    local workspace start finish end used
+    # F4: a slow read of the post-processing time record stops in its limit,
+    # and the metric work ends by its absolute end.
+    workspace="$(new_workspace s85_slow_record)"
+    ab_collect_fixture "$workspace"
+    ab_fake_hang "$workspace" cat '*flow_latest_time.txt'
+    ab_fake_hang "$workspace" head '*flow_latest_time.txt'
+    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 45 ))" > /dev/null
+    ab_assert_fakes_stopped "$workspace" "S85"
+    assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S85: a slow time-record read is TIMEOUT"
+    start="$(ab_collect_value "$workspace" METRIC_START_MS)"
+    finish="$(ab_collect_value "$workspace" METRIC_FINISH_MS)"
+    end="$(ab_collect_value "$workspace" METRIC_END_MS)"
+    used="$(ab_collect_value "$workspace" WORK_USED_MS)"
+    [[ "$finish" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] && (( finish <= end )) ||
+        _fail "S85: the metric work ends by its absolute end" "finish: ${finish}, end: ${end}"
+    [[ "$used" =~ ^[0-9]+$ ]] && (( used >= 1000 )) ||
+        _fail "S85: the read counts against the work budget" "used: ${used} ms"
+    [[ "$start" =~ ^[0-9]+$ ]] || _fail "S85: the start is recorded"
+}
+
+s86_collect_value_and_volume_convert_to_finite_doubles() {
+    # F5: a token that does not convert to a finite double, and a volume that
+    # converts to zero.
+    ab_collect_expect "S86 speed 1e9999" NON_FINITE_VALUE - FAKE_VALUE=1e9999
+    ab_collect_expect "S86 volume 1e-9999" INVALID_VOLUME - FAKE_DAT_VOLUME=1e-9999
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -6590,6 +6709,11 @@ AB_OBSERVATIONS=(
     s79_collect_limits_stops_and_cleanup
     s80_collect_keeps_the_other_verdicts_separate
     s81_collect_keeps_the_workflow_interface
+    s82_collect_failed_log_evidence_fails_closed
+    s83_collect_task_bytes_stay_in_the_limit
+    s84_collect_cleanup_needs_a_complete_process_check
+    s85_collect_time_record_read_is_bounded
+    s86_collect_value_and_volume_convert_to_finite_doubles
 )
 
 # One observation runs in this process when the caller names it. The scenario
