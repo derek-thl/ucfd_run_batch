@@ -107,6 +107,14 @@
 # deadline, that the result is FAIL_PROCESS_STOP, and that each slow helper
 # stops.
 #
+# Check S71 covers PR #97 review 5455232932: the procps kill takes the first
+# argument of the form -<number> as the signal, also after --, so
+# "kill -s TERM -- -58" printed its usage and sent nothing. S71 runs the
+# install signal helper with the real external kill on a small group ID that
+# is also a signal number and that no process group uses: each call must
+# parse the group as the operand. S71 also proves that a group ID below 2 is
+# refused. That part uses a refusing fake sudo, so no kill runs.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -5515,8 +5523,8 @@ s68_metric_install_stop_reaches_root_processes() {
     assert_eq "TIMEOUT" "$(awk -F '\t' '$2 == "install" { print $9 }' "${task}/evidence/commands.tsv")" \
         "S68: the install row shows the timeout"
     calls="$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)"
-    assert_eq "sudo -n kill -s TERM -- -${group}
-sudo -n kill -s KILL -- -${group}" "$calls" "S68: SIGTERM, then SIGKILL, go to the install group through sudo"
+    assert_eq "sudo -n kill -TERM -- -${group}
+sudo -n kill -KILL -- -${group}" "$calls" "S68: SIGTERM, then SIGKILL, go to the install group through sudo"
     (( elapsed <= 15 )) || _fail "S68: the install stops at its 12-second limit" "elapsed: ${elapsed}"
     assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job fails for the timeout"
     assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup removes the task directory after the stop"
@@ -5723,7 +5731,7 @@ s70_metric_stop_ends_by_the_operation_deadline() {
     [[ "$row" =~ ^([0-9]+)\ ([0-9]+)\ NOT_STOPPED$ ]] && (( BASH_REMATCH[2] <= BASH_REMATCH[1] )) ||
         _fail "S70: the install with its stop ends by its limit" "limit, elapsed, outcome: ${row}"
     (( elapsed <= 13 )) || _fail "S70: the validation step ends at the 12-second install limit" "elapsed: ${elapsed}"
-    assert_contains "$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)" "sudo -n kill -s KILL -- -" \
+    assert_contains "$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)" "sudo -n kill -KILL -- -" \
         "S70: the SIGKILL helper starts before the deadline"
     while IFS= read -r pid; do
         if kill -0 "$pid" 2>/dev/null; then
@@ -5790,6 +5798,50 @@ s70_metric_stop_ends_by_the_operation_deadline() {
     assert_contains "$out" "outcome=TIMEOUT stop=STOPPED" "S70: the stop ends the TERM-ignoring child"
     (( elapsed >= 5500 && elapsed <= 6600 )) ||
         _fail "S70: the stop sends SIGKILL 1 second before the 7-second limit" "elapsed: ${elapsed} ms"
+}
+
+s71_metric_root_signal_vector_takes_a_small_group_id() {
+    local workspace library out calls candidate group probe=()
+    workspace="$(new_workspace s71_vector)"
+    ab_metric_fixture "$workspace"
+    library="$(ab_metric_library "$workspace")"
+    # A small group ID that is also a signal number, and that no process group
+    # of the host uses: kill -0 fails with ESRCH and sends no signal. Linux
+    # gives a PID below 300 only at boot, so no new process gets this ID.
+    group=""
+    for candidate in 58 34 15 9 3; do
+        if [[ "$(LC_ALL=C bash -c "kill -0 -- -${candidate}" 2>&1)" == *"No such process"* ]]; then
+            group="$candidate"
+            break
+        fi
+    done
+    [[ -n "$group" ]] || _fail "S71: the test host must have a free small process group ID"
+    probe=(PATH="${workspace}/fakebin:${PATH}" LC_ALL=C METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    # The install helper runs the real external kill through the fake sudo.
+    : > "${workspace}/calls.tsv"
+    out="$(env "${probe[@]}" bash -c "${library}
+        OP_CLASS=INSTALL
+        signal_group TERM ${group} \$(( \$(date +%s%3N) + 3000 ))
+        signal_group KILL ${group} \$(( \$(date +%s%3N) + 3000 ))" 2>&1 || true)"
+    calls="$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)"
+    assert_eq "sudo -n kill -TERM -- -${group}
+sudo -n kill -KILL -- -${group}" "$calls" "S71: the signal comes first, and the group is the operand"
+    assert_not_contains "$out" "Usage" "S71: the external kill accepts the vector"
+    assert_eq "2" "$(grep -c -- "(-${group}): No such process" <<< "$out")" \
+        "S71: each signal goes to the free group -${group}"
+    # A group ID below 2 is refused: kill to -1 reaches every process, and kill
+    # to -0 reaches the group of the caller. The fake sudo refuses, so no kill
+    # runs in this part.
+    : > "${workspace}/calls.tsv"
+    out="$(env "${probe[@]}" FAKE_SUDO=deny bash -c "${library}
+        OP_CLASS=INSTALL
+        signal_group TERM 1 \$(( \$(date +%s%3N) + 3000 ))
+        signal_group KILL 0 \$(( \$(date +%s%3N) + 3000 ))" 2>&1 || true)"
+    assert_eq "" "$(ab_metric_calls "$workspace" | grep -E '^sudo ' || true)" "S71: no signal helper starts for group 1 or 0"
+    assert_eq "2" "$(grep -c 'refused' <<< "$out")" "S71: each refusal is in the log"
 }
 
 # ---- the observation list ---------------------------------------------------
@@ -5880,6 +5932,7 @@ AB_OBSERVATIONS=(
     s68_metric_install_stop_reaches_root_processes
     s69_metric_process_checks_do_not_depend_on_permission
     s70_metric_stop_ends_by_the_operation_deadline
+    s71_metric_root_signal_vector_takes_a_small_group_id
 )
 
 # One observation runs in this process when the caller names it. The scenario
