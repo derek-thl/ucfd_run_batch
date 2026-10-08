@@ -100,6 +100,13 @@
 # EPERM, that an unreadable /proc entry, a refused sudo, or a slow scan keeps
 # the task directory, and that a complete scan removes it.
 #
+# Check S70 covers PR #97 review 5454383774: each privileged signal helper
+# could start a new limit, so a 12-second operation returned after 22
+# seconds. With a sudo that hangs, S70 proves that the run, the install with
+# its stop, and stop_operation_group alone end by the absolute operation
+# deadline, that the result is FAIL_PROCESS_STOP, and that each slow helper
+# stops.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4558,14 +4565,20 @@ case "$name" in
         # -n kill and the sudo -n sh process scan run. FAKE_SUDO=deny refuses
         # them, as sudo without root access does. FAKE_SUDO=user runs them
         # without root, so the /proc entries of root processes stay unreadable.
-        # By default the scan has the root view: the unreadable entries drop
-        # out, because no root process of the test host uses a test directory.
+        # FAKE_SUDO=slow hangs: it ignores SIGTERM, writes its PID, and runs
+        # nothing. By default the scan has the root view: the unreadable
+        # entries drop out, because no root process of the test host uses a
+        # test directory.
         [[ "${1:-}" == -n ]] && shift
         case "${1:-}" in
             kill|sh)
                 case "${FAKE_SUDO:-root}" in
                     deny) echo "sudo: a password is required" >&2; exit 1 ;;
                     user) exec "$@" ;;
+                    slow)
+                        printf '%s\n' "$$" >> "$METRIC_FAKE_PIDS"
+                        trap '' TERM
+                        exec sleep 300 ;;
                 esac
                 [[ "$1" == kill ]] && exec "$@"
                 "$@" | grep -v ': Permission denied$'
@@ -5449,7 +5462,7 @@ s67_metric_task_directory_and_cleanup() {
     done
 }
 
-# ---- S68 and S69: root processes and the process checks (PR #97) ------------
+# ---- S68 to S70: root processes and the process checks (PR #97) ------------
 #
 # The install runs the repository script and apt-get as root through sudo. The
 # runner user may not signal a root process, and kill -0 fails for it with
@@ -5686,6 +5699,71 @@ s69_metric_process_checks_do_not_depend_on_permission() {
     assert_contains "$summary" "| Cleanup | \`REMOVED\` |" "S69: the summary shows the removal"
 }
 
+s70_metric_stop_ends_by_the_operation_deadline() {
+    local workspace run elapsed task row child pid library out start sleeper group probe=()
+    # sudo hangs: each sudo -n kill helper ignores SIGTERM and sends no signal
+    # (review 5454383774). The helpers, the SIGKILL, and the check must end by
+    # the absolute deadline of the install, and the run fails closed.
+    workspace="$(new_workspace s70_slow_helper)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" FAKE_SUDO=slow \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    if [[ "$child" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$child" 2>/dev/null || true
+    else
+        _fail "S70: the install must start the TERM-ignoring child" "$(tail -n 5 "${workspace}/run.out")"
+    fi
+    task="$(ab_metric_task "$workspace")"
+    row="$(awk -F '\t' '$2 == "install" { print $5 " " ($7 - $6) " " $9 }' "${task}/evidence/commands.tsv")"
+    assert_eq "FAIL_PROCESS_STOP" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S70: a group that does not stop by its deadline is FAIL_PROCESS_STOP"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S70: the run stops at the install"
+    [[ "$row" =~ ^([0-9]+)\ ([0-9]+)\ NOT_STOPPED$ ]] && (( BASH_REMATCH[2] <= BASH_REMATCH[1] )) ||
+        _fail "S70: the install with its stop ends by its limit" "limit, elapsed, outcome: ${row}"
+    (( elapsed <= 13 )) || _fail "S70: the validation step ends at the 12-second install limit" "elapsed: ${elapsed}"
+    assert_contains "$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)" "sudo -n kill -s KILL -- -" \
+        "S70: the SIGKILL helper starts before the deadline"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S70: each slow helper must stop by the deadline" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    # stop_operation_group alone, for a live group of the test with a deadline
+    # 3 seconds ahead: it returns by the deadline although each helper hangs.
+    library="$(ab_metric_library "$workspace")"
+    : > "${workspace}/fake_pids"
+    probe=(PATH="${workspace}/fakebin:${PATH}" FAKE_SUDO=slow METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    setsid bash -c "trap '' TERM; exec sleep 300" < /dev/null > /dev/null 2>&1 &
+    sleeper=$!
+    sleep 0.2
+    group="$(ps -o pgid= -p "$sleeper" | tr -d ' ')"
+    start="$(date +%s%3N)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        OP_CLASS=INSTALL
+        stop_operation_group ${group} probe \$(( \$(date +%s%3N) + 3000 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    kill -KILL "$sleeper" 2>/dev/null || true
+    wait "$sleeper" 2>/dev/null || true
+    assert_contains "$out" "status=1" "S70: the probe group stays"
+    assert_contains "$out" "stop=NOT_STOPPED" "S70: the stop records NOT_STOPPED"
+    (( elapsed <= 4000 )) ||
+        _fail "S70: the stop ends by its absolute deadline although each helper hangs" \
+              "elapsed: ${elapsed} ms for a deadline 3000 ms after the probe start"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S70: each slow helper of the probe must stop by the deadline" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -5773,6 +5851,7 @@ AB_OBSERVATIONS=(
     s67_metric_task_directory_and_cleanup
     s68_metric_install_stop_reaches_root_processes
     s69_metric_process_checks_do_not_depend_on_permission
+    s70_metric_stop_ends_by_the_operation_deadline
 )
 
 # One observation runs in this process when the caller names it. The scenario
