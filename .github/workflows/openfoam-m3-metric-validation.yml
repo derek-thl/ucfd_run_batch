@@ -62,11 +62,12 @@ name: openfoam-m3-metric-validation
 # Root processes (PR #97 review 5453307998): the install runs the repository
 # script and apt-get as root through sudo, and the runner user may not
 # signal a root process. So the stop signals of the install group go through
-# sudo -n kill, inside the deadline of the install (PR #97 review
-# 5454383774), and every process check reads /proc: kill -0 fails with EPERM
-# for a root process, and that is not an empty group. The scan for processes
-# that use the task directory runs as root through sudo -n. A refused,
-# incomplete, or slow scan keeps the directory.
+# sudo -n kill -<signal> -- -<group>, inside the deadline of the install
+# (PR #97 reviews 5454383774 and 5455232932), and every process check reads
+# /proc: kill -0 fails with EPERM for a root process, and that is not an
+# empty group. The scan for processes that use the task directory runs as
+# root through sudo -n. A refused, incomplete, or slow scan keeps the
+# directory.
 
 on:
   workflow_dispatch:
@@ -431,22 +432,32 @@ jobs:
           }
 
           # signal_group <signal> <group> <until> - send one signal to each process of
-          # one group. The install runs root processes through sudo, and the runner
-          # user may not signal them, so each signal to the install group goes through
-          # sudo -n kill. That helper ends by <until>, in milliseconds since the
-          # epoch: timeout stops it 200 milliseconds before <until> and kills it 100
-          # milliseconds later. With less than 300 milliseconds left, no helper
-          # starts. A refused, failed, or stopped signal is not an error here: the
-          # group check after the signal decides.
+          # one group. A group ID below 2 is refused: kill to -1 reaches every
+          # process, and kill to -0 reaches the group of the caller. The install runs
+          # root processes through sudo, and the runner user may not signal them, so
+          # each signal to the install group goes through sudo -n kill. That kill is
+          # the procps kill. It takes the first argument of the form -<number> or
+          # -<name> as the signal, also after --, so "kill -s TERM -- -58" fails for
+          # group 58 (PR #97 review 5455232932). The vector is therefore
+          # "kill -<signal> -- -<group>": the signal comes first, and the group stays
+          # the operand for each group ID. That helper ends by <until>, in
+          # milliseconds since the epoch: timeout stops it 200 milliseconds before
+          # <until> and kills it 100 milliseconds later. With less than 300
+          # milliseconds left, no helper starts. A refused, failed, or stopped signal
+          # is not an error here: the group check after the signal decides.
           signal_group() {
               local left
+              if [[ ! "$2" =~ ^[0-9]+$ ]] || (( 10#$2 < 2 )); then
+                  echo "refused: SIG$1 to process group '$2'"
+                  return 0
+              fi
               if [[ "$OP_CLASS" == INSTALL ]]; then
                   left=$(( $3 - $(now_ms) - 200 ))
                   if (( left < 100 )); then
                       echo "no time is left for sudo -n kill -s $1"
                       return 0
                   fi
-                  timeout --kill-after=0.1s "$(seconds_text "$left")" sudo -n kill -s "$1" -- "-$2" \
+                  timeout --kill-after=0.1s "$(seconds_text "$left")" sudo -n kill "-$1" -- "-$2" \
                       < /dev/null 2>&1 || true
               else
                   kill -s "$1" -- "-$2" 2>/dev/null || true
