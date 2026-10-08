@@ -6212,14 +6212,23 @@ s74_collect_selects_only_the_recorded_latest_time() {
         ab_collect_expect "S74 ${label}" SOURCE_MISMATCH - "$label"
         ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 ${label}"
     done
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "is not a numeric time" \
+        "S74: a time that is not a number has its exact reason"
+    ab_collect_expect "S74 zero record" SOURCE_MISMATCH ab_collect_record_zero "FAKE_LIST_TIMES=0\n"
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 zero record"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "not a result time" \
+        "S74: time 0 is not a result time, also when the record names it"
     ab_collect_expect "S74 earlier record" SOURCE_MISMATCH ab_collect_record_earlier
     ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 earlier record"
     ab_collect_expect "S74 two-line record" SOURCE_MISMATCH ab_collect_record_two_lines
     ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 two-line record"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "time record is not one numeric time" \
+        "S74: a two-line record has its exact reason"
     ab_collect_expect "S74 selection failure" COMMAND_FAILURE - FAKE_FAIL=foamListTimes
     ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 selection failure"
 }
 ab_collect_record_earlier() { printf '1\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_zero() { printf '0\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
 ab_collect_record_two_lines() { printf '2\n2\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
 
 s75_collect_isolates_exact_input_bytes() {
@@ -6228,7 +6237,15 @@ s75_collect_isolates_exact_input_bytes() {
                  ab_collect_hard_link ab_collect_mesh_override ab_collect_unsafe_name; do
         ab_collect_expect "S75 ${setup#ab_collect_}" SOURCE_MISMATCH "$setup"
         ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 ${setup#ab_collect_}"
+        if [[ "$setup" == ab_collect_mesh_override ]]; then
+            assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "override" \
+                "S75: a mesh in the time directory has its exact reason"
+        fi
     done
+    ab_collect_expect "S75 changed copy" INPUT_CHANGED ab_collect_bad_copy
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 changed copy"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "before the calculation" \
+        "S75: a snapshot that differs from the source stops the work before the calculation"
     ab_collect_expect "S75 copy failure" COMMAND_FAILURE ab_collect_fail_copy
     ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 copy failure"
     ab_collect_expect "S75 changed source" INPUT_CHANGED - \
@@ -6250,6 +6267,19 @@ ab_collect_hard_link() { ln -- "$(ab_collect_flow "$1")/constant/polyMesh/points
 ab_collect_mesh_override() { mkdir -p "$(ab_collect_flow "$1")/2/polyMesh"; }
 ab_collect_unsafe_name() { printf 'x\n' > "$(ab_collect_flow "$1")/2/bad name"; }
 ab_collect_fail_copy() { ab_fake_fail "$1" cp '--parents'; }
+# ab_collect_bad_copy <workspace> - a cp that copies, and then changes one byte
+# of the snapshot U when it makes the snapshot.
+ab_collect_bad_copy() {
+    local real
+    real="$(command -v cp)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '%q "$@" || exit $?\n' "$real"
+        printf 'for argument in "$@"; do [[ "$argument" == --parents ]] && printf x >> "${@: -1}/2/U"; done\n'
+        printf 'exit 0\n'
+    } > "${1}/fakebin/cp"
+    chmod +x "${1}/fakebin/cp"
+}
 
 s76_collect_output_fails_closed() {
     local entry
@@ -6346,6 +6376,17 @@ s79_collect_limits_stops_and_cleanup() {
     [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S79: the task directory stays while a process uses it"
     # A failed removal.
     ab_collect_failed_removal
+    # A capture that stops before the metric work publishes UNAVAILABLE with
+    # NOT_COMPLETED, never AVAILABLE.
+    workspace="$(new_workspace s79_not_reached)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" LIB="${workspace}/missing-library.sh" > /dev/null
+    assert_eq "FAILED" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S79: the capture work does not run"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "S79: no metric after a stopped capture"
+    assert_eq "NOT_COMPLETED" "$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S79: a capture that stops before the metric work gives NOT_COMPLETED"
+    assert_contains "$(ab_collect_summary "$workspace")" "| Mean speed | \`UNAVAILABLE\` |" \
+        "S79: the summary shows the stopped metric"
     # A process group that the stop cannot empty: kill -0 fails with EPERM, and
     # the stop says NOT_STOPPED by its deadline. NOT_STOPPED is a process-stop
     # failure.
