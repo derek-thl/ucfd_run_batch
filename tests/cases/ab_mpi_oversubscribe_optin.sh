@@ -5479,7 +5479,7 @@ ab_metric_foreign_group() {
 }
 
 s68_metric_install_stop_reaches_root_processes() {
-    local workspace run elapsed task group child calls status alive summary
+    local workspace run elapsed task group child calls status alive summary library out outcome probe=()
     # sudo is available: SIGTERM, then SIGKILL at the limit, both to the
     # recorded install group through sudo -n kill.
     workspace="$(new_workspace s68_root_stop)"
@@ -5538,10 +5538,28 @@ sudo -n kill -s KILL -- -${group}" "$calls" "S68: SIGTERM, then SIGKILL, go to t
     sleep 0.2
     assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job still fails after the child stops"
     assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup then removes the task directory"
+    # A log above the limit does not hide a process that did not stop.
+    library="$(ab_metric_library "$workspace")"
+    probe=(METRIC_TASK_ROOT="${workspace}/probe" METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation"
+           METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 100 ))")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation/logs" "${workspace}/probe/m3-mean-speed-validation/evidence" \
+             "${workspace}/probe/excluded" "${workspace}/probe/scratch"
+    for outcome in NOT_STOPPED COMPLETED; do
+        head -c 1048577 /dev/zero > "${workspace}/probe/m3-mean-speed-validation/logs/01-probe.stdout.log"
+        out="$(env "${probe[@]}" bash -c "${library}
+            OP_OUTCOME=${outcome}
+            log_limit '${workspace}/probe/m3-mean-speed-validation/logs/01-probe.stdout.log'
+            echo outcome=\${OP_OUTCOME}" 2>&1 || true)"
+        if [[ "$outcome" == NOT_STOPPED ]]; then
+            assert_contains "$out" "outcome=NOT_STOPPED" "S68: a log above the limit keeps NOT_STOPPED"
+        else
+            assert_contains "$out" "outcome=OUTPUT_LIMIT" "S68: a log above the limit gives OUTPUT_LIMIT"
+        fi
+    done
 }
 
 s69_metric_process_checks_do_not_depend_on_permission() {
-    local workspace library root group out status summary start elapsed pid probe=()
+    local workspace library root group out status summary start elapsed pid holder zombie tick probe=()
     # A recorded group that the test user may not signal: kill -0 fails with
     # EPERM, but the group has a live process.
     group="$(ab_metric_foreign_group)"
@@ -5565,6 +5583,30 @@ s69_metric_process_checks_do_not_depend_on_permission() {
     assert_contains "$out" "status=1" "S69: the stop does not take a group of another user as empty" "$out"
     assert_contains "$out" "stop=NOT_STOPPED" "S69: the stop records NOT_STOPPED"
     (( elapsed <= 9 )) || _fail "S69: the stop of a group that stays is bounded" "elapsed: ${elapsed}"
+    # A group with only a zombie is empty: a zombie has stopped. Its parent
+    # sleeps in another group and does not reap it.
+    bash -c 'setsid sleep 0 & echo "$!" > "$1"; exec sleep 30' _ "${workspace}/zombie" \
+        < /dev/null > /dev/null 2>&1 &
+    holder=$!
+    zombie=""
+    for (( tick = 0; tick < 50; tick++ )); do
+        zombie="$(cat "${workspace}/zombie" 2>/dev/null || true)"
+        if [[ "$zombie" =~ ^[0-9]+$ && "$(awk '{ print $3 }' "/proc/${zombie}/stat" 2>/dev/null || true)" == Z ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ ! "$zombie" =~ ^[0-9]+$ || "$(awk '{ print $3 }' "/proc/${zombie}/stat" 2>/dev/null || true)" != Z ]]; then
+        kill "$holder" 2>/dev/null || true
+        _fail "S69: the probe must make a zombie in its own group" "pid: ${zombie}"
+    fi
+    out="$(env "${probe[@]}" bash -c "${library}
+        stop_operation_group ${zombie} probe \$(( \$(date +%s) + 1 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    assert_contains "$out" "status=0" "S69: a group with only a zombie is empty" "$out"
+    assert_contains "$out" "stop=EMPTY" "S69: the stop records EMPTY for a group with only a zombie"
     # The cleanup does not take that group as empty.
     ab_metric_run "$workspace" > /dev/null
     root="$(ab_metric_root "$workspace")"
@@ -5575,6 +5617,29 @@ s69_metric_process_checks_do_not_depend_on_permission() {
     assert_dir_exists "$root" "S69: the task directory stays while a recorded group of another user has a process"
     assert_contains "$(cat "${workspace}/step_summary")" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" \
         "S69: the summary shows the active group"
+    # Every started operation records its group, also the package operation,
+    # which has no commands.tsv row. A live group in that record keeps the
+    # task directory.
+    workspace="$(new_workspace s69_group_record)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    out="$(awk -F '\t' 'NR > 1 { print $10 " " $2 }' "$(ab_metric_task "$workspace")/evidence/commands.tsv")"
+    assert_eq "$out" "$(head -n -1 "${root}/process-groups.tsv" 2>/dev/null | tr '\t' ' ')" \
+        "S69: the group record lists the group of each command row"
+    [[ "$(tail -n 1 "${root}/process-groups.tsv" 2>/dev/null)" =~ ^[0-9]+$'\t'package$ ]] ||
+        _fail "S69: the group record lists the package group last"
+    setsid sleep 30 < /dev/null > /dev/null 2>&1 &
+    pid=$!
+    sleep 0.2
+    printf '%s\tpackage\n' "$(ps -o pgid= -p "$pid" | tr -d ' ')" >> "${root}/process-groups.tsv"
+    status="$(ab_metric_cleanup "$workspace")"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    assert_eq "1" "$status" "S69: the cleanup fails while a group of the record has a process"
+    assert_dir_exists "$root" "S69: the task directory stays while a group of the record has a process"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_ACTIVE" \
+        "S69: the cleanup result is the active group of the record"
     # A /proc entry that the scan cannot read makes the check incomplete. The
     # test user may not read the working directory of a root process.
     if readlink /proc/1/cwd > /dev/null 2>&1; then

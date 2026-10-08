@@ -23,8 +23,9 @@ name: openfoam-m3-metric-validation
 # than openfoam2512-default 2512.0-2 and v2512, a missing or changed U, a
 # missing or duplicate output, a wrong time or region, a cell count other
 # than 2, a zero or negative cell volume, a total volume other than 3 m3, a
-# non-finite value, a parse failure, a timeout, a limit, or a value outside
-# the tolerance gives one explicit FAIL_<CAUSE> result and a failed job.
+# non-finite value, a parse failure, a timeout, a process that does not
+# stop, a limit, or a value outside the tolerance gives one explicit
+# FAIL_<CAUSE> result and a failed job.
 # Nothing falls back to another command, field, time, region, or path.
 #
 # Output path (v2512 source): writeFile names the time folder from the Case
@@ -35,14 +36,15 @@ name: openfoam-m3-metric-validation
 #
 # Time: the job limit is 10 minutes. A cap includes the 5-second kill grace:
 # SIGTERM at the cap less 5 seconds, then SIGKILL to the whole process group
-# at the cap. The package update and install have 180 seconds. Each OpenFOAM
-# command has 60 seconds, and the OpenFOAM commands have 240 seconds
-# together. The fixture setup, the evidence collection, the package, and the
-# cleanup have 30 seconds each, 120 seconds together. The active work ends
-# 290 seconds after the clock starts, and the install, setup, and OpenFOAM
-# operations keep the evidence budget before that deadline. The five step
-# timeouts sum to 9 minutes (1 + 5 + 1 + 1 + 1), so they are only final
-# guards.
+# at the cap. After SIGKILL, the group must be empty within 5 seconds, or
+# the result is FAIL_PROCESS_STOP. The package update and install have 180
+# seconds. Each OpenFOAM command has 60 seconds, and the OpenFOAM commands
+# have 240 seconds together. The fixture setup, the evidence collection, the
+# package, and the cleanup have 30 seconds each, 120 seconds together. The
+# active work ends 290 seconds after the clock starts, and the install,
+# setup, and OpenFOAM operations keep the evidence budget before that
+# deadline. The five step timeouts sum to 9 minutes (1 + 5 + 1 + 1 + 1), so
+# they are only final guards.
 #
 # Limits: each command log at most 1 MiB, all logs at most 8 MiB, and the
 # artifact at most 10 MiB. A log above a limit leaves the evidence with its
@@ -54,6 +56,14 @@ name: openfoam-m3-metric-validation
 # The last step removes only that directory, after the upload, and only when
 # no process of a recorded operation group and no process that uses the
 # directory remains.
+#
+# Root processes (PR #97 review 5453307998): the install runs the repository
+# script and apt-get as root through sudo, and the runner user may not signal
+# a root process. So the stop signals of the install group go through
+# sudo -n kill, and every process check reads /proc: kill -0 fails with
+# EPERM for a root process, and that is not an empty group. The scan for
+# processes that use the task directory runs as root through sudo -n. A
+# refused, incomplete, or slow scan keeps the directory.
 
 on:
   workflow_dispatch:
@@ -169,6 +179,8 @@ jobs:
           UPLOAD="${TASK_ROOT}/upload"
           EXCLUDED="${TASK_ROOT}/excluded"
           SCRATCH="${TASK_ROOT}/scratch"
+          # The process group of each started operation, for the cleanup step.
+          GROUPS_FILE="${TASK_ROOT}/process-groups.tsv"
 
           # The fixture files, relative to the task directory.
           FIXTURE_FILES=(
@@ -214,6 +226,8 @@ jobs:
           )
 
           SEQ=0
+          OP_CLASS=""
+          OP_STOP=""
           INSTALL_USED=0
           OPENFOAM_USED=0
           SETUP_USED=0
@@ -322,17 +336,19 @@ jobs:
 
           # bounded <label> <limit> <stdout> <stderr> <command> [args...] - run one
           # command with standard input from /dev/null. timeout makes a new process
-          # group, and its PID is the group ID. The command gets SIGTERM at the limit
-          # less KILL_GRACE and SIGKILL at the limit. stop_operation_group then stops
-          # what remains of the group by the same limit, so the function returns only
-          # when the group is empty. A limit at or below KILL_GRACE starts nothing. Sets
-          # OP_STATUS, OP_OUTCOME (COMPLETED, FAILED, TIMEOUT, or NOT_STARTED),
-          # OP_START, OP_END, OP_LIMIT, and OP_GROUP.
+          # group, and its PID is the group ID. GROUPS_FILE records the group. The
+          # command gets SIGTERM at the limit less KILL_GRACE and SIGKILL at the
+          # limit. stop_operation_group then stops what remains of the group by the
+          # same limit. A group that is not empty KILL_GRACE seconds after SIGKILL
+          # gives NOT_STOPPED. A limit at or below KILL_GRACE starts nothing. Sets
+          # OP_STATUS, OP_OUTCOME (COMPLETED, FAILED, TIMEOUT, NOT_STOPPED, or
+          # NOT_STARTED), OP_START, OP_END, OP_LIMIT, OP_GROUP, and OP_STOP.
           bounded() {
               local label="$1" out="$3" err="$4" term
               OP_LIMIT="$2"
               OP_START="$EPOCHSECONDS"
               OP_GROUP="-"
+              OP_STOP=EMPTY
               shift 4
               term=$(( OP_LIMIT - KILL_GRACE ))
               if (( term <= 0 )); then
@@ -344,6 +360,7 @@ jobs:
               fi
               timeout --kill-after="${KILL_GRACE}s" "${term}s" "$@" > "$out" 2> "$err" < /dev/null &
               OP_GROUP=$!
+              printf '%s\t%s\n' "$OP_GROUP" "$label" >> "$GROUPS_FILE"
               wait "$OP_GROUP"
               OP_STATUS=$?
               stop_operation_group "$OP_GROUP" "$label" "$(( OP_START + OP_LIMIT ))"
@@ -353,34 +370,94 @@ jobs:
                   124|137) OP_OUTCOME=TIMEOUT ;;
                   *) OP_OUTCOME=FAILED ;;
               esac
+              if [[ "$OP_STOP" == NOT_STOPPED ]]; then
+                  OP_OUTCOME=NOT_STOPPED
+              fi
+          }
+
+          # group_members <group> - print the PID of each live process in one process
+          # group. Every /proc/<pid>/stat file is readable for every user, also for a
+          # root process, so the check does not depend on the permission to signal:
+          # kill -0 fails with EPERM for a root process. A zombie has stopped and is
+          # not listed. Returns 1 when the stat file of a listed process cannot be
+          # read, because the check is then not complete.
+          group_members() {
+              local file line rest state
+              for file in /proc/[0-9]*/stat; do
+                  if ! { read -r line < "$file"; } 2>/dev/null; then
+                      [[ -e "$file" ]] && return 1
+                      continue
+                  fi
+                  # After the command name: the state, the parent PID, the group ID.
+                  [[ "$line" == *" $1 "* ]] || continue
+                  rest="${line##*") "}"
+                  state="${rest%% *}"
+                  rest="${rest#* }"
+                  rest="${rest#* }"
+                  if [[ "${rest%% *}" == "$1" && "$state" != Z ]]; then
+                      printf '%s\n' "${file:6:-5}"
+                  fi
+              done
+              return 0
+          }
+
+          # group_empty <group> - status 0 only when the check is complete and the
+          # group has no live process.
+          group_empty() {
+              local members
+              members="$(group_members "$1")" || return 1
+              [[ -z "$members" ]]
+          }
+
+          # signal_group <signal> <group> - send one signal to each process of one
+          # group. The install runs root processes through sudo, and the runner user
+          # may not signal them, so each signal to the install group goes through
+          # sudo -n kill, in at most 5 seconds. A refused or failed signal is not
+          # an error here: the group check after the signal decides.
+          signal_group() {
+              if [[ "$OP_CLASS" == INSTALL ]]; then
+                  timeout --kill-after=1s 4s sudo -n kill -s "$1" -- "-$2" < /dev/null 2>&1 || true
+              else
+                  kill -s "$1" -- "-$2" 2>/dev/null || true
+              fi
           }
 
           # stop_operation_group <group> <label> <kill-at> - stop each process that is
           # still in the process group of one operation after timeout returns. timeout
-          # sends SIGKILL only while its direct child runs, so a descendant that ignores
-          # SIGTERM can remain after the direct child exits. Each remaining process gets
-          # SIGTERM, and SIGKILL at <kill-at>, the end of the operation limit. After an
-          # early return, the remaining processes get at most KILL_GRACE seconds. The
-          # function returns only when the group is empty. Linux does not give a group
-          # ID to a new process while the group has a process, so no other process gets
-          # a signal.
+          # sends SIGKILL only while its direct child runs, and it may not signal a
+          # root process, so a descendant can remain after the direct child exits.
+          # Each remaining process gets SIGTERM, and SIGKILL at <kill-at>, the end of
+          # the operation limit. After an early return, the remaining processes get
+          # at most KILL_GRACE seconds. After SIGKILL, the group must be empty within
+          # KILL_GRACE seconds. Sets OP_STOP to EMPTY, STOPPED, or NOT_STOPPED, and
+          # returns 1 for NOT_STOPPED. Linux does not give a group ID to a new
+          # process while the group has a process, so no other process gets a signal.
           stop_operation_group() {
               local group="$1" label="$2" kill_at="$3" now
-              kill -0 -- "-${group}" 2>/dev/null || return 0
-              kill -TERM -- "-${group}" 2>/dev/null
+              OP_STOP=EMPTY
+              group_empty "$group" && return 0
+              OP_STOP=STOPPED
+              signal_group TERM "$group"
               now="$EPOCHSECONDS"
               if (( kill_at > now + KILL_GRACE )); then
                   kill_at=$(( now + KILL_GRACE ))
               fi
               while (( EPOCHSECONDS < kill_at )); do
-                  kill -0 -- "-${group}" 2>/dev/null || return 0
+                  group_empty "$group" && return 0
                   sleep 0.1
               done
-              kill -KILL -- "-${group}" 2>/dev/null || return 0
-              while kill -0 -- "-${group}" 2>/dev/null; do
+              signal_group KILL "$group"
+              kill_at=$(( EPOCHSECONDS + KILL_GRACE ))
+              while (( EPOCHSECONDS < kill_at )); do
+                  if group_empty "$group"; then
+                      echo "${label}: process group ${group} stopped with SIGKILL"
+                      return 0
+                  fi
                   sleep 0.1
               done
-              echo "${label}: process group ${group} stopped with SIGKILL"
+              OP_STOP=NOT_STOPPED
+              echo "${label}: process group ${group} did not stop: $(group_members "$group" | tr '\n' ' ')"
+              return 1
           }
 
           # run_op <label> <class> <cap> <command> [args...] - one bounded operation
@@ -398,7 +475,9 @@ jobs:
               OP_VECTOR="$(printf '%q ' "$@")"
               OP_VECTOR="${OP_VECTOR% }"
               limit="$(op_limit "$class" "$cap")"
+              OP_CLASS="$class"
               bounded "$label" "$limit" "$OP_STDOUT" "$OP_STDERR" "$@"
+              OP_CLASS=""
               charge "$class" "$(( OP_END - OP_START ))"
               log_ref="-"
               if [[ "$OP_OUTCOME" != NOT_STARTED ]]; then
@@ -414,8 +493,8 @@ jobs:
 
           # log_limit <log> - a log above LOG_LIMIT bytes leaves the evidence. It is not
           # cut. Its size and checksum stay in excluded.tsv, and OP_OUTCOME becomes
-          # OUTPUT_LIMIT. The checksum is one bounded evidence operation. The values of
-          # the logged operation stay as they were.
+          # OUTPUT_LIMIT, but NOT_STOPPED stays. The checksum is one bounded evidence
+          # operation. The values of the logged operation stay as they were.
           log_limit() {
               local file="$1" bytes sha=UNAVAILABLE saved
               [[ -f "$file" ]] || return 0
@@ -423,7 +502,7 @@ jobs:
               (( bytes > LOG_LIMIT )) || return 0
               mv -f -- "$file" "${EXCLUDED}/"
               file="${EXCLUDED}/${file##*/}"
-              saved=("${OP_STATUS:-}" "${OP_START:-}" "${OP_END:-}" "${OP_LIMIT:-}" "${OP_GROUP:-}")
+              saved=("${OP_STATUS:-}" "${OP_START:-}" "${OP_END:-}" "${OP_LIMIT:-}" "${OP_GROUP:-}" "${OP_OUTCOME:-}")
               bounded hash-excluded "$(op_limit EVIDENCE "$PHASE_CAP")" "${SCRATCH}/excluded-hash" /dev/null \
                   sha256sum -- "$file"
               charge EVIDENCE "$(( OP_END - OP_START ))"
@@ -432,15 +511,19 @@ jobs:
               fi
               OP_STATUS="${saved[0]}" OP_START="${saved[1]}" OP_END="${saved[2]}" OP_LIMIT="${saved[3]}" OP_GROUP="${saved[4]}"
               OP_OUTCOME=OUTPUT_LIMIT
+              if [[ "${saved[5]}" == NOT_STOPPED ]]; then
+                  OP_OUTCOME=NOT_STOPPED
+              fi
               printf '%s\t%s\t%s\t%s\n' "logs/${file##*/}" "$bytes" "${sha:-UNAVAILABLE}" \
                   "the log is above ${LOG_LIMIT} bytes" >> "${EVIDENCE}/excluded.tsv"
           }
 
           # require_op <label> <cause> <stop-point> - stop unless the last operation
-          # completed with status 0 and kept its logs.
+          # completed with status 0, kept its logs, and left no process.
           require_op() {
               case "$OP_OUTCOME" in
                   COMPLETED) return 0 ;;
+                  NOT_STOPPED) fail PROCESS_STOP "process group ${OP_GROUP} of the $1 operation still had a process, or could not be checked, ${KILL_GRACE} seconds after SIGKILL" "$3" ;;
                   TIMEOUT) fail TIMEOUT "the $1 operation did not complete within its ${OP_LIMIT}-second limit" "$3" ;;
                   NOT_STARTED) fail TIMEOUT "no time was left for the $1 operation" "$3" ;;
                   OUTPUT_LIMIT) fail OUTPUT_LIMIT "a $1 log is above ${LOG_LIMIT} bytes" "$3" ;;
@@ -1429,6 +1512,8 @@ jobs:
       #    only the unique task directory, in at most 30 seconds, and ends
       #    with status 0 only for PASS and a completed removal. The step runs
       #    as bash -eo pipefail, so each expected non-zero status is caught.
+      #    The step sends no signal: it only checks the recorded groups and
+      #    the processes that use the directory, also the root processes.
       # ---------------------------------------------------------------------
       - name: Remove the task directory
         if: always()
@@ -1446,6 +1531,29 @@ jobs:
               fi
               printf '%s' "${v:-UNAVAILABLE}"
           }
+          # group_active <group> - status 0 while /proc lists a live process of
+          # the group, or while a stat file cannot be read. Every /proc/<pid>/stat
+          # file is readable for every user, so the check does not depend on the
+          # permission to signal: kill -0 fails with EPERM for a root process.
+          group_active() {
+              local file line rest state
+              for file in /proc/[0-9]*/stat; do
+                  if ! { read -r line < "$file"; } 2>/dev/null; then
+                      if [[ -e "$file" ]]; then return 0; fi
+                      continue
+                  fi
+                  # After the command name: the state, the parent PID, the group ID.
+                  [[ "$line" == *" $1 "* ]] || continue
+                  rest="${line##*") "}"
+                  state="${rest%% *}"
+                  rest="${rest#* }"
+                  rest="${rest#* }"
+                  if [[ "${rest%% *}" == "$1" && "$state" != Z ]]; then
+                      return 0
+                  fi
+              done
+              return 1
+          }
           # Every reported value is read before the removal.
           declare -A shown=()
           for key in METRIC_RESULT METRIC_REASON METRIC_PRIOR_RESULT METRIC_STOP_POINT MAIN_SHA \
@@ -1459,6 +1567,9 @@ jobs:
           groups=()
           if [[ -f "${task}/evidence/commands.tsv" ]]; then
               mapfile -t groups < <(awk -F '\t' 'NR > 1 && $10 ~ /^[0-9]+$/ { print $10 }' "${task}/evidence/commands.tsv")
+          fi
+          if [[ -f "${root}/process-groups.tsv" ]]; then
+              mapfile -t -O "${#groups[@]}" groups < <(awk -F '\t' '$1 ~ /^[0-9]+$/ { print $1 }' "${root}/process-groups.tsv")
           fi
 
           # Only the unique task directory under RUNNER_TEMP, and only when no
@@ -1474,20 +1585,51 @@ jobs:
           if [[ "$cleanup" == NOT_RUN ]]; then
               active=""
               for group in "${groups[@]}"; do
-                  if kill -0 -- "-${group}" 2>/dev/null; then
+                  if group_active "$group"; then
                       active="${active} group ${group}"
                   fi
               done
-              # find also ends with status 1 for the /proc entries of other users.
-              users="$(timeout --kill-after=1s 4s find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \
-                         \( -lname "$root" -o -lname "${root}/*" \) -print 2>/dev/null)" && check=0 || check=$?
-              if (( check == 124 || check == 137 )); then
-                  cleanup=NOT_REMOVED_PROCESS_CHECK_TIMEOUT
-              elif [[ -n "$active" || -n "$users" ]]; then
+              # The users of the directory: a process with its working directory
+              # or an open file in it. The runner user may not read the /proc
+              # entries of a root process, so find runs as root through sudo -n,
+              # with a 5-second bound inside the 8-second bound of sudo. The last
+              # line gives the find status; no last line means that the scan did
+              # not run. A process that ends during the scan gives "No such file
+              # or directory" or "No such process" and is not a user. Any other
+              # message makes the check incomplete.
+              scan="$(timeout --kill-after=1s 8s sudo -n sh -c \
+                        'LC_ALL=C; export LC_ALL; exec 2>&1; timeout --kill-after=1s 5s find "$@"; echo "scan-status $?"' \
+                        scan /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 \( -lname "$root" -o -lname "${root}/*" \) -print \
+                        < /dev/null)" && check=0 || check=$?
+              vanished="^([^ ]*/)?find: '/proc/[0-9]+/(cwd|fd)(/[0-9]+)?': (No such file or directory|No such process)$"
+              users=""
+              problems=""
+              scan_status=""
+              while IFS= read -r line; do
+                  [[ -n "$line" ]] || continue
+                  case "$line" in
+                      "scan-status "*) scan_status="${line#scan-status }" ;;
+                      /proc/*) users="${users} ${line}" ;;
+                      *)
+                          if [[ ! "$line" =~ $vanished ]]; then
+                              problems="${problems}${line}"$'\n'
+                          fi ;;
+                  esac
+              done <<< "$scan"
+              if [[ -n "$active" || -n "$users" ]]; then
                   cleanup=NOT_REMOVED_PROCESS_ACTIVE
-                  echo "processes remain:${active} $(tr '\n' ' ' <<< "$users")"
+                  echo "processes remain:${active}${users}"
+              elif (( check == 124 || check == 137 )) || [[ "$scan_status" == 124 || "$scan_status" == 137 ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_TIMEOUT
+              elif [[ "$scan_status" != 0 && "$scan_status" != 1 ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_FAILED
+                  echo "the process scan did not complete: status ${check}, find status '${scan_status}'"
+              elif [[ -n "$problems" ]]; then
+                  cleanup=NOT_REMOVED_PROCESS_CHECK_INCOMPLETE
+                  echo "the process scan could not read every /proc entry; the first messages:"
+                  head -n 5 <<< "$problems"
               else
-                  timeout --kill-after=5s 20s rm -rf -- "$root" && status=0 || status=$?
+                  timeout --kill-after=5s 15s rm -rf -- "$root" && status=0 || status=$?
                   if (( status == 0 )) && [[ ! -e "$root" ]]; then
                       cleanup=REMOVED
                   else
