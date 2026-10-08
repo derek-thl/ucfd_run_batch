@@ -34,17 +34,19 @@ name: openfoam-m3-metric-validation
 # accepted output is postProcessing/m3MeanSpeed/<SELECTED_TIME>/
 # volFieldValue.dat. region0 adds no region folder (polyMesh.C, regionName).
 #
-# Time: the job limit is 10 minutes. A cap includes the 5-second kill grace:
-# SIGTERM at the cap less 5 seconds, then SIGKILL to the whole process group
-# at the cap. After SIGKILL, the group must be empty within 5 seconds, or
-# the result is FAIL_PROCESS_STOP. The package update and install have 180
-# seconds. Each OpenFOAM command has 60 seconds, and the OpenFOAM commands
-# have 240 seconds together. The fixture setup, the evidence collection, the
-# package, and the cleanup have 30 seconds each, 120 seconds together. The
-# active work ends 290 seconds after the clock starts, and the install,
-# setup, and OpenFOAM operations keep the evidence budget before that
-# deadline. The five step timeouts sum to 9 minutes (1 + 5 + 1 + 1 + 1), so
-# they are only final guards.
+# Time: the job limit is 10 minutes. Each cap is an absolute deadline from
+# the start of its operation, and the operation with its stop ends by it:
+# SIGTERM at the cap less 6 seconds, SIGKILL to the whole process group 5
+# seconds later, and a 1-second stop reserve for the last signal and the
+# check. No stop signal or check starts a new limit. A group that is not
+# empty at the cap gives FAIL_PROCESS_STOP. The package update and install
+# have 180 seconds. Each OpenFOAM command has 60 seconds, and the OpenFOAM
+# commands have 240 seconds together. The fixture setup, the evidence
+# collection, the package, and the cleanup have 30 seconds each, 120 seconds
+# together. The active work ends 290 seconds after the clock starts, and the
+# install, setup, and OpenFOAM operations keep the evidence budget before
+# that deadline. The five step timeouts sum to 9 minutes
+# (1 + 5 + 1 + 1 + 1), so they are only final guards.
 #
 # Limits: each command log at most 1 MiB, all logs at most 8 MiB, and the
 # artifact at most 10 MiB. A log above a limit leaves the evidence with its
@@ -58,12 +60,13 @@ name: openfoam-m3-metric-validation
 # directory remains.
 #
 # Root processes (PR #97 review 5453307998): the install runs the repository
-# script and apt-get as root through sudo, and the runner user may not signal
-# a root process. So the stop signals of the install group go through
-# sudo -n kill, and every process check reads /proc: kill -0 fails with
-# EPERM for a root process, and that is not an empty group. The scan for
-# processes that use the task directory runs as root through sudo -n. A
-# refused, incomplete, or slow scan keeps the directory.
+# script and apt-get as root through sudo, and the runner user may not
+# signal a root process. So the stop signals of the install group go through
+# sudo -n kill, inside the deadline of the install (PR #97 review
+# 5454383774), and every process check reads /proc: kill -0 fails with EPERM
+# for a root process, and that is not an empty group. The scan for processes
+# that use the task directory runs as root through sudo -n. A refused,
+# incomplete, or slow scan keeps the directory.
 
 on:
   workflow_dispatch:
@@ -156,9 +159,12 @@ jobs:
           EXPECTED_U_LATEST_SHA256="6c0d30e57137916312cba4f16bc603da82bb581a48d9c0f50b1001d1bb5d5820"
           EXPECTED_U_EARLIER_SHA256="707f40153c57473ac0f6f9e3294a381d5a81bce4e60615f673cee4135afbf948"
           EXPECTED_DICTIONARY_SHA256="ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef"
-          # Limits in seconds. A cap includes the kill grace: SIGTERM at the cap less
-          # KILL_GRACE, then SIGKILL to the process group at the cap.
+          # Limits in seconds. A cap is an absolute deadline from the start of the
+          # operation: SIGTERM at the cap less KILL_GRACE and STOP_RESERVE, SIGKILL to
+          # the process group KILL_GRACE seconds later, and the stop and its check end
+          # by the cap.
           KILL_GRACE=5
+          STOP_RESERVE=1
           INSTALL_CAP=180
           OPENFOAM_CAP=60
           OPENFOAM_BUDGET=240
@@ -334,23 +340,38 @@ jobs:
               esac
           }
 
+          # now_ms - the time in milliseconds since the epoch.
+          now_ms() {
+              local t="${EPOCHREALTIME//[!0-9]/}"
+              printf '%s\n' "$(( 10#$t / 1000 ))"
+          }
+
+          # seconds_text <milliseconds> - a timeout duration in seconds, with three
+          # decimals.
+          seconds_text() {
+              printf '%d.%03d\n' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"
+          }
+
           # bounded <label> <limit> <stdout> <stderr> <command> [args...] - run one
-          # command with standard input from /dev/null. timeout makes a new process
-          # group, and its PID is the group ID. GROUPS_FILE records the group. The
-          # command gets SIGTERM at the limit less KILL_GRACE and SIGKILL at the
-          # limit. stop_operation_group then stops what remains of the group by the
-          # same limit. A group that is not empty KILL_GRACE seconds after SIGKILL
-          # gives NOT_STOPPED. A limit at or below KILL_GRACE starts nothing. Sets
-          # OP_STATUS, OP_OUTCOME (COMPLETED, FAILED, TIMEOUT, NOT_STOPPED, or
-          # NOT_STARTED), OP_START, OP_END, OP_LIMIT, OP_GROUP, and OP_STOP.
+          # command with standard input from /dev/null. The operation deadline is the
+          # start plus the limit. timeout makes a new process group, and its PID is
+          # the group ID. GROUPS_FILE records the group. The command gets SIGTERM at
+          # the deadline less KILL_GRACE and STOP_RESERVE, and SIGKILL KILL_GRACE
+          # seconds later. stop_operation_group then stops what remains of the group,
+          # and it ends by the same deadline. A group that is not empty at the
+          # deadline gives NOT_STOPPED. A limit at or below KILL_GRACE plus
+          # STOP_RESERVE starts nothing. Sets OP_STATUS, OP_OUTCOME (COMPLETED,
+          # FAILED, TIMEOUT, NOT_STOPPED, or NOT_STARTED), OP_START, OP_END, OP_LIMIT,
+          # OP_GROUP, and OP_STOP.
           bounded() {
-              local label="$1" out="$3" err="$4" term
+              local label="$1" out="$3" err="$4" start term
               OP_LIMIT="$2"
-              OP_START="$EPOCHSECONDS"
+              start="$(now_ms)"
+              OP_START=$(( start / 1000 ))
               OP_GROUP="-"
               OP_STOP=EMPTY
               shift 4
-              term=$(( OP_LIMIT - KILL_GRACE ))
+              term=$(( (OP_LIMIT - KILL_GRACE - STOP_RESERVE) * 1000 ))
               if (( term <= 0 )); then
                   OP_STATUS=124
                   OP_OUTCOME=NOT_STARTED
@@ -358,12 +379,12 @@ jobs:
                   echo "${label}: NOT_STARTED, limit ${OP_LIMIT} s"
                   return 0
               fi
-              timeout --kill-after="${KILL_GRACE}s" "${term}s" "$@" > "$out" 2> "$err" < /dev/null &
+              timeout --kill-after="${KILL_GRACE}s" "$(seconds_text "$term")" "$@" > "$out" 2> "$err" < /dev/null &
               OP_GROUP=$!
               printf '%s\t%s\n' "$OP_GROUP" "$label" >> "$GROUPS_FILE"
               wait "$OP_GROUP"
               OP_STATUS=$?
-              stop_operation_group "$OP_GROUP" "$label" "$(( OP_START + OP_LIMIT ))"
+              stop_operation_group "$OP_GROUP" "$label" "$(( start + OP_LIMIT * 1000 ))"
               OP_END="$EPOCHSECONDS"
               case "$OP_STATUS" in
                   0) OP_OUTCOME=COMPLETED ;;
@@ -409,54 +430,72 @@ jobs:
               [[ -z "$members" ]]
           }
 
-          # signal_group <signal> <group> - send one signal to each process of one
-          # group. The install runs root processes through sudo, and the runner user
-          # may not signal them, so each signal to the install group goes through
-          # sudo -n kill, in at most 5 seconds. A refused or failed signal is not
-          # an error here: the group check after the signal decides.
+          # signal_group <signal> <group> <until> - send one signal to each process of
+          # one group. The install runs root processes through sudo, and the runner
+          # user may not signal them, so each signal to the install group goes through
+          # sudo -n kill. That helper ends by <until>, in milliseconds since the
+          # epoch: timeout stops it 200 milliseconds before <until> and kills it 100
+          # milliseconds later. With less than 300 milliseconds left, no helper
+          # starts. A refused, failed, or stopped signal is not an error here: the
+          # group check after the signal decides.
           signal_group() {
+              local left
               if [[ "$OP_CLASS" == INSTALL ]]; then
-                  timeout --kill-after=1s 4s sudo -n kill -s "$1" -- "-$2" < /dev/null 2>&1 || true
+                  left=$(( $3 - $(now_ms) - 200 ))
+                  if (( left < 100 )); then
+                      echo "no time is left for sudo -n kill -s $1"
+                      return 0
+                  fi
+                  timeout --kill-after=0.1s "$(seconds_text "$left")" sudo -n kill -s "$1" -- "-$2" \
+                      < /dev/null 2>&1 || true
               else
                   kill -s "$1" -- "-$2" 2>/dev/null || true
               fi
           }
 
-          # stop_operation_group <group> <label> <kill-at> - stop each process that is
-          # still in the process group of one operation after timeout returns. timeout
-          # sends SIGKILL only while its direct child runs, and it may not signal a
-          # root process, so a descendant can remain after the direct child exits.
-          # Each remaining process gets SIGTERM, and SIGKILL at <kill-at>, the end of
-          # the operation limit. After an early return, the remaining processes get
-          # at most KILL_GRACE seconds. After SIGKILL, the group must be empty within
-          # KILL_GRACE seconds. Sets OP_STOP to EMPTY, STOPPED, or NOT_STOPPED, and
-          # returns 1 for NOT_STOPPED. Linux does not give a group ID to a new
-          # process while the group has a process, so no other process gets a signal.
+          # stop_operation_group <group> <label> <deadline> - stop each process that is
+          # still in the process group of one operation after timeout returns.
+          # <deadline> is the absolute end of the operation, in milliseconds since the
+          # epoch. timeout sends SIGKILL only while its direct child runs, and it may
+          # not signal a root process, so a descendant can remain after the direct
+          # child exits. Each remaining process gets SIGTERM, and SIGKILL at the kill
+          # time: the deadline less STOP_RESERVE, or KILL_GRACE seconds after an
+          # early return. The stop and its check end STOP_RESERVE seconds after the
+          # kill time, which is never after the deadline. Each signal helper gets only
+          # the time that is left before its point, so no step starts a new limit.
+          # Sets OP_STOP to EMPTY, STOPPED, or NOT_STOPPED, and returns 1 for
+          # NOT_STOPPED. Linux does not give a group ID to a new process while the
+          # group has a process, so no other process gets a signal.
           stop_operation_group() {
-              local group="$1" label="$2" kill_at="$3" now
+              local group="$1" label="$2" end="$3" kill_at now members
               OP_STOP=EMPTY
               group_empty "$group" && return 0
               OP_STOP=STOPPED
-              signal_group TERM "$group"
-              now="$EPOCHSECONDS"
-              if (( kill_at > now + KILL_GRACE )); then
-                  kill_at=$(( now + KILL_GRACE ))
+              now="$(now_ms)"
+              kill_at=$(( end - STOP_RESERVE * 1000 ))
+              if (( kill_at > now + KILL_GRACE * 1000 )); then
+                  kill_at=$(( now + KILL_GRACE * 1000 ))
+                  end=$(( kill_at + STOP_RESERVE * 1000 ))
               fi
-              while (( EPOCHSECONDS < kill_at )); do
-                  group_empty "$group" && return 0
-                  sleep 0.1
-              done
-              signal_group KILL "$group"
-              kill_at=$(( EPOCHSECONDS + KILL_GRACE ))
-              while (( EPOCHSECONDS < kill_at )); do
-                  if group_empty "$group"; then
+              if (( now < kill_at )); then
+                  signal_group TERM "$group" "$kill_at"
+                  while (( $(now_ms) < kill_at )); do
+                      group_empty "$group" && return 0
+                      sleep 0.1
+                  done
+              fi
+              signal_group KILL "$group" "$end"
+              # The last check starts at least 150 milliseconds before the end.
+              while :; do
+                  if members="$(group_members "$group")" && [[ -z "$members" ]]; then
                       echo "${label}: process group ${group} stopped with SIGKILL"
                       return 0
                   fi
+                  (( $(now_ms) + 150 < end )) || break
                   sleep 0.1
               done
               OP_STOP=NOT_STOPPED
-              echo "${label}: process group ${group} did not stop: $(group_members "$group" | tr '\n' ' ')"
+              echo "${label}: process group ${group} did not stop by its deadline: $(tr '\n' ' ' <<< "$members")"
               return 1
           }
 
@@ -523,7 +562,7 @@ jobs:
           require_op() {
               case "$OP_OUTCOME" in
                   COMPLETED) return 0 ;;
-                  NOT_STOPPED) fail PROCESS_STOP "process group ${OP_GROUP} of the $1 operation still had a process, or could not be checked, ${KILL_GRACE} seconds after SIGKILL" "$3" ;;
+                  NOT_STOPPED) fail PROCESS_STOP "process group ${OP_GROUP} of the $1 operation still had a process, or could not be checked, at the end of its ${OP_LIMIT}-second limit" "$3" ;;
                   TIMEOUT) fail TIMEOUT "the $1 operation did not complete within its ${OP_LIMIT}-second limit" "$3" ;;
                   NOT_STARTED) fail TIMEOUT "no time was left for the $1 operation" "$3" ;;
                   OUTPUT_LIMIT) fail OUTPUT_LIMIT "a $1 log is above ${LOG_LIMIT} bytes" "$3" ;;

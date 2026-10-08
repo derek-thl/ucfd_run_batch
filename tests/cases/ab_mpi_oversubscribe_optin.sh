@@ -5590,7 +5590,7 @@ s69_metric_process_checks_do_not_depend_on_permission() {
     # the kill grace.
     start="$(date +%s)"
     out="$(env "${probe[@]}" bash -c "${library}
-        stop_operation_group ${group} probe \$(( \$(date +%s) + 1 )) && echo status=0 || echo status=\$?
+        stop_operation_group ${group} probe \$(( \$(date +%s%3N) + 1000 )) && echo status=0 || echo status=\$?
         echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
     elapsed=$(( $(date +%s) - start ))
     assert_contains "$out" "status=1" "S69: the stop does not take a group of another user as empty" "$out"
@@ -5614,7 +5614,7 @@ s69_metric_process_checks_do_not_depend_on_permission() {
         _fail "S69: the probe must make a zombie in its own group" "pid: ${zombie}"
     fi
     out="$(env "${probe[@]}" bash -c "${library}
-        stop_operation_group ${zombie} probe \$(( \$(date +%s) + 1 )) && echo status=0 || echo status=\$?
+        stop_operation_group ${zombie} probe \$(( \$(date +%s%3N) + 1000 )) && echo status=0 || echo status=\$?
         echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
@@ -5762,6 +5762,34 @@ s70_metric_stop_ends_by_the_operation_deadline() {
             _fail "S70: each slow helper of the probe must stop by the deadline" "pid ${pid}"
         fi
     done < "${workspace}/fake_pids"
+    # SIGKILL comes STOP_RESERVE (1 second) before the deadline. A command that
+    # ignores SIGTERM ends about 1 second before its 7-second limit, and the
+    # stop then finds an empty group.
+    start="$(date +%s%3N)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        bounded probe 7 '${workspace}/probe.out' '${workspace}/probe.err' bash -c \"trap '' TERM; exec sleep 300\"
+        echo outcome=\${OP_OUTCOME} stop=\${OP_STOP}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    assert_contains "$out" "outcome=TIMEOUT stop=EMPTY" "S70: timeout kills the TERM-ignoring command"
+    (( elapsed >= 5500 && elapsed <= 6600 )) ||
+        _fail "S70: SIGKILL comes 1 second before the 7-second limit" "elapsed: ${elapsed} ms"
+    # The same when the command exits 4 seconds after SIGTERM and leaves a
+    # child that ignores SIGTERM: the stop sends SIGKILL 1 second before the
+    # cap, not at the cap.
+    ab_write_term_ignoring_command "${workspace}/term_ignoring_command" 4
+    start="$(date +%s%3N)"
+    out="$(cd "$workspace" && env "${probe[@]}" bash -c "${library}
+        bounded probe 7 '${workspace}/late.out' '${workspace}/late.err' ./term_ignoring_command
+        echo outcome=\${OP_OUTCOME} stop=\${OP_STOP}" 2>&1 || true)"
+    elapsed=$(( $(date +%s%3N) - start ))
+    pid="$(ab_file_value "${workspace}/late.out" CHILD_PID)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        _fail "S70: the TERM-ignoring child must stop before bounded returns"
+    fi
+    assert_contains "$out" "outcome=TIMEOUT stop=STOPPED" "S70: the stop ends the TERM-ignoring child"
+    (( elapsed >= 5500 && elapsed <= 6600 )) ||
+        _fail "S70: the stop sends SIGKILL 1 second before the 7-second limit" "elapsed: ${elapsed} ms"
 }
 
 # ---- the observation list ---------------------------------------------------
