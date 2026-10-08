@@ -91,6 +91,15 @@
 # budget, log, and artifact limits, the process-group cleanup, and that the run
 # writes only inside its unique task directory, which the last step removes.
 #
+# Checks S68 and S69 cover PR #97 review 5453307998: a timed-out install can
+# leave a root process that the runner user may not signal. S68 proves that the
+# install stop signals the install group through sudo -n kill, and that a
+# process that does not stop fails the run in a bounded time and keeps the task
+# directory. S69 uses real processes of another host user. It proves that the
+# stop and the cleanup do not take a group as empty when kill -0 fails with
+# EPERM, that an unreadable /proc entry, a refused sudo, or a slow scan keeps
+# the task directory, and that a complete scan removes it.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4543,7 +4552,35 @@ for entry in ${FAKE_BLOCK:-}; do
     fi
 done
 case "$name" in
-    curl|sudo) exit 0 ;;
+    curl) exit 0 ;;
+    sudo)
+        # The fake install runs nothing, but the process control is real: sudo
+        # -n kill and the sudo -n sh process scan run. FAKE_SUDO=deny refuses
+        # them, as sudo without root access does. FAKE_SUDO=user runs them
+        # without root, so the /proc entries of root processes stay unreadable.
+        # By default the scan has the root view: the unreadable entries drop
+        # out, because no root process of the test host uses a test directory.
+        [[ "${1:-}" == -n ]] && shift
+        case "${1:-}" in
+            kill|sh)
+                case "${FAKE_SUDO:-root}" in
+                    deny) echo "sudo: a password is required" >&2; exit 1 ;;
+                    user) exec "$@" ;;
+                esac
+                [[ "$1" == kill ]] && exec "$@"
+                "$@" | grep -v ': Permission denied$'
+                exit "${PIPESTATUS[0]}" ;;
+            apt-get)
+                # FAKE_ROOT_CHILD=<file>: the install leaves a process that
+                # ignores SIGTERM in the operation group, as a root process of
+                # apt-get can, writes its PID to the file, and blocks.
+                if [[ "${2:-}" == install && -n "${FAKE_ROOT_CHILD:-}" ]]; then
+                    ( trap '' TERM; exec sleep 300 ) < /dev/null > /dev/null 2>&1 &
+                    printf '%s\n' "$!" > "$FAKE_ROOT_CHILD"
+                    exec sleep 300
+                fi ;;
+        esac
+        exit 0 ;;
     dpkg-query)
         case "${!#}" in
             openfoam2512-default) printf '%s' "${FAKE_PACKAGE_VERSION-2512.0-2}" ;;
@@ -5412,6 +5449,178 @@ s67_metric_task_directory_and_cleanup() {
     done
 }
 
+# ---- S68 and S69: root processes and the process checks (PR #97) ------------
+#
+# The install runs the repository script and apt-get as root through sudo. The
+# runner user may not signal a root process, and kill -0 fails for it with
+# EPERM, so a check with kill -0 takes a group of root processes as empty
+# (Architect review 5453307998). S68 uses the fake sudo: the install leaves a
+# process that ignores SIGTERM, the stop must signal the install group through
+# sudo -n kill, and when sudo refuses, the process stays, as a root process
+# stays for a runner-user signal. S69 uses real host processes of another
+# user: a process group for which kill -0 fails with EPERM, and /proc entries
+# that the test user may not read. No signal reaches a process of another
+# user: each attempt fails with EPERM, as the kill -0 check shows first.
+
+# ab_metric_foreign_group - one process group of the test host with a live
+# process, for which kill -0 fails with EPERM for the test user.
+ab_metric_foreign_group() {
+    local group out
+    for group in $(ps -eo pgid=,stat= | awk '$1 > 1 && $2 !~ /^Z/ { print $1 }' | sort -un); do
+        if out="$(LC_ALL=C kill -0 -- "-${group}" 2>&1)"; then
+            continue
+        fi
+        if [[ "$out" == *"Operation not permitted"* ]]; then
+            printf '%s\n' "$group"
+            return 0
+        fi
+    done
+    return 0
+}
+
+s68_metric_install_stop_reaches_root_processes() {
+    local workspace run elapsed task group child calls status alive summary
+    # sudo is available: SIGTERM, then SIGKILL at the limit, both to the
+    # recorded install group through sudo -n kill.
+    workspace="$(new_workspace s68_root_stop)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S68: the install must start the TERM-ignoring child" \
+        "$(tail -n 5 "${workspace}/run.out")"
+    if kill -0 "$child" 2>/dev/null; then
+        kill -KILL "$child" 2>/dev/null || true
+        _fail "S68: the install stop must end the TERM-ignoring child"
+    fi
+    assert_eq "FAIL_TIMEOUT" "$(ab_metric_value "$workspace" METRIC_RESULT)" "S68: the install timeout is FAIL_TIMEOUT"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S68: the run stops at the install"
+    task="$(ab_metric_task "$workspace")"
+    group="$(awk -F '\t' '$2 == "install" { print $10 }' "${task}/evidence/commands.tsv")"
+    [[ "$group" =~ ^[0-9]+$ ]] || _fail "S68: the install row records its group" "$group"
+    assert_eq "TIMEOUT" "$(awk -F '\t' '$2 == "install" { print $9 }' "${task}/evidence/commands.tsv")" \
+        "S68: the install row shows the timeout"
+    calls="$(ab_metric_calls "$workspace" | grep -E '^sudo -n kill ' || true)"
+    assert_eq "sudo -n kill -s TERM -- -${group}
+sudo -n kill -s KILL -- -${group}" "$calls" "S68: SIGTERM, then SIGKILL, go to the install group through sudo"
+    (( elapsed <= 15 )) || _fail "S68: the install stops at its 12-second limit" "elapsed: ${elapsed}"
+    assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job fails for the timeout"
+    assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup removes the task directory after the stop"
+    # sudo refuses: the child stays, as a root process stays. The run fails
+    # closed in a bounded time, and the cleanup keeps the task directory while
+    # the child runs in it.
+    workspace="$(new_workspace s68_root_survivor)"
+    ab_metric_fixture "$workspace"
+    run="$(ab_metric_run "$workspace" FAKE_ROOT_CHILD="${workspace}/root_child" FAKE_SUDO=deny \
+        METRIC_ACTIVE_DEADLINE="$(( $(date +%s) + 30 + 12 ))")"
+    elapsed="$(sed -e 's/.*elapsed=\([0-9]*\).*/\1/' <<< "$run")"
+    child="$(cat "${workspace}/root_child" 2>/dev/null || true)"
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S68: the install must start the TERM-ignoring child" \
+        "$(tail -n 5 "${workspace}/run.out")"
+    alive=no
+    if kill -0 "$child" 2>/dev/null; then alive=yes; fi
+    status="$(ab_metric_cleanup "$workspace")"
+    summary="$(cat "${workspace}/step_summary")"
+    if kill -0 "$child" 2>/dev/null; then alive="${alive} yes"; else alive="${alive} no"; fi
+    kill -KILL "$child" 2>/dev/null || true
+    task="$(ab_metric_task "$workspace")"
+    assert_eq "yes yes" "$alive" "S68: the child survives the refused signals, and the cleanup sends no signal"
+    assert_eq "FAIL_PROCESS_STOP" "$(ab_metric_value "$workspace" METRIC_RESULT)" \
+        "S68: a process that does not stop is FAIL_PROCESS_STOP"
+    assert_eq "install" "$(ab_metric_value "$workspace" METRIC_STOP_POINT)" "S68: the run stops at the install"
+    assert_eq "NOT_STOPPED" "$(awk -F '\t' '$2 == "install" { print $9 }' "${task}/evidence/commands.tsv")" \
+        "S68: the install row shows NOT_STOPPED"
+    (( elapsed <= 20 )) || _fail "S68: the stop is bounded: the limit, then at most the kill grace" "elapsed: ${elapsed}"
+    assert_eq "1" "$status" "S68: the cleanup fails while the child runs"
+    assert_dir_exists "$(ab_metric_root "$workspace")" "S68: the task directory stays while the child runs"
+    assert_contains "$summary" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" "S68: the summary shows the active process"
+    sleep 0.2
+    assert_eq "1" "$(ab_metric_cleanup "$workspace")" "S68: the job still fails after the child stops"
+    assert_dir_missing "$(ab_metric_root "$workspace")" "S68: the cleanup then removes the task directory"
+}
+
+s69_metric_process_checks_do_not_depend_on_permission() {
+    local workspace library root group out status summary start elapsed pid probe=()
+    # A recorded group that the test user may not signal: kill -0 fails with
+    # EPERM, but the group has a live process.
+    group="$(ab_metric_foreign_group)"
+    [[ -n "$group" ]] || _fail "S69: the test host must have a process group that the test user may not signal" \
+        "Run the contract tests as a user other than root."
+    workspace="$(new_workspace s69_foreign_group)"
+    ab_metric_fixture "$workspace"
+    library="$(ab_metric_library "$workspace")"
+    probe=(PATH="${workspace}/fakebin:${PATH}" FAKE_SUDO=deny METRIC_FAKE_CALLS="${workspace}/calls.tsv"
+           METRIC_FAKE_PIDS="${workspace}/fake_pids" METRIC_TASK_ROOT="${workspace}/probe"
+           METRIC_TASK_TEMP="${workspace}/probe/m3-mean-speed-validation")
+    mkdir -p "${workspace}/probe/m3-mean-speed-validation"
+    # The stop of an operation group does not take that group as empty. The
+    # signals fail with EPERM, so the group stays, and the stop says so after
+    # the kill grace.
+    start="$(date +%s)"
+    out="$(env "${probe[@]}" bash -c "${library}
+        stop_operation_group ${group} probe \$(( \$(date +%s) + 1 )) && echo status=0 || echo status=\$?
+        echo stop=\${OP_STOP:-UNSET}" 2>&1 || true)"
+    elapsed=$(( $(date +%s) - start ))
+    assert_contains "$out" "status=1" "S69: the stop does not take a group of another user as empty" "$out"
+    assert_contains "$out" "stop=NOT_STOPPED" "S69: the stop records NOT_STOPPED"
+    (( elapsed <= 9 )) || _fail "S69: the stop of a group that stays is bounded" "elapsed: ${elapsed}"
+    # The cleanup does not take that group as empty.
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    printf '99\tprobe\tEVIDENCE\t30\t30\t0\t0\t0\tCOMPLETED\t%s\t-\tprobe\n' "$group" \
+        >> "$(ab_metric_task "$workspace")/evidence/commands.tsv"
+    status="$(ab_metric_cleanup "$workspace")"
+    assert_eq "1" "$status" "S69: the cleanup fails while a recorded group of another user has a process"
+    assert_dir_exists "$root" "S69: the task directory stays while a recorded group of another user has a process"
+    assert_contains "$(cat "${workspace}/step_summary")" "| Cleanup | \`NOT_REMOVED_PROCESS_ACTIVE\` |" \
+        "S69: the summary shows the active group"
+    # A /proc entry that the scan cannot read makes the check incomplete. The
+    # test user may not read the working directory of a root process.
+    if readlink /proc/1/cwd > /dev/null 2>&1; then
+        _fail "S69: the test user must not be able to read /proc/1/cwd" "Run the contract tests as a user other than root."
+    fi
+    workspace="$(new_workspace s69_scan)"
+    ab_metric_fixture "$workspace"
+    ab_metric_run "$workspace" > /dev/null
+    root="$(ab_metric_root "$workspace")"
+    status="$(ab_metric_cleanup "$workspace" FAKE_SUDO=user)"
+    assert_eq "1" "$status" "S69: the cleanup fails when the scan cannot read a /proc entry"
+    assert_dir_exists "$root" "S69: the task directory stays after an incomplete scan"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_INCOMPLETE" \
+        "S69: the cleanup result is the incomplete scan"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "Permission denied" "S69: the log shows the unreadable entry"
+    # Without root access the scan does not run.
+    status="$(ab_metric_cleanup "$workspace" FAKE_SUDO=deny)"
+    assert_eq "1" "$status" "S69: the cleanup fails without root access"
+    assert_dir_exists "$root" "S69: the task directory stays without root access"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_FAILED" \
+        "S69: the cleanup result is the failed scan"
+    # The scan is bounded.
+    ln -s "${workspace}/metric_fake" "${workspace}/fakebin/find"
+    start="$(date +%s)"
+    status="$(ab_metric_cleanup "$workspace" FAKE_BLOCK=find)"
+    elapsed=$(( $(date +%s) - start ))
+    rm -f -- "${workspace}/fakebin/find"
+    assert_eq "1" "$status" "S69: the cleanup fails when the scan does not end"
+    assert_dir_exists "$root" "S69: the task directory stays after a scan timeout"
+    assert_contains "$(cat "${workspace}/cleanup.out")" "cleanup: NOT_REMOVED_PROCESS_CHECK_TIMEOUT" \
+        "S69: the cleanup result is the scan timeout"
+    (( elapsed <= 10 )) || _fail "S69: the scan stops at its limit" "elapsed: ${elapsed}"
+    while IFS= read -r pid; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "S69: the blocked scan must stop" "pid ${pid}"
+        fi
+    done < "${workspace}/fake_pids"
+    # With the root view and no user, the cleanup removes the directory.
+    status="$(ab_metric_cleanup "$workspace")"
+    summary="$(cat "${workspace}/step_summary")"
+    assert_eq "0" "$status" "S69: the cleanup passes after a complete scan"
+    assert_dir_missing "$root" "S69: the cleanup removes the task directory after a complete scan"
+    assert_contains "$summary" "| Cleanup | \`REMOVED\` |" "S69: the summary shows the removal"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -5497,6 +5706,8 @@ AB_OBSERVATIONS=(
     s65_metric_limits_and_process_cleanup
     s66_metric_log_and_artifact_limits
     s67_metric_task_directory_and_cleanup
+    s68_metric_install_stop_reaches_root_processes
+    s69_metric_process_checks_do_not_depend_on_permission
 )
 
 # One observation runs in this process when the caller names it. The scenario
