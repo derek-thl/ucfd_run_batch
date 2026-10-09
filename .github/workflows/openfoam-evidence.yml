@@ -1760,19 +1760,19 @@ jobs:
           '
 
           # The process check of the task directory. Arguments: the task directory, the
-          # runner UID, and the boot time of the metric start in centiseconds. For each
-          # process with the runner UID as its real, effective, saved, or file-system
-          # UID: the working directory and the open files of each thread, and the mapped
-          # files. A process that started at or after the metric start is relevant: each
-          # metric descendant is one, because no metric command uses privilege. A
-          # relevant process that still runs and that cannot be read completely makes the
-          # check UNCERTAIN. A runner-UID process that started before the metric cannot
-          # be a metric descendant; if it cannot be read, it is counted. A thread that
-          # ends during the check, or an open file that closes during it, is not an
-          # error: the check of the open files is a snapshot of the listing. A process
-          # with another error gets two more checks, after 0.05 and 0.25 seconds when it
-          # is relevant, so a thread that is ending can end. Output: MATCH, UNCERTAIN,
-          # and OLDER_UNREADABLE lines, then END.
+          # runner UID, and the boot time of the metric start in centiseconds. A
+          # relevant process is a live process with the runner UID as its real,
+          # effective, saved, or file-system UID. For each relevant process: the working
+          # directory and the open files of each thread, and the mapped files. A
+          # relevant process that cannot be read completely makes the check UNCERTAIN,
+          # also when it started before the metric: its start time does not prove that
+          # it does not use the task directory. Such an older process is also counted
+          # (OLDER_UNREADABLE), for the evidence only. A thread that ends during the
+          # check, or an open file that closes during it, is not an error: the check of
+          # the open files is a snapshot of the listing. A process with another error
+          # gets two more checks, after 0.05 and 0.25 seconds, so a thread that is
+          # ending can end; after the first UNCERTAIN line, the checks have no pause.
+          # Output: MATCH, UNCERTAIN, and OLDER_UNREADABLE lines, then END.
           METRIC_USERS_SCRIPT='
           dir="$1" uid="$2" since="$3"
           shopt -s nullglob
@@ -1883,23 +1883,22 @@ jobs:
               fi
               check "$proc"
           }
+          refused=0
           for status in /proc/[0-9]*/status; do
               proc="${status%/status}"
               examine "$proc"
               if [[ -n "$problem" ]]; then
                   for pause in 0.05 0.25; do
-                      (( new )) && sleep "$pause"
+                      (( refused )) || sleep "$pause"
                       examine "$proc"
                       [[ -z "$problem" ]] && break
                   done
               fi
               (( relevant )) || continue
               if [[ -n "$problem" ]]; then
-                  if (( new )); then
-                      printf "UNCERTAIN %s\n" "$problem"
-                  else
-                      printf "OLDER_UNREADABLE %s\n" "$proc"
-                  fi
+                  refused=1
+                  printf "UNCERTAIN %s\n" "$problem"
+                  (( new )) || printf "OLDER_UNREADABLE %s\n" "$proc"
               fi
           done
           printf "END\n"
@@ -2836,9 +2835,14 @@ jobs:
                   metric_fail CLEANUP_FAILURE "a process still uses the task directory: ${users[*]:0:3}"
                   return 0
               fi
-              if (( ended == 0 || ${#uncertain[@]} > 0 )); then
+              if (( ended == 0 )); then
                   M_CLEANUP=REFUSED_PROCESS_CHECK
-                  metric_fail CLEANUP_FAILURE "the process check of the task directory is not complete, so the task directory stays: ${uncertain[0]:-no end record}"
+                  metric_fail CLEANUP_FAILURE "the process check of the task directory has no end record, so the task directory stays"
+                  return 0
+              fi
+              if (( ${#uncertain[@]} > 0 )); then
+                  M_CLEANUP=REFUSED_PROCESS_CHECK
+                  metric_fail CLEANUP_FAILURE "the process check of the task directory is not complete for ${#uncertain[@]} runner-UID processes (${M_OLDER_UNREADABLE} started before the metric), so the task directory stays: ${uncertain[0]}"
                   return 0
               fi
               metric_op remove CLEANUP rm -rf -- "$TASK_TEMP"
