@@ -4748,6 +4748,22 @@ CHECK_LOG
             du -sb -- "${case_dir%/case}" | cut -f 1 > "$FAKE_TRANSIENT_RECORD"
             rm -f -- "${case_dir}/transient.bin"
         fi
+        # FAKE_MAPPED_FILE=<file>: a process of the test user that leaves its
+        # group, maps a file of the Case, closes that file, and moves its
+        # working directory out of the Case. Its PID goes to the file.
+        if [[ -n "${FAKE_MAPPED_FILE:-}" ]]; then
+            setsid python3 -c 'import mmap, os, sys, time
+fd = os.open(os.path.join(sys.argv[1], "system", "controlDict"), os.O_RDONLY)
+mapped = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+os.close(fd)
+os.chdir("/")
+print(os.getpid(), flush=True)
+time.sleep(30)' "$case_dir" < /dev/null > "$FAKE_MAPPED_FILE" 2> /dev/null &
+            for (( wait_tick = 0; wait_tick < 200; wait_tick++ )); do
+                [[ -s "$FAKE_MAPPED_FILE" ]] && break
+                sleep 0.01
+            done
+        fi
         # FAKE_HIDDEN_USER=<file>: a process of the test user that leaves its
         # group, keeps its working directory in the Case, and makes its /proc
         # entries unreadable (PR_SET_DUMPABLE 0). Its PID goes to the file.
@@ -6528,12 +6544,16 @@ s82_collect_failed_log_evidence_fails_closed() {
     assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
     ab_collect_expect "S82 log copy" COMMAND_FAILURE ab_collect_fail_log_copy
     assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
+    # A failed listing of the evidence inventory is not an empty inventory.
+    ab_collect_expect "S82 evidence inventory" COMMAND_FAILURE ab_collect_fail_inventory
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" INVENTORY)" "UNAVAILABLE_" "S82: the inventory is not complete"
 }
 ab_collect_fail_log_sizes() { ab_fake_fail "$1" find '*m3-metric-collection.*/logs'; }
 ab_collect_fail_log_copy() { ab_fake_fail "$1" cp '*m3-mean-speed/logs/'; }
+ab_collect_fail_inventory() { ab_fake_fail "$1" find './inventory.txt'; }
 
 s83_collect_task_bytes_stay_in_the_limit() {
-    local workspace observed
+    local workspace observed evidence label before
     # F2: a file that would take the task directory above 4294967296 apparent
     # bytes for a moment is stopped, so the task directory never holds it.
     workspace="$(new_workspace s83_transient)"
@@ -6548,6 +6568,32 @@ s83_collect_task_bytes_stay_in_the_limit() {
         "S83: a file above the task byte limit is RESOURCE_LIMIT"
     assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S83: no value is accepted"
     assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S83: the capture is incomplete"
+    # The file limit of the copy and of the calculation is the task bytes left
+    # after the measurement just before the operation.
+    evidence="${workspace}/runner_temp/evidence/m3-mean-speed"
+    for label in copy:task-bytes-before-copy:TASK_COPY_FILE_LIMIT_BYTES \
+                 metric:task-bytes-before-calculation:TASK_CALCULATION_FILE_LIMIT_BYTES; do
+        before="$(cut -f 1 "${evidence}/$(cut -d : -f 2 <<< "$label").out" 2>/dev/null || true)"
+        [[ "$before" =~ ^[0-9]+$ ]] || _fail "S83: the measurement before ${label%%:*} is recorded"
+        assert_eq "$(( 4294967296 - before ))" "$(ab_collect_value "$workspace" "${label##*:}")" \
+            "S83: the ${label%%:*} file limit is the task bytes left"
+        assert_eq "$(( 4294967296 - before ))" \
+            "$(awk -F '\t' -v op="${label%%:*}" '$2 == op { print $5 }' "${evidence}/commands.tsv")" \
+            "S83: the ${label%%:*} operation runs with that file limit"
+    done
+    # An input file above the 1048577-byte limit of the other operations
+    # copies, because the copy has the task bytes left.
+    workspace="$(new_workspace s83_large_input)"
+    ab_collect_fixture "$workspace"
+    truncate -s 2097152 "$(ab_collect_flow "$workspace")/2/large"
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S83: a 2097152-byte input copies"
+    assert_eq "16" "$(ab_collect_value "$workspace" INPUT_FILES)" "S83: the large input is in the snapshot"
+    # Two files, each in its file limit, that together take the task directory
+    # above the limit, are seen by the measurement after the calculation.
+    ab_collect_expect "S83 measured total" RESOURCE_LIMIT - FAKE_BIG_FILE=4293918720 FAKE_STDOUT_BYTES=1048577
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "the task directory has" \
+        "S83: the measurement after the calculation sees the total"
 }
 
 s84_collect_cleanup_needs_a_complete_process_check() {
@@ -6578,6 +6624,20 @@ s84_collect_cleanup_needs_a_complete_process_check() {
         "S84: the refusal names the incomplete process check"
     assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S84: no value is accepted"
     [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays while the process check is incomplete"
+    # A process that only maps a file of the task directory also uses it.
+    workspace="$(new_workspace s84_mapped_file)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_MAPPED_FILE="${workspace}/mapped_file" > /dev/null
+    pid="$(cat "${workspace}/mapped_file" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        _fail "S84: the mapping process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+    fi
+    assert_eq "REFUSED_PROCESS_ACTIVE" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: a mapped file of the task directory stops the removal"
+    assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "/maps" "S84: the reason names the mapped file"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays while a file of it is mapped"
 }
 
 s85_collect_time_record_read_is_bounded() {
@@ -6601,7 +6661,17 @@ s85_collect_time_record_read_is_bounded() {
     [[ "$used" =~ ^[0-9]+$ ]] && (( used >= 1000 )) ||
         _fail "S85: the read counts against the work budget" "used: ${used} ms"
     [[ "$start" =~ ^[0-9]+$ ]] || _fail "S85: the start is recorded"
+    # The read takes at most 65 bytes, and the record must be one line of at
+    # most 64 bytes with no NUL byte.
+    ab_collect_expect "S85 long record" SOURCE_MISMATCH ab_collect_record_long
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "more than 64 bytes" \
+        "S85: a record above 64 bytes is refused"
+    ab_collect_expect "S85 NUL record" SOURCE_MISMATCH ab_collect_record_nul
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "NUL byte" \
+        "S85: a record with a NUL byte is refused"
 }
+ab_collect_record_long() { printf '%064d\n' 2 > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_nul() { printf '2\n\0' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
 
 s86_collect_value_and_volume_convert_to_finite_doubles() {
     # F5: a token that does not convert to a finite double, and a volume that
