@@ -132,6 +132,11 @@
 # post-processing time record (F4), and a value or volume that does not
 # convert to a finite double (F5).
 #
+# Check S87 covers PR #98 review 5466999244 (F3): a process of the test user
+# that starts before the metric clock and enters the task Case. An unreadable
+# one keeps the Case with REFUSED_PROCESS_CHECK; a readable one with
+# REFUSED_PROCESS_ACTIVE.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4748,6 +4753,16 @@ CHECK_LOG
             du -sb -- "${case_dir%/case}" | cut -f 1 > "$FAKE_TRANSIENT_RECORD"
             rm -f -- "${case_dir}/transient.bin"
         fi
+        # FAKE_OLDER_FIFO=<fifo>, FAKE_OLDER_OUT=<file>: a process that the test
+        # started before the metric clock gets the Case path through the FIFO,
+        # enters the Case, and writes READY to FAKE_OLDER_OUT.
+        if [[ -n "${FAKE_OLDER_FIFO:-}" ]]; then
+            printf '%s\n' "$case_dir" > "$FAKE_OLDER_FIFO"
+            for (( wait_tick = 0; wait_tick < 300; wait_tick++ )); do
+                [[ "$(tail -n 1 "$FAKE_OLDER_OUT" 2>/dev/null)" == READY ]] && break
+                sleep 0.01
+            done
+        fi
         # FAKE_MAPPED_FILE=<file>: a process of the test user that leaves its
         # group, maps a file of the Case, closes that file, and moves its
         # working directory out of the Case. Its PID goes to the file.
@@ -6680,6 +6695,102 @@ s86_collect_value_and_volume_convert_to_finite_doubles() {
     ab_collect_expect "S86 volume 1e-9999" INVALID_VOLUME - FAKE_DAT_VOLUME=1e-9999
 }
 
+# ab_collect_host_unreadable - the live processes of the test user whose /proc
+# fd entry the test user cannot read, as "<count>: <name>(<pid>) ...". Such a
+# process makes every cleanup refuse, so a test that expects a removed task
+# directory needs a host without one.
+ab_collect_host_unreadable() {
+    local status proc item uid name state count=0 list=""
+    local -a lines=()
+    uid="$(id -u)"
+    for status in /proc/[0-9]*/status; do
+        proc="${status%/status}"
+        { mapfile -t lines < "$status"; } 2>/dev/null || continue
+        name="" state="" item=""
+        for item in "${lines[@]}"; do
+            case "$item" in
+                Name:*) name="${item#Name:}"; name="${name//[[:space:]]/}" ;;
+                State:*) state="${item#State:}"; state="${state//[[:space:]]/}"; state="${state:0:1}" ;;
+                Uid:*) item=" ${item#Uid:} "; item="${item//[[:space:]]/ }"; break ;;
+            esac
+        done
+        [[ "$item" == *" ${uid} "* && "$state" != Z && "$state" != X ]] || continue
+        if [[ ! -r "${proc}/fd" && -e "$proc" ]]; then
+            count=$(( count + 1 ))
+            list="${list} ${name}(${proc#/proc/})"
+        fi
+    done
+    printf '%s:%s\n' "$count" "${list:- none}"
+}
+
+# ab_collect_older_run <workspace> <dumpable> - start a process of the test
+# user before the capture step, so it starts before the metric clock. During
+# the fake calculation, it gets the Case path, enters the Case, and, for
+# dumpable 0, makes its /proc entries unreadable (PR_SET_DUMPABLE 0). Then
+# run the capture step. Sets AB_OLDER_PID.
+ab_collect_older_run() {
+    local workspace="$1" dumpable="$2" fifo_fd tick
+    AB_OLDER_PID=""
+    mkfifo -- "${workspace}/older.fifo"
+    exec {fifo_fd}<>"${workspace}/older.fifo"
+    setsid python3 -u -c 'import ctypes, os, sys, time
+print(os.getpid(), flush=True)
+target = sys.stdin.readline().rstrip("\n")
+if not target.startswith(sys.argv[1] + "/runner_temp/m3-metric-collection.") or not target.endswith("/case"):
+    raise SystemExit(2)
+os.chdir(target)
+if sys.argv[2] == "0" and ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(3)
+print("READY", flush=True)
+time.sleep(30)' "$workspace" "$dumpable" <&"$fifo_fd" > "${workspace}/older.out" 2> /dev/null &
+    for (( tick = 0; tick < 200; tick++ )); do
+        [[ -s "${workspace}/older.out" ]] && break
+        sleep 0.01
+    done
+    AB_OLDER_PID="$(head -n 1 "${workspace}/older.out")"
+    ab_collect_run "$workspace" FAKE_OLDER_FIFO="${workspace}/older.fifo" \
+        FAKE_OLDER_OUT="${workspace}/older.out" > /dev/null
+    exec {fifo_fd}>&-
+}
+
+s87_collect_older_process_in_the_case_keeps_it() {
+    local workspace rows dumpable result
+    # F3 (review 5466999244): the start time of a process does not prove that
+    # it does not use the task directory.
+    printf 'HOST_UNREADABLE_TEST_USER_PROCESSES=%s\n' "$(ab_collect_host_unreadable)"
+    for dumpable in 0 1; do
+        workspace="$(new_workspace "s87_older_${dumpable}")"
+        ab_collect_fixture "$workspace"
+        ab_collect_older_run "$workspace" "$dumpable"
+        rows="$(cat "${workspace}/runner_temp/evidence/m3-mean-speed/logs/"*-users.out 2>/dev/null || true)"
+        if [[ "$AB_OLDER_PID" =~ ^[0-9]+$ ]]; then
+            kill -KILL "$AB_OLDER_PID" 2>/dev/null || true
+        else
+            _fail "S87: the older process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+        fi
+        [[ "$(tail -n 1 "${workspace}/older.out")" == READY ]] ||
+            _fail "S87: the older process must enter the task Case during the calculation"
+        if (( dumpable == 0 )); then
+            result=REFUSED_PROCESS_CHECK
+            assert_contains "$rows" "OLDER_UNREADABLE /proc/${AB_OLDER_PID}" \
+                "S87: the test process started before the metric clock and is unreadable"
+            assert_contains "$rows" "UNCERTAIN find: '/proc/${AB_OLDER_PID}/" \
+                "S87: the unreadable older process makes the process check uncertain"
+        else
+            result=REFUSED_PROCESS_ACTIVE
+            assert_contains "$rows" "MATCH /proc/${AB_OLDER_PID}/" "S87: the readable older process is found"
+        fi
+        assert_eq "$result" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+            "S87 dumpable ${dumpable}: the cleanup refusal is ${result}"
+        assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+            "S87 dumpable ${dumpable}: the removal stops"
+        assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S87: no value is accepted"
+        assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S87: no numeric value"
+        assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S87: the capture is incomplete"
+        [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S87 dumpable ${dumpable}: the task directory stays"
+    done
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -6784,6 +6895,7 @@ AB_OBSERVATIONS=(
     s84_collect_cleanup_needs_a_complete_process_check
     s85_collect_time_record_read_is_bounded
     s86_collect_value_and_volume_convert_to_finite_doubles
+    s87_collect_older_process_in_the_case_keeps_it
 )
 
 # One observation runs in this process when the caller names it. The scenario
