@@ -6617,6 +6617,11 @@ ab_collect_block() {
 
 s72_collect_volume_weighted_mean_of_the_latest_time() {
     local workspace run flow evidence before after calls task line summary file
+    # A GitHub-hosted runner runs the real admitted check here, never the fake
+    # boundary, so a pass there proves the root monitor assertions below.
+    if [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]; then
+        assert_eq "yes" "$AB_CHECK_HOSTED" "S72: the GitHub-hosted runner runs the real admitted check (ImageOS '${ImageOS:-}')"
+    fi
     workspace="$(new_workspace s72_collect)"
     ab_collect_fixture "$workspace"
     flow="$(ab_collect_flow "$workspace")"
@@ -7455,6 +7460,13 @@ printf "%s" "${METRIC_ROOT_CHECK_SOURCE:-}"')"
         -c "$source" m3-process-guard "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" 2>&1 && echo status=0 || echo "status=$?")"
     assert_contains "$out" "status=2" "S89: the guard refuses to run without its timeout monitor"
     assert_not_contains "$out" "FRAME " "S89: no scan starts without the monitor"
+    # A parent that leads the process group of the guard, but is not the
+    # timeout monitor, is refused too.
+    out="$(timeout --foreground --kill-after=2s 20s setsid bash --noprofile --norc -c \
+        'env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p -c "$1" m3-process-guard "${@:2}"; exit $?' \
+        parent "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" 2>&1 && echo status=0 || echo "status=$?")"
+    assert_contains "$out" "status=2" "S89: the guard refuses a group leader that is not its timeout monitor"
+    assert_not_contains "$out" "FRAME " "S89: no scan starts under another group leader"
     # A valid launch: the scan time comes from the absolute end, and the guard
     # runs under its monitor, in the monitor process group.
     read -r up _ < /proc/uptime
