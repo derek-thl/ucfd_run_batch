@@ -1635,6 +1635,13 @@ jobs:
           # evidence, and a completed cleanup. Every other end gives UNAVAILABLE, no
           # value, and one reason code. The value is not convergence, mesh, PointData, or
           # M3 acceptance, and no scientific range applies.
+          #
+          # Corrected contract 6084196797: the task directory is measured at five
+          # checkpoints, and each file of the copy and the calculation is limited to the
+          # measured task bytes left (Section 3). The cleanup reads /proc as root only
+          # through one exact sudo -n vector of a fixed read-only source, with its own
+          # root monitor, inside the cleanup reserve (Section 4). The removal and all
+          # evidence stay unprivileged.
 
           METRIC_TOTAL_MS=180000
           METRIC_SELECT_MS=10000
@@ -1654,6 +1661,17 @@ jobs:
           METRIC_OP_FILE_LIMIT=1048577
           # The post-processing time record: at most 64 bytes.
           METRIC_RECORD_LIMIT=64
+          # The cleanup has one absolute end. Its first part, at most 12000 ms, is for
+          # the process-check launch, scan, stop, and stop verification; the rest, at
+          # least 8000 ms, is for the unprivileged path recheck and the removal.
+          METRIC_CHECK_MS=12000
+          METRIC_REMOVE_MS=8000
+          # The installed executables of the process check: the outer vector, then the
+          # fixed source. Each must resolve to a regular root-owned file that is not
+          # group- or world-writable, in a directory of the same kind.
+          METRIC_CHECK_TOOLS=(/usr/bin/sudo /usr/bin/env /usr/bin/bash /usr/bin/prlimit /usr/bin/timeout /usr/bin/getconf /usr/bin/find /usr/bin/grep /usr/bin/sleep)
+          # The OS record of the hosted-runner gate.
+          METRIC_OS_RELEASE=/etc/os-release
           METRIC_DICTIONARY_SHA256=ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef
           METRIC_NUMBER_RE='^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$'
           METRIC_TIME_RE='^[0-9]+([.][0-9]+)?$'
@@ -1759,30 +1777,112 @@ jobs:
           mkdir -- "$dir/case" "$dir/config" "$dir/logs" || exit 2
           '
 
-          # The process check of the task directory. Arguments: the task directory, the
-          # runner UID, and the boot time of the metric start in centiseconds. A
-          # relevant process is a live process with the runner UID as its real,
-          # effective, saved, or file-system UID. For each relevant process: the working
-          # directory and the open files of each thread, and the mapped files. A
-          # relevant process that cannot be read completely makes the check UNCERTAIN,
-          # also when it started before the metric: its start time does not prove that
-          # it does not use the task directory. Such an older process is also counted
-          # (OLDER_UNREADABLE), for the evidence only. A thread that ends during the
-          # check, or an open file that closes during it, is not an error: the check of
-          # the open files is a snapshot of the listing. A process with another error
-          # gets two more checks, after 0.05 and 0.25 seconds, so a thread that is
-          # ending can end; after the first UNCERTAIN line, the checks have no pause.
-          # Output: MATCH, UNCERTAIN, and OLDER_UNREADABLE lines, then END.
-          METRIC_USERS_SCRIPT='
-          dir="$1" uid="$2" since="$3"
+          # The fixed read-only process check of the cleanup (contract 6084196797,
+          # Section 4). The cleanup runs it as root through the one admitted sudo -n
+          # vector, with a clean environment and no caller command. $0 selects the part:
+          # m3-process-check is the launch, and m3-process-guard is the guard under the
+          # root monitor, which runs this same fixed text again (FIXED_GUARD_SOURCE).
+          # Arguments: the task directory, RUNNER_TEMP, the original runner UID, the
+          # boot time of the metric start and the absolute check end, both in
+          # centiseconds, and the correlation token. Both parts check the arguments.
+          #
+          # The launch reads the boot clock and takes the scan interval: the time to the
+          # absolute end less 500 centiseconds for the TERM grace and 100 for the stop
+          # verification, at most 600. It refuses when the interval is not positive. It
+          # writes the LAUNCH record and runs the monitor chain: prlimit, then timeout,
+          # which sends SIGTERM to its own private process group at the interval and
+          # SIGKILL 5 seconds later, then the guard. The guard records the monitor and
+          # starts the scan in the monitor group. On SIGTERM it starts no new work. It
+          # ends only when every other process of the group has stopped, so a check
+          # child that ignores SIGTERM keeps the guard until the monitor SIGKILL, and no
+          # check child outlives the monitor. The guard signals nothing.
+          #
+          # The scan is the strict check of the continuation head 2902e9ab. A relevant
+          # process is a live process with the runner UID as its real, effective, saved,
+          # or file-system UID. For each one, the scan reads the working directory and
+          # the open files of each thread, and the mapped files. A relevant process that
+          # cannot be read completely is UNCERTAIN, also when it started before the
+          # metric; such an older process is also counted (OLDER_UNREADABLE), for the
+          # evidence only. A thread that ends, or an open file that closes, during the
+          # check is not an error. A process with another error gets two more checks,
+          # after 0.05 and 0.25 seconds; after the first UNCERTAIN line, the checks have
+          # no pause. The check reads only /proc identity, state, UID, and start-time
+          # metadata, the thread cwd and fd links, and the mapped files, and it keeps no
+          # unmatched data. The frame: LAUNCH, FRAME, and MONITOR; MATCH, UNCERTAIN, and
+          # OLDER_UNREADABLE lines; then SCAN_END, CHILD, and END.
+          METRIC_ROOT_CHECK_SOURCE='
+          set -u
           shopt -s nullglob
-          exec 3>&1
-          clk="$(getconf CLK_TCK)" || exit 1
-          [[ "$clk" =~ ^[1-9][0-9]*$ ]] || exit 1
-          gone_re="^([^:]*/)?find: .(/proc/[0-9]+/task/[0-9]+)(/cwd|/fd|/fd/[0-9]+).: (No such file or directory|No such process)$"
-          # status_of <proc> - set uids and state from one sequential read of the
-          # status file. A line-by-line read seeks back after each line, and the kernel
-          # then makes the text again, with a State line that can have a new length.
+          cd / || exit 2
+          m3_refuse() {
+              printf "m3 process check: %s\n" "$1" >&2
+              exit 2
+          }
+          m3_valid() {
+              local part rest
+              (( $# == 6 )) || m3_refuse "$# arguments, not 6"
+              task="$1" runner="$2" uid="$3" since="$4" end="$5" token="$6"
+              [[ "$runner" =~ ^(/[A-Za-z0-9_.-]+)+$ ]] || m3_refuse "RUNNER_TEMP is not a safe absolute path"
+              rest="${runner#/}"
+              while :; do
+                  part="${rest%%/*}"
+                  [[ "$part" != . && "$part" != .. && "$part" != -* ]] || m3_refuse "RUNNER_TEMP has an unsafe component"
+                  [[ "$rest" == */* ]] || break
+                  rest="${rest#*/}"
+              done
+              [[ "${task%/*}" == "$runner" && "${task##*/}" =~ ^m3-metric-collection[.][A-Za-z0-9]{8}$ ]] ||
+                  m3_refuse "the task directory is not the unique metric directory under RUNNER_TEMP"
+              [[ "$uid" =~ ^[1-9][0-9]{0,9}$ ]] && (( uid <= 4294967294 )) || m3_refuse "the runner UID is not a positive UID"
+              [[ "$since" =~ ^(0|[1-9][0-9]{0,11})$ && "$end" =~ ^[1-9][0-9]{0,11}$ ]] && (( since < end )) ||
+                  m3_refuse "the boot-clock values are not valid"
+              [[ "$token" =~ ^[A-Za-z0-9]{8,64}$ ]] || m3_refuse "the token is not 8 to 64 letters and digits"
+              [[ -d "$task" && ! -L "$task" ]] || m3_refuse "the task directory is not a directory"
+              cd -P -- "$runner" 2> /dev/null && [[ "$PWD" == "$runner" ]] || m3_refuse "RUNNER_TEMP is not a canonical path"
+              cd / || m3_refuse "the root directory cannot be entered"
+          }
+          m3_now() {
+              local up rest
+              { read -r up rest < /proc/uptime; } 2> /dev/null || return 1
+              [[ "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]] || return 1
+              now=$(( 10#${up/./} ))
+          }
+          m3_launch() {
+              local scan duration FIXED_GUARD_SOURCE="$BASH_EXECUTION_STRING"
+              m3_valid "$@"
+              m3_now || m3_refuse "the boot clock cannot be read"
+              scan=$(( end - now - 600 ))
+              (( scan > 0 )) || m3_refuse "no scan time is left: the check end ${end} is not 600 centiseconds after ${now}"
+              (( scan <= 600 )) || scan=600
+              duration="$(( scan / 100 )).$(( scan % 100 / 10 ))$(( scan % 10 ))"
+              printf "LAUNCH 1 %s %s %s\n" "$token" "$now" "$scan"
+              exec /usr/bin/prlimit --core=1 --fsize=1048577 -- \
+                  /usr/bin/timeout --signal=TERM --kill-after=5s "$duration" \
+                  /usr/bin/bash --noprofile --norc -p -c "$FIXED_GUARD_SOURCE" m3-process-guard "$@"
+          }
+          m3_stat() {
+              local line
+              local -a fields=()
+              st_state="" st_group="" st_start="" st_name=""
+              { read -r line < "/proc/$1/stat"; } 2> /dev/null || return 1
+              st_name="${line#*(}"
+              st_name="${st_name%)*}"
+              read -r -a fields <<< "${line##*") "}"
+              st_state="${fields[0]:-}" st_group="${fields[2]:-}" st_start="${fields[19]:-}"
+              [[ "$st_group" =~ ^[0-9]+$ && "$st_start" =~ ^[0-9]+$ ]]
+          }
+          m3_others() {
+              local file pid
+              others=""
+              for file in /proc/[0-9]*/stat; do
+                  pid="${file:6:-5}"
+                  [[ "$pid" == "$1" || "$pid" == "$$" ]] && continue
+                  if ! m3_stat "$pid"; then
+                      [[ -e "$file" ]] && others="${others} ${pid}?"
+                      continue
+                  fi
+                  [[ "$st_group" == "$1" && "$st_state" != Z && "$st_state" != X ]] && others="${others} ${pid}"
+              done
+          }
           status_of() {
               local item
               local -a lines=()
@@ -1802,8 +1902,6 @@ jobs:
               done
               return 0
           }
-          # ended <path> - status 0 when the process or thread at /proc/<pid> or
-          # /proc/<pid>/task/<tid> has ended or is a zombie.
           ended() {
               [[ -e "$1" ]] || return 0
               if ! status_of "$1"; then
@@ -1812,8 +1910,6 @@ jobs:
               fi
               [[ "$state" == Z || "$state" == X || ! -e "$1" ]]
           }
-          # check <proc> - one check of one process. Sets problem, empty when the check
-          # is complete.
           check() {
               local proc="$1" errors rc line explained=0
               local -a paths=("$1"/task/*/cwd "$1"/task/*/fd)
@@ -1822,7 +1918,7 @@ jobs:
                   ended "$proc" || problem="${proc}: no thread entries"
                   return 0
               fi
-              errors="$( { LC_ALL=C find "${paths[@]}" -maxdepth 1 \( -lname "$dir" -o -lname "$dir/*" \) \
+              errors="$( { LC_ALL=C /usr/bin/find "${paths[@]}" -maxdepth 1 \( -lname "$dir" -o -lname "$dir/*" \) \
                            -printf "MATCH %p\n" >&3; } 2>&1 )"
               rc=$?
               if (( rc != 0 )); then
@@ -1840,7 +1936,7 @@ jobs:
                       return 0
                   fi
               fi
-              grep -F -q -e "${dir}/" -- "${proc}/maps" 2>/dev/null
+              /usr/bin/grep -F -q -e "${dir}/" -- "${proc}/maps" 2>/dev/null
               rc=$?
               if (( rc == 0 )); then
                   printf "MATCH %s/maps\n" "$proc"
@@ -1849,10 +1945,6 @@ jobs:
               fi
               return 0
           }
-          # examine <proc> - one check of one process. Sets relevant to 1 for a live
-          # process with the runner UID, or with a status that cannot be read; new to 0
-          # for a process that started before the metric; and problem, empty when the
-          # check is complete.
           examine() {
               local proc="$1" line="" start
               local -a fields=()
@@ -1883,25 +1975,105 @@ jobs:
               fi
               check "$proc"
           }
-          refused=0
-          for status in /proc/[0-9]*/status; do
-              proc="${status%/status}"
-              examine "$proc"
-              if [[ -n "$problem" ]]; then
-                  for pause in 0.05 0.25; do
-                      (( refused )) || sleep "$pause"
-                      examine "$proc"
-                      [[ -z "$problem" ]] && break
-                  done
+          m3_scan() {
+              local status proc pause refused=0
+              dir="$task"
+              exec 3>&1
+              clk="$(/usr/bin/getconf CLK_TCK)" || exit 1
+              [[ "$clk" =~ ^[1-9][0-9]*$ ]] || exit 1
+              gone_re="^([^:]*/)?find: .(/proc/[0-9]+/task/[0-9]+)(/cwd|/fd|/fd/[0-9]+).: (No such file or directory|No such process)$"
+              for status in /proc/[0-9]*/status; do
+                  proc="${status%/status}"
+                  examine "$proc"
+                  if [[ -n "$problem" ]]; then
+                      for pause in 0.05 0.25; do
+                          (( refused )) || /usr/bin/sleep "$pause"
+                          examine "$proc"
+                          [[ -z "$problem" ]] && break
+                      done
+                  fi
+                  (( relevant )) || continue
+                  if [[ -n "$problem" ]]; then
+                      refused=1
+                      printf "UNCERTAIN %s\n" "$problem"
+                      (( new )) || printf "OLDER_UNREADABLE %s\n" "$proc"
+                  fi
+              done
+              printf "SCAN_END\n"
+          }
+          m3_guard() {
+              local monitor="$PPID" mstart euid="" scan_pid scan_start="" scan_rc=1 status line
+              local -a lines=()
+              m3_valid "$@"
+              m3_stat "$monitor" && [[ "$st_name" == timeout && "$st_group" == "$monitor" ]] ||
+                  m3_refuse "the guard does not run under its timeout monitor"
+              mstart="$st_start"
+              m3_stat "$$" && [[ "$st_group" == "$monitor" ]] || m3_refuse "the guard is not in the monitor process group"
+              { mapfile -t lines < /proc/self/status; } 2> /dev/null
+              for line in "${lines[@]}"; do
+                  if [[ "$line" == Uid:* ]]; then
+                      read -r _ _ euid _ <<< "$line"
+                      break
+                  fi
+              done
+              term=0
+              trap "term=1" TERM
+              printf "FRAME 1 %s %s %s %s\n" "$token" "$task" "$uid" "$end"
+              printf "MONITOR %s %s %s %s\n" "$monitor" "$monitor" "$mstart" "${euid:-UNAVAILABLE}"
+              m3_scan &
+              scan_pid=$!
+              m3_stat "$scan_pid" && scan_start="$st_start"
+              while :; do
+                  wait "$scan_pid" && scan_rc=0 || scan_rc=$?
+                  m3_stat "$scan_pid" && [[ "$st_start" == "$scan_start" ]] || break
+              done
+              printf "CHILD %s %s\n" "$scan_pid" "$scan_start"
+              while :; do
+                  m3_others "$monitor"
+                  [[ -z "$others" ]] && break
+                  /usr/bin/sleep 0.1
+              done
+              status=COMPLETE
+              if (( term )); then
+                  status=TERMINATED
+              elif (( scan_rc != 0 )); then
+                  status="SCAN_STATUS_${scan_rc}"
               fi
-              (( relevant )) || continue
-              if [[ -n "$problem" ]]; then
-                  refused=1
-                  printf "UNCERTAIN %s\n" "$problem"
-                  (( new )) || printf "OLDER_UNREADABLE %s\n" "$proc"
+              m3_now || now=0
+              printf "END 1 %s %s %s\n" "$token" "$status" "$now"
+              [[ "$status" == COMPLETE ]]
+          }
+          case "$0" in
+              m3-process-check) m3_launch "$@" ;;
+              m3-process-guard) m3_guard "$@" ;;
+              *) m3_refuse "the part is not known" ;;
+          esac
+          '
+          readonly METRIC_ROOT_CHECK_SOURCE
+
+          # The unprivileged check of the process-check executables before any
+          # elevation, and the SHA-256 of the fixed source. Arguments: the source, then
+          # the executables. One TOOL row for each: the path, the resolved target, its
+          # owner, mode, and type, the owner and mode of its directory, and whether it
+          # is executable; MISSING when it does not resolve.
+          METRIC_TOOLS_SCRIPT='
+          set -o pipefail
+          sum="$(printf "%s" "$1" | sha256sum)" || exit 4
+          printf "SOURCE_SHA256\t%s\n" "${sum%% *}"
+          shift
+          clk="$(getconf CLK_TCK)" || exit 5
+          printf "CLK_TCK\t%s\n" "$clk"
+          for tool; do
+              if ! target="$(readlink -e -- "$tool")"; then
+                  printf "TOOL\t%s\tMISSING\n" "$tool"
+                  continue
               fi
+              meta="$(stat -L -c "%u %a %F" -- "$target")" || exit 6
+              dir="$(stat -L -c "%u %a" -- "${target%/*}")" || exit 6
+              flag=NOEXEC
+              [[ -x "$target" ]] && flag=X
+              printf "TOOL\t%s\t%s\t%s\t%s\t%s\n" "$tool" "$target" "$meta" "$dir" "$flag"
           done
-          printf "END\n"
           '
 
           # The double-precision conversion of the speed and volume tokens: the speed
@@ -2086,16 +2258,25 @@ jobs:
           # limit of 1 byte stops each core dump, also through a core pipe. Sets M_OUT,
           # M_ERR, M_STATUS, M_OUTCOME (COMPLETED, FAILED, FILE_LIMIT, TIMEOUT,
           # NOT_STOPPED, or NOT_STARTED), M_LIMIT, M_FILE_LIMIT, M_GROUP, and M_ELAPSED,
-          # and writes one row to commands.tsv.
+          # and writes one row to commands.tsv. M_OP_END, when set, is an earlier
+          # absolute end for this operation, so a cleanup step never restarts a limit.
           metric_op() {
-              local label="$1" class="$2" start limit left term
+              local label="$1" class="$2" start limit left term argument quoted
               shift 2
               M_FILE_LIMIT="${M_FSIZE:-$METRIC_OP_FILE_LIMIT}"
               M_SEQ=$(( M_SEQ + 1 ))
               M_OUT="${M_OUT_FILE:-${M_LOG_DIR}/$(printf '%02d' "$M_SEQ")-${label}.out}"
               M_ERR="${M_ERR_FILE:-${M_LOG_DIR}/$(printf '%02d' "$M_SEQ")-${label}.err}"
               if [[ -z "$M_RECORD" ]]; then
-                  M_RECORD="$(printf '%q ' "$@")"
+                  # Each argument shell-quoted; the fixed check source as its SHA-256.
+                  for argument in "$@"; do
+                      if [[ "$argument" == "$METRIC_ROOT_CHECK_SOURCE" ]]; then
+                          quoted="<METRIC_ROOT_CHECK_SOURCE sha256 ${M_CHECK_SOURCE_SHA}>"
+                      else
+                          printf -v quoted '%q' "$argument"
+                      fi
+                      M_RECORD+="${quoted} "
+                  done
                   M_RECORD="${M_RECORD% }"
               fi
               start="$(metric_now_ms)"
@@ -2110,6 +2291,9 @@ jobs:
                   CLEANUP|FINAL) left=$(( M_END_MS - start )) ;;
                   *) left=$(( M_END_MS - METRIC_CLEANUP_MS - start )) ;;
               esac
+              if [[ -n "$M_OP_END" ]] && (( M_OP_END - start < left )); then
+                  left=$(( M_OP_END - start ))
+              fi
               if (( left < limit )); then
                   limit="$left"
               fi
@@ -2148,6 +2332,7 @@ jobs:
                   "$M_RECORD" >> "${M_DIR}/commands.tsv"
               M_RECORD=""
               M_FSIZE=""
+              M_OP_END=""
               return 0
           }
 
@@ -2238,10 +2423,11 @@ jobs:
                 echo "INPUT_FILES=${M_INPUT_FILES}"
                 echo "INPUT_BYTES=${M_INPUT_BYTES}"
                 echo "INPUTS_UNCHANGED=${M_INPUTS_UNCHANGED}"
+                echo "TASK_MEASURED_LIMIT_BYTES=${METRIC_MAX_TASK_BYTES}"
                 echo "TASK_MEASURED_MAX_BYTES=${M_TASK_BYTES}"
                 echo "TASK_COPY_FILE_LIMIT_BYTES=${M_COPY_FSIZE}"
                 echo "TASK_CALCULATION_FILE_LIMIT_BYTES=${M_CALC_FSIZE}"
-                echo "TASK_BYTES_CONTROL=the task directory is measured before and after the copy and the calculation; the kernel limits each file of the copy and the calculation to the task bytes left at the start of that operation; several files that one calculation writes between two measurements have no common kernel limit"
+                echo "TASK_BYTES_CONTROL=TASK_MEASURED_MAX_BYTES is the largest of five apparent-byte measurements (before and after the copy, before and after the calculation, and final), not a continuous peak; a measured total above TASK_MEASURED_LIMIT_BYTES fails; the kernel limits each file of the copy and of the calculation to the measured task bytes left at its start (RLIMIT_FSIZE, a limit for each file, not for the sum); files that exist only between two measurements are not measured, so the apparent and the allocated task bytes are not continuously bounded, and a full disk can stop the collection or the capture; no quota"
                 echo "OUTPUT_PATH=${M_OUTPUT_PATH}"
                 echo "OUTPUT_SHA256=${M_OUTPUT_SHA}"
                 echo "OUTPUT_TIME=${M_O_ROW_TIME}"
@@ -2252,6 +2438,20 @@ jobs:
                 echo "OUTPUT_VALUE=${M_O_ROW_VALUE}"
                 echo "CLEANUP_RESULT=${M_CLEANUP}"
                 echo "CLEANUP_OLDER_UNREADABLE=${M_OLDER_UNREADABLE}"
+                echo "CLEANUP_START_MS=${M_CLEANUP_START}"
+                echo "PROCESS_CHECK_END_MS=${M_CHECK_END}"
+                echo "CLEANUP_END_MS=${M_CLEANUP_END}"
+                echo "ORIGINAL_RUNNER_UID=${ORIGINAL_RUNNER_UID}"
+                echo "PROCESS_CHECK_RESULT=${M_CHECK_RESULT}"
+                echo "PROCESS_CHECK_SOURCE_SHA256=${M_CHECK_SOURCE_SHA}"
+                echo "PROCESS_CHECK_TOKEN=${M_CHECK_TOKEN}"
+                echo "PROCESS_CHECK_LAUNCH_BOOT_CS=${M_CHECK_LAUNCH_CS}"
+                echo "PROCESS_CHECK_END_BOOT_CS=${CHECK_END_BOOT_CS}"
+                echo "PROCESS_CHECK_ENTRY_BOOT_CS=${M_CHECK_ENTRY}"
+                echo "PROCESS_CHECK_SCAN_CS=${M_CHECK_SCAN}"
+                echo "PROCESS_CHECK_MONITOR=${M_CHECK_MONITOR}"
+                echo "PROCESS_CHECK_CHILD=${M_CHECK_CHILD}"
+                echo "PROCESS_CHECK_STOPPED=${M_CHECK_STOPPED}"
                 echo "LOGS_RETAINED=${M_LOGS_RETAINED}"
                 echo "LOG_BYTES=${M_LOG_BYTES}"
                 echo "EVIDENCE_BYTES=${M_EVIDENCE_BYTES}"
@@ -2263,7 +2463,7 @@ jobs:
                 echo "CALCULATION_USED_MS=${M_CALC_USED}"
                 echo "WORK_USED_MS=${M_WORK_USED}"
                 echo "CLEANUP_USED_MS=${M_CLEANUP_USED}"
-                echo "LIMITS=total ${METRIC_TOTAL_MS} ms; selection ${METRIC_SELECT_MS} ms; calculation ${METRIC_CALC_MS} ms; inputs, copy, checks, and evidence ${METRIC_WORK_MS} ms; cleanup ${METRIC_CLEANUP_MS} ms; ${METRIC_MAX_FILES} input files; ${METRIC_MAX_INPUT_BYTES} input bytes; ${METRIC_MAX_TASK_BYTES} task bytes; ${METRIC_LOG_LIMIT} bytes for each log; ${METRIC_LOGS_LIMIT} log bytes; ${METRIC_EVIDENCE_LIMIT} evidence bytes; file limit ${METRIC_OP_FILE_LIMIT} bytes for each operation except the copy and the calculation; ${METRIC_RECORD_LIMIT} bytes for the time record"
+                echo "LIMITS=total ${METRIC_TOTAL_MS} ms; selection ${METRIC_SELECT_MS} ms; calculation ${METRIC_CALC_MS} ms; inputs, copy, checks, and evidence ${METRIC_WORK_MS} ms; cleanup ${METRIC_CLEANUP_MS} ms, with at most ${METRIC_CHECK_MS} ms for the process check and at least ${METRIC_REMOVE_MS} ms for the removal; ${METRIC_MAX_FILES} input files; ${METRIC_MAX_INPUT_BYTES} input bytes; ${METRIC_MAX_TASK_BYTES} task bytes; ${METRIC_LOG_LIMIT} bytes for each log; ${METRIC_LOGS_LIMIT} log bytes; ${METRIC_EVIDENCE_LIMIT} evidence bytes; file limit ${METRIC_OP_FILE_LIMIT} bytes for each operation except the copy and the calculation; ${METRIC_RECORD_LIMIT} bytes for the time record"
               } > "${M_DIR}/result.env"
           }
 
@@ -2493,19 +2693,30 @@ jobs:
 
           # metric_task_bytes <label> - the apparent size of the task directory. The two
           # logs go to the evidence directory, so the task directory does not change
-          # between the measurement and the next operation. Sets M_TASK_LAST, and
-          # M_TASK_BYTES to the largest measured size.
+          # between the measurement and the next operation. Each measurement goes to
+          # task-bytes.tsv with its time, also a failed one (UNAVAILABLE). Sets
+          # M_TASK_LAST, and M_TASK_BYTES to the largest measured size.
           metric_task_bytes() {
-              local bytes
+              local bytes="" path="" count=0 line
               M_OUT_FILE="${M_DIR}/${1}.out"
               M_ERR_FILE="${M_DIR}/${1}.err"
               metric_op "$1" WORK du -sb -- "$TASK_TEMP"
               M_OUT_FILE=""
               M_ERR_FILE=""
+              if [[ "$M_OUTCOME" == COMPLETED ]]; then
+                  while IFS= read -r line; do
+                      count=$(( count + 1 ))
+                      bytes="${line%%$'\t'*}"
+                      path="${line#*$'\t'}"
+                  done < "$M_OUT"
+                  if (( count != 1 )) || [[ ! "$bytes" =~ ^[0-9]+$ || "$path" != "$TASK_TEMP" ]]; then
+                      bytes=""
+                  fi
+              fi
+              printf '%s\t%s\t%s\n' "$1" "${bytes:-UNAVAILABLE}" "$(metric_now_ms)" >> "${M_DIR}/task-bytes.tsv"
               metric_require "$1" COMMAND_FAILURE || return 1
-              read -r bytes _ < "$M_OUT"
-              if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
-                  metric_fail COMMAND_FAILURE "the size of the task directory cannot be read"
+              if [[ -z "$bytes" ]]; then
+                  metric_fail COMMAND_FAILURE "the $1 measurement is not one byte count of the task directory"
                   return 1
               fi
               M_TASK_LAST="$bytes"
@@ -2657,6 +2868,11 @@ jobs:
               metric_inputs || return 1
               metric_manifest manifest-source "$SOURCE_FLOW_CASE" "${M_DIR}/source-before.tsv" || return 1
               metric_task_bytes task-bytes-before-copy || return 1
+              # The file allowance of the copy must be positive, or no copy starts.
+              if (( METRIC_MAX_TASK_BYTES - M_TASK_LAST <= 0 )); then
+                  metric_fail RESOURCE_LIMIT "the task directory has ${M_TASK_LAST} bytes before the copy, so no file allowance is left below ${METRIC_MAX_TASK_BYTES}"
+                  return 1
+              fi
               M_FSIZE=$(( METRIC_MAX_TASK_BYTES - M_TASK_LAST ))
               M_COPY_FSIZE="$M_FSIZE"
               M_RECORD="cp --parents -- <${#M_FILES[@]} input files> ${CASE_DIR}"
@@ -2697,6 +2913,12 @@ jobs:
                   return 1
               fi
               M_POINT=calculation
+              # The file allowance of the calculation must be positive, or no
+              # calculation starts.
+              if (( METRIC_MAX_TASK_BYTES - M_TASK_LAST <= 0 )); then
+                  metric_fail RESOURCE_LIMIT "the task directory has ${M_TASK_LAST} bytes before the calculation, so no file allowance is left below ${METRIC_MAX_TASK_BYTES}"
+                  return 1
+              fi
               M_FSIZE=$(( METRIC_MAX_TASK_BYTES - M_TASK_LAST ))
               M_CALC_FSIZE="$M_FSIZE"
               metric_foam_op metric CALC simpleFoam -case "$CASE_DIR" -postProcess -time "$SELECTED_TIME" -fields '(U)' -dict "$TASK_TEMP/config/metric-functions"
@@ -2787,19 +3009,372 @@ jobs:
               return 0
           }
 
-          # metric_cleanup - remove only the verified unique task directory, after every
-          # recorded process group is empty and a complete process check finds no
-          # process that uses it (METRIC_USERS_SCRIPT). An uncertain path or process
-          # state keeps the directory.
+          # metric_check_refuse <reason> - keep the task directory for an incomplete or
+          # refused process check.
+          metric_check_refuse() {
+              M_CLEANUP=REFUSED_PROCESS_CHECK
+              metric_fail CLEANUP_FAILURE "$1, so the task directory stays"
+              return 0
+          }
+
+          # metric_safe_path <path> - status 0 for an absolute path of slash-separated
+          # [A-Za-z0-9_.-] components, none of them ".", "..", or option-like.
+          metric_safe_path() {
+              local part rest
+              [[ "$1" =~ ^(/[A-Za-z0-9_.-]+)+$ ]] || return 1
+              rest="${1#/}"
+              while :; do
+                  part="${rest%%/*}"
+                  [[ "$part" != . && "$part" != .. && "$part" != -* ]] || return 1
+                  [[ "$rest" == */* ]] || return 0
+                  rest="${rest#*/}"
+              done
+          }
+
+          # metric_hosted_runner - status 0 only on the approved ephemeral GitHub-hosted
+          # ubuntu-24.04 runner: the runner identity of the job and the OS record. Real
+          # elevation is refused everywhere else. Sets M_CHECK_REASON.
+          metric_hosted_runner() {
+              local item id="" version=""
+              local -a lines=()
+              { mapfile -t lines < "$METRIC_OS_RELEASE"; } 2> /dev/null || lines=()
+              for item in "${lines[@]}"; do
+                  case "$item" in
+                      ID=*) id="${item#ID=}" ;;
+                      VERSION_ID=*) version="${item#VERSION_ID=}" ;;
+                  esac
+              done
+              id="${id//\"/}"
+              version="${version//\"/}"
+              if [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "${RUNNER_OS:-}" == Linux \
+                    && "${ImageOS:-}" == ubuntu24 && "$id" == ubuntu && "$version" == 24.04 ]]; then
+                  return 0
+              fi
+              M_CHECK_REASON="real elevation is limited to the GitHub-hosted ubuntu-24.04 runner: GITHUB_ACTIONS '${GITHUB_ACTIONS:-}', RUNNER_ENVIRONMENT '${RUNNER_ENVIRONMENT:-}', RUNNER_OS '${RUNNER_OS:-}', ImageOS '${ImageOS:-}', OS '${id} ${version}'"
+              return 1
+          }
+
+          # metric_check_tools - the records of the executable check: one TOOL row for
+          # each process-check executable, resolved to a regular root-owned executable
+          # file that is not group- or world-writable, in a root-owned directory that is
+          # not group- or world-writable; the source hash; and the clock tick rate. Sets
+          # M_CHECK_SOURCE_SHA, M_CHECK_CLK, and M_CHECK_REASON (the first problem).
+          metric_check_tools() {
+              local kind tool target meta dir flag owner mode type dir_owner dir_mode
+              local -A seen=()
+              M_CHECK_REASON="" M_CHECK_CLK=""
+              while IFS=$'\t' read -r kind tool target meta dir flag; do
+                  case "$kind" in
+                      SOURCE_SHA256) [[ "$tool" =~ ^[0-9a-f]{64}$ ]] && M_CHECK_SOURCE_SHA="$tool" ;;
+                      CLK_TCK) [[ "$tool" =~ ^[1-9][0-9]{0,5}$ ]] && M_CHECK_CLK="$tool" ;;
+                      TOOL)
+                          seen[$tool]=$(( ${seen[$tool]:-0} + 1 ))
+                          [[ -z "$M_CHECK_REASON" ]] || continue
+                          if [[ "$target" == MISSING ]]; then
+                              M_CHECK_REASON="the check executable is missing: ${tool}"
+                              continue
+                          fi
+                          read -r owner mode type <<< "$meta"
+                          read -r dir_owner dir_mode <<< "$dir"
+                          if [[ "$target" != /* || "$type" != "regular file" ]]; then
+                              M_CHECK_REASON="the check executable is not a regular file: ${tool} (${target})"
+                          elif [[ "$owner" != 0 ]]; then
+                              M_CHECK_REASON="the check executable is not owned by root: ${tool} (${target})"
+                          elif [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 8#22) != 0 )); then
+                              M_CHECK_REASON="the check executable is group- or world-writable: ${tool} (${target})"
+                          elif [[ "$flag" != X ]]; then
+                              M_CHECK_REASON="the check executable is not executable: ${tool} (${target})"
+                          elif [[ "$dir_owner" != 0 || ! "$dir_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$dir_mode & 8#22) != 0 )); then
+                              M_CHECK_REASON="the directory of the check executable is not root-owned, or it is group- or world-writable: ${tool} (${target})"
+                          fi ;;
+                  esac
+              done < "${M_DIR}/process-check-tools.tsv"
+              for tool in "${METRIC_CHECK_TOOLS[@]}"; do
+                  if [[ -z "$M_CHECK_REASON" && "${seen[$tool]:-0}" != 1 ]]; then
+                      M_CHECK_REASON="the executable check has no single record: ${tool}"
+                  fi
+              done
+              if [[ -z "$M_CHECK_REASON" && "$M_CHECK_SOURCE_SHA" == UNAVAILABLE ]]; then
+                  M_CHECK_REASON="the executable check has no SHA-256 of the fixed source"
+              fi
+              if [[ -z "$M_CHECK_REASON" && -z "$M_CHECK_CLK" ]]; then
+                  M_CHECK_REASON="the executable check has no clock tick rate"
+              fi
+              [[ -z "$M_CHECK_REASON" ]]
+          }
+
+          # metric_proc_live <pid> <start> - status 0 when /proc/<pid> is a live process
+          # with that start time, or when its stat file exists and cannot be read.
+          metric_proc_live() {
+              local line
+              local -a fields=()
+              [[ "$1" =~ ^[0-9]+$ ]] || return 1
+              if ! { read -r line < "/proc/$1/stat"; } 2> /dev/null; then
+                  [[ -e "/proc/$1/stat" ]]
+                  return
+              fi
+              read -r -a fields <<< "${line##*") "}"
+              [[ "${fields[19]:-}" == "$2" && "${fields[0]:-}" != Z && "${fields[0]:-}" != X ]]
+          }
+
+          # metric_check_frame <file> <return-cs> - validate the result frame of the
+          # process check against the request, the launch and return times on the boot
+          # clock, and the recorded operation groups. Sets C_ENTRY, C_SCAN, C_MPID,
+          # C_MSTART, C_EUID, C_CPID, C_CSTART, C_USERS, C_UNCERTAIN, C_OLDER, and
+          # C_PROBLEM (empty for one complete valid frame). C_MPID is set for a valid
+          # monitor record also in a frame with another problem.
+          metric_check_frame() {
+              local file="$1" back="$2" content="" line index=3 count expect group status
+              local -a lines=()
+              C_ENTRY="" C_SCAN="" C_MPID="" C_MSTART="" C_EUID="" C_CPID="" C_CSTART="" C_OLDER=0 C_PROBLEM=""
+              C_USERS=() C_UNCERTAIN=()
+              if IFS= read -r -d '' content < "$file"; then
+                  C_PROBLEM="the frame has a NUL byte"
+              elif [[ "$content" != *$'\n' ]]; then
+                  C_PROBLEM="the frame is empty, or it does not end with a line end"
+              fi
+              { mapfile -t lines < "$file"; } 2> /dev/null || lines=()
+              count="${#lines[@]}"
+              if [[ "${lines[0]:-}" =~ ^LAUNCH\ 1\ ([A-Za-z0-9]+)\ ([0-9]{1,12})\ ([0-9]{1,3})$ \
+                    && "${BASH_REMATCH[1]}" == "$CHECK_TOKEN" ]]; then
+                  C_ENTRY="${BASH_REMATCH[2]}" C_SCAN="${BASH_REMATCH[3]}"
+                  expect=$(( CHECK_END_BOOT_CS - C_ENTRY - 600 ))
+                  (( expect <= 600 )) || expect=600
+                  if (( C_ENTRY < M_CHECK_LAUNCH_CS || C_ENTRY > back || C_SCAN < 1 || C_SCAN != expect )); then
+                      C_PROBLEM="${C_PROBLEM:-the launch time ${C_ENTRY} or the scan time ${C_SCAN} does not match the absolute end ${CHECK_END_BOOT_CS}}"
+                  fi
+              else
+                  C_PROBLEM="${C_PROBLEM:-the launch record is missing, or it does not match the request}"
+              fi
+              if [[ "${lines[1]:-}" != "FRAME 1 ${CHECK_TOKEN} ${TASK_TEMP} ${ORIGINAL_RUNNER_UID} ${CHECK_END_BOOT_CS}" ]]; then
+                  C_PROBLEM="${C_PROBLEM:-the frame record does not match the request: '$(metric_text "${lines[1]:-}")'}"
+              fi
+              if [[ "${lines[2]:-}" =~ ^MONITOR\ ([0-9]{1,10})\ ([0-9]{1,10})\ ([0-9]{1,20})\ ([0-9]{1,10})$ \
+                    && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] && (( BASH_REMATCH[1] >= 2 )); then
+                  C_MPID="${BASH_REMATCH[1]}" C_MSTART="${BASH_REMATCH[3]}" C_EUID="${BASH_REMATCH[4]}"
+                  for group in "${M_GROUPS[@]}"; do
+                      [[ "$group" == "$C_MPID" ]] && C_PROBLEM="${C_PROBLEM:-the monitor is a recorded operation group}"
+                  done
+                  if (( C_MSTART * 100 / M_CHECK_CLK + 1 < M_CHECK_LAUNCH_CS || C_MSTART * 100 / M_CHECK_CLK > back + 1 )); then
+                      C_PROBLEM="${C_PROBLEM:-the monitor did not start during the check operation}"
+                  fi
+              else
+                  C_PROBLEM="${C_PROBLEM:-the monitor record is missing, or it is not the leader of its own process group}"
+              fi
+              while (( index < count )); do
+                  line="${lines[index]}"
+                  case "$line" in
+                      "MATCH /proc/"[0-9]*) C_USERS+=("${line#MATCH }") ;;
+                      "UNCERTAIN "?*) C_UNCERTAIN+=("${line#UNCERTAIN }") ;;
+                      "OLDER_UNREADABLE /proc/"[0-9]*) C_OLDER=$(( C_OLDER + 1 )) ;;
+                      *) break ;;
+                  esac
+                  index=$(( index + 1 ))
+              done
+              if [[ "${lines[index]:-}" == SCAN_END ]]; then
+                  index=$(( index + 1 ))
+              else
+                  C_PROBLEM="${C_PROBLEM:-the scan end record is missing, or an unknown record comes first: '$(metric_text "${lines[index]:-}")'}"
+              fi
+              if [[ "${lines[index]:-}" =~ ^CHILD\ ([0-9]{1,10})\ ([0-9]{1,20})$ ]]; then
+                  C_CPID="${BASH_REMATCH[1]}" C_CSTART="${BASH_REMATCH[2]}"
+                  index=$(( index + 1 ))
+              else
+                  C_PROBLEM="${C_PROBLEM:-the child record is missing or malformed}"
+              fi
+              if [[ "${lines[index]:-}" =~ ^END\ 1\ ([A-Za-z0-9]+)\ ([A-Z0-9_]+)\ ([0-9]{1,12})$ \
+                    && "${BASH_REMATCH[1]}" == "$CHECK_TOKEN" ]]; then
+                  status="${BASH_REMATCH[2]}"
+                  [[ "$status" == COMPLETE ]] || C_PROBLEM="${C_PROBLEM:-the terminal record has the status ${status}}"
+                  (( index == count - 1 )) || C_PROBLEM="${C_PROBLEM:-a record follows the terminal record}"
+              else
+                  C_PROBLEM="${C_PROBLEM:-the terminal record is missing, or it does not match the request}"
+              fi
+              return 0
+          }
+
+          # metric_check_stopped - read-only proof from /proc metadata that the monitor,
+          # its process group, and the recorded check child have stopped. The proof
+          # takes at most 1000 ms and ends by the check end. Sets M_CHECK_STOPPED to YES
+          # or NO, and C_ALIVE.
+          metric_check_stopped() {
+              local members until_ms
+              until_ms=$(( $(metric_now_ms) + 1000 ))
+              (( until_ms <= M_CHECK_END )) || until_ms="$M_CHECK_END"
+              while :; do
+                  C_ALIVE=""
+                  if ! members="$(metric_group_members "$C_MPID")"; then
+                      C_ALIVE=" group ${C_MPID} cannot be checked"
+                  elif [[ -n "$members" ]]; then
+                      C_ALIVE=" group ${C_MPID}: ${members//$'\n'/ }"
+                  fi
+                  if metric_proc_live "$C_MPID" "$C_MSTART"; then
+                      C_ALIVE="${C_ALIVE} monitor ${C_MPID}"
+                  fi
+                  if [[ -n "$C_CPID" ]] && metric_proc_live "$C_CPID" "$C_CSTART"; then
+                      C_ALIVE="${C_ALIVE} child ${C_CPID}"
+                  fi
+                  if [[ -z "$C_ALIVE" ]]; then
+                      M_CHECK_STOPPED=YES
+                      return 0
+                  fi
+                  (( $(metric_now_ms) + 150 < until_ms )) || break
+                  sleep 0.1
+              done
+              M_CHECK_STOPPED=NO
+              return 1
+          }
+
+          # metric_process_check - the read-only process check of the task directory
+          # (contract 6084196797, Section 4), inside the check part of the cleanup. The
+          # unprivileged checks come first: the original runner UID, the hosted runner,
+          # RUNNER_TEMP, the time left, and the executables. Then the one admitted
+          # vector runs the fixed source as root. Its frame, the monitor identity, and
+          # the stop of the monitor group and the check child are verified from /proc
+          # metadata. Status 0 only for a complete valid frame, a verified stop, and no
+          # user or uncertain process; otherwise the task directory stays.
+          metric_process_check() {
+              local left up="" rest back="" now first=""
+              if [[ ! "$ORIGINAL_RUNNER_UID" =~ ^[1-9][0-9]{0,9}$ || "$UID" != "$ORIGINAL_RUNNER_UID" \
+                    || "$EUID" != "$ORIGINAL_RUNNER_UID" ]]; then
+                  metric_check_refuse "the original runner UID '${ORIGINAL_RUNNER_UID}' is not the nonzero real and effective UID (${UID}, ${EUID})"
+                  return 1
+              fi
+              if ! metric_hosted_runner; then
+                  metric_check_refuse "$M_CHECK_REASON"
+                  return 1
+              fi
+              if ! metric_safe_path "$RUNNER_TEMP"; then
+                  metric_check_refuse "RUNNER_TEMP '$(metric_text "$RUNNER_TEMP")' is not a safe absolute path"
+                  return 1
+              fi
+              if ! ( cd -P -- "$RUNNER_TEMP" 2> /dev/null && [[ "$PWD" == "$RUNNER_TEMP" ]] ); then
+                  metric_check_refuse "RUNNER_TEMP '${RUNNER_TEMP}' is not a canonical path"
+                  return 1
+              fi
+              if [[ ! "$M_BOOT_CS" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+                  metric_check_refuse "the boot time of the metric start is not valid"
+                  return 1
+              fi
+              # The check needs a positive scan time, the 5000 ms TERM grace, and the
+              # 1000 ms stop verification before its end.
+              left=$(( M_CHECK_END - $(metric_now_ms) ))
+              if (( left <= METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )); then
+                  metric_check_refuse "the cleanup reserve leaves ${left} ms for the process check, not more than $(( METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )) ms"
+                  return 1
+              fi
+              M_OP_END="$M_CHECK_END"
+              M_OUT_FILE="${M_DIR}/process-check-tools.tsv"
+              M_ERR_FILE="${M_DIR}/process-check-tools.err"
+              M_RECORD="bash -c <process-check executables and source hash> <${#METRIC_CHECK_TOOLS[@]} installed executables>"
+              metric_op process-check-tools CLEANUP bash -c "$METRIC_TOOLS_SCRIPT" tools "$METRIC_ROOT_CHECK_SOURCE" \
+                  "${METRIC_CHECK_TOOLS[@]}"
+              M_OUT_FILE=""
+              M_ERR_FILE=""
+              if [[ "$M_OUTCOME" != COMPLETED ]]; then
+                  metric_check_refuse "the executable check ended with ${M_OUTCOME}, status ${M_STATUS}"
+                  return 1
+              fi
+              if ! metric_check_tools; then
+                  metric_check_refuse "$M_CHECK_REASON"
+                  return 1
+              fi
+              left=$(( M_CHECK_END - $(metric_now_ms) ))
+              if (( left <= METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )); then
+                  metric_check_refuse "the cleanup reserve leaves ${left} ms for the process check, not more than $(( METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )) ms"
+                  return 1
+              fi
+              # The absolute check end on the boot clock, from the same end in ms.
+              { read -r up rest < /proc/uptime; } 2> /dev/null || true
+              now="$(metric_now_ms)"
+              if [[ ! "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]]; then
+                  metric_check_refuse "the boot clock cannot be read"
+                  return 1
+              fi
+              M_CHECK_LAUNCH_CS=$(( 10#${up/./} ))
+              CHECK_END_BOOT_CS=$(( M_CHECK_LAUNCH_CS + (M_CHECK_END - now) / 10 ))
+              CHECK_TOKEN="${TASK_TEMP##*.}${now}"
+              M_CHECK_TOKEN="$CHECK_TOKEN"
+              if (( M_BOOT_CS >= CHECK_END_BOOT_CS )); then
+                  metric_check_refuse "the boot time of the metric start is not before the check end"
+                  return 1
+              fi
+              M_CHECK_RESULT=INCOMPLETE
+              M_OP_END="$M_CHECK_END"
+              M_OUT_FILE="${M_DIR}/process-check.txt"
+              M_ERR_FILE="${M_DIR}/process-check.err"
+              metric_op process-check CLEANUP /usr/bin/sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+                  /usr/bin/bash --noprofile --norc -p -c "$METRIC_ROOT_CHECK_SOURCE" \
+                  m3-process-check "$TASK_TEMP" "$RUNNER_TEMP" "$ORIGINAL_RUNNER_UID" "$M_BOOT_CS" "$CHECK_END_BOOT_CS" "$CHECK_TOKEN"
+              M_OUT_FILE=""
+              M_ERR_FILE=""
+              { read -r up rest < /proc/uptime; } 2> /dev/null || true
+              if [[ "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]]; then
+                  back=$(( 10#${up/./} ))
+              else
+                  back="$CHECK_END_BOOT_CS"
+              fi
+              { IFS= read -r first < "${M_DIR}/process-check.err"; } 2> /dev/null || true
+              metric_check_frame "${M_DIR}/process-check.txt" "$back"
+              M_CHECK_ENTRY="${C_ENTRY:-UNAVAILABLE}"
+              M_CHECK_SCAN="${C_SCAN:-UNAVAILABLE}"
+              M_OLDER_UNREADABLE="$C_OLDER"
+              if [[ -n "$C_MPID" ]]; then
+                  M_CHECK_MONITOR="${C_MPID} ${C_MPID} ${C_MSTART} ${C_EUID}"
+                  M_CHECK_CHILD="${C_CPID:-UNAVAILABLE} ${C_CSTART:-UNAVAILABLE}"
+                  metric_check_stopped || true
+              fi
+              if [[ "$M_CHECK_STOPPED" == NO ]]; then
+                  metric_check_refuse "the process check monitor or its group did not stop:${C_ALIVE}"
+                  return 1
+              fi
+              if [[ "$M_OUTCOME" != COMPLETED ]]; then
+                  metric_check_refuse "the process check ended with ${M_OUTCOME}, status ${M_STATUS}${first:+: $(metric_text "$first")}"
+                  return 1
+              fi
+              if [[ -n "$C_PROBLEM" ]]; then
+                  metric_check_refuse "the process check result is not one complete valid frame: ${C_PROBLEM}"
+                  return 1
+              fi
+              if (( ${#C_USERS[@]} > 0 )); then
+                  M_CHECK_RESULT=MATCH
+                  M_CLEANUP=REFUSED_PROCESS_ACTIVE
+                  metric_fail CLEANUP_FAILURE "a process still uses the task directory: ${C_USERS[*]:0:3}"
+                  return 1
+              fi
+              if (( ${#C_UNCERTAIN[@]} > 0 )); then
+                  M_CHECK_RESULT=UNCERTAIN
+                  metric_check_refuse "the process check of the task directory is not complete for ${#C_UNCERTAIN[@]} runner-UID processes (${C_OLDER} started before the metric): ${C_UNCERTAIN[0]}"
+                  return 1
+              fi
+              M_CHECK_RESULT=COMPLETE
+              return 0
+          }
+
+          # metric_cleanup - remove only the verified unique task directory, inside one
+          # absolute cleanup end: the earlier of the cleanup entry plus 20000 ms and the
+          # metric end. Every recorded process group must be empty, and the read-only
+          # process check (metric_process_check) must end in its part of the cleanup
+          # with no process that uses the directory. Then the original unprivileged
+          # runner user checks the path again and removes it. An uncertain path or
+          # process state keeps the directory.
           metric_cleanup() {
-              local group name line ended=0
-              local -a users=() uncertain=()
+              local group name
               if [[ -z "$TASK_TEMP" ]]; then
                   M_CLEANUP=NOT_NEEDED
                   return 0
               fi
               M_POINT=cleanup
               M_LOG_DIR="${M_DIR}/logs"
+              M_CLEANUP_START="$(metric_now_ms)"
+              M_CLEANUP_END=$(( M_CLEANUP_START + METRIC_CLEANUP_MS ))
+              if (( M_END_MS < M_CLEANUP_END )); then
+                  M_CLEANUP_END="$M_END_MS"
+              fi
+              M_CHECK_END=$(( M_CLEANUP_START + METRIC_CHECK_MS ))
+              if (( M_CLEANUP_END - METRIC_REMOVE_MS < M_CHECK_END )); then
+                  M_CHECK_END=$(( M_CLEANUP_END - METRIC_REMOVE_MS ))
+              fi
               for group in "${M_GROUPS[@]}"; do
                   if ! metric_group_empty "$group"; then
                       M_CLEANUP=REFUSED_PROCESS_ACTIVE
@@ -2814,37 +3389,23 @@ jobs:
                   metric_fail CLEANUP_FAILURE "the task directory '${TASK_TEMP}' is not one unique directory under RUNNER_TEMP"
                   return 0
               fi
-              M_RECORD="bash -c <process check: the working directory and open files of each thread, and the mapped files, of each runner-UID process> ${TASK_TEMP} ${EUID} ${M_BOOT_CS}"
-              metric_op users CLEANUP bash -c "$METRIC_USERS_SCRIPT" users "$TASK_TEMP" "$EUID" "$M_BOOT_CS"
-              if [[ "$M_OUTCOME" != COMPLETED ]]; then
-                  M_CLEANUP=REFUSED_PROCESS_CHECK
-                  metric_fail CLEANUP_FAILURE "the process check of the task directory ended with ${M_OUTCOME}, status ${M_STATUS}, so the task directory stays"
+              metric_process_check || return 0
+              # The check operations are recorded groups too: all must be empty.
+              for group in "${M_GROUPS[@]}"; do
+                  if ! metric_group_empty "$group"; then
+                      M_CLEANUP=REFUSED_PROCESS_ACTIVE
+                      metric_fail CLEANUP_FAILURE "process group ${group} of a metric operation still has a process after the process check, so the task directory stays"
+                      return 0
+                  fi
+              done
+              # The unprivileged path recheck, as the original runner user.
+              if [[ "$UID" != "$ORIGINAL_RUNNER_UID" || "$EUID" != "$ORIGINAL_RUNNER_UID" || "$name" != "${TASK_TEMP#"${RUNNER_TEMP}/"}" \
+                    || ! -d "$TASK_TEMP" || -L "$TASK_TEMP" ]]; then
+                  M_CLEANUP=REFUSED_UNEXPECTED_PATH
+                  metric_fail CLEANUP_FAILURE "the task directory '${TASK_TEMP}' is not the checked directory of the runner user before the removal"
                   return 0
               fi
-              M_OLDER_UNREADABLE=0
-              while IFS= read -r line; do
-                  case "$line" in
-                      "MATCH "*) users+=("${line#MATCH }") ;;
-                      "UNCERTAIN "*) uncertain+=("${line#UNCERTAIN }") ;;
-                      "OLDER_UNREADABLE "*) M_OLDER_UNREADABLE=$(( M_OLDER_UNREADABLE + 1 )) ;;
-                      END) ended=1 ;;
-                  esac
-              done < "$M_OUT"
-              if (( ${#users[@]} > 0 )); then
-                  M_CLEANUP=REFUSED_PROCESS_ACTIVE
-                  metric_fail CLEANUP_FAILURE "a process still uses the task directory: ${users[*]:0:3}"
-                  return 0
-              fi
-              if (( ended == 0 )); then
-                  M_CLEANUP=REFUSED_PROCESS_CHECK
-                  metric_fail CLEANUP_FAILURE "the process check of the task directory has no end record, so the task directory stays"
-                  return 0
-              fi
-              if (( ${#uncertain[@]} > 0 )); then
-                  M_CLEANUP=REFUSED_PROCESS_CHECK
-                  metric_fail CLEANUP_FAILURE "the process check of the task directory is not complete for ${#uncertain[@]} runner-UID processes (${M_OLDER_UNREADABLE} started before the metric), so the task directory stays: ${uncertain[0]}"
-                  return 0
-              fi
+              M_OP_END="$M_CLEANUP_END"
               metric_op remove CLEANUP rm -rf -- "$TASK_TEMP"
               if [[ "$M_OUTCOME" == COMPLETED && ! -e "$TASK_TEMP" ]]; then
                   M_CLEANUP=REMOVED
@@ -2908,7 +3469,17 @@ jobs:
               mkdir -p "$M_DIR" "${M_DIR}/output" "${M_DIR}/logs"
               M_CODE="" M_REASON="" M_POINT=product M_FAIL_POINT=NONE M_SEQ=0 M_RECORD="" M_FOAM_RECORD=""
               M_FSIZE="" M_FILE_LIMIT="$METRIC_OP_FILE_LIMIT" M_TASK_LAST=0 M_COPY_FSIZE=UNAVAILABLE M_CALC_FSIZE=UNAVAILABLE
-              M_OLDER_UNREADABLE=UNAVAILABLE
+              M_OLDER_UNREADABLE=UNAVAILABLE M_OP_END=""
+              M_CLEANUP_START=UNAVAILABLE M_CLEANUP_END=UNAVAILABLE M_CHECK_END=UNAVAILABLE M_CHECK_RESULT=NOT_RUN
+              M_CHECK_SOURCE_SHA=UNAVAILABLE M_CHECK_TOKEN=UNAVAILABLE M_CHECK_LAUNCH_CS=UNAVAILABLE M_CHECK_ENTRY=UNAVAILABLE
+              M_CHECK_SCAN=UNAVAILABLE M_CHECK_MONITOR=UNAVAILABLE M_CHECK_CHILD=UNAVAILABLE M_CHECK_STOPPED=UNAVAILABLE
+              M_CHECK_CLK="" M_CHECK_REASON="" CHECK_END_BOOT_CS=UNAVAILABLE CHECK_TOKEN=""
+              # The original runner UID, before any elevation: the selector of the
+              # process check. It stays read-only; root's UID never replaces it.
+              if [[ "$(declare -p ORIGINAL_RUNNER_UID 2> /dev/null)" != "declare -r ORIGINAL_RUNNER_UID=\"${UID}\"" ]]; then
+                  ORIGINAL_RUNNER_UID="$UID"
+                  readonly ORIGINAL_RUNNER_UID
+              fi
               M_OUT_FILE="" M_ERR_FILE="" M_OUT="" M_ERR="" M_LOG_DIR="$M_DIR"
               M_SELECT_USED=0 M_CALC_USED=0 M_WORK_USED=0 M_CLEANUP_USED=0
               M_GROUPS=() M_FILES=()
@@ -2938,6 +3509,7 @@ jobs:
               fi
               printf 'seq\tlabel\tclass\tlimit_ms\tfile_limit_bytes\tstart_ms\tend_ms\tstatus\toutcome\tgroup\tlog\tvector\n' \
                   > "${M_DIR}/commands.tsv"
+              printf 'label\tbytes\ttime_ms\n' > "${M_DIR}/task-bytes.tsv"
               metric_write_result UNAVAILABLE NOT_COMPLETED "the metric collection did not reach its end"
               if [[ "${PREPARE_RESULT:-}" != SUCCEEDED || "${OVERALL_RESULT:-}" != SUCCEEDED ]]; then
                   M_CODE=NOT_ATTEMPTED

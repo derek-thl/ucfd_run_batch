@@ -5983,10 +5983,12 @@ AB_CHECK_PREFIX="-n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash
 # privilege and claims none:
 # - /usr/bin/sudo becomes <workspace>/rootfake/sudo. It accepts only the exact
 #   admitted vector, records each call in root_calls.tsv (the fixed source as
-#   its SHA-256), and runs the command after "--" as the test user. FAKE_CHECK
-#   selects one behavior: view (the default) drops the permission errors of the
-#   processes that the test user cannot read, as the root view of a test host
-#   does, because no such host process uses a new test directory; user keeps
+#   its SHA-256), and runs the command after "--" as the test user. As with
+#   sudo, a SIGTERM of the caller does not stop the command, and the command
+#   writes straight to the inherited output. FAKE_CHECK selects one behavior:
+#   view (the default) then drops the permission errors of the processes that
+#   the test user cannot read, as the root view of a test host does, because
+#   no such host process uses a new test directory; user keeps
 #   them, as a read that is denied even at the admitted boundary; deny refuses
 #   as sudo -n without a rule does; fail runs the check and ends with status 1;
 #   big writes more than the file limit; frame:<kind> writes one controlled
@@ -6024,6 +6026,19 @@ if (( $# != 19 )) || [[ "${*:1:11}" != "$expected" || "${13}" != m3-process-chec
     exit 97
 fi
 task="${14}" runner="${15}" uid="${16}" end="${18}" token="${19}"
+# As sudo: the caller cannot stop the command with SIGTERM (the runner user
+# cannot signal the root-owned sudo), and the command writes straight to the
+# inherited output.
+trap ':' TERM
+run() {
+    local child status
+    "$@" &
+    child=$!
+    while :; do
+        wait "$child" && status=0 || status=$?
+        [[ -e "/proc/${child}" ]] || return "$status"
+    done
+}
 if [[ -n "${FAKE_CHECK_DELAY:-}" ]]; then
     sleep "$FAKE_CHECK_DELAY"
 fi
@@ -6031,17 +6046,21 @@ mode="${FAKE_CHECK:-view}"
 shift 2
 case "$mode" in
     view)
-        "$@" | awk '
+        run "$@"
+        status=$?
+        # The root view, after the check: drop the permission errors.
+        out="$(readlink -f "/proc/$$/fd/1")"
+        awk '
             /^UNCERTAIN / && (/: Permission denied$/ || /\/maps: grep status 2$/) {
                 if (match($0, /\/proc\/[0-9]+/)) hidden[substr($0, RSTART, RLENGTH)] = 1
                 next
             }
             /^OLDER_UNREADABLE / && ($2 in hidden) { next }
-            { print; fflush() }'
-        exit "${PIPESTATUS[0]}" ;;
-    user) exec "$@" ;;
+            { print }' "$out" > "${calls%/*}/root_view.tmp" && cat "${calls%/*}/root_view.tmp" > "$out"
+        exit "$status" ;;
+    user) run "$@"; exit $? ;;
     deny) echo "sudo: a password is required" >&2; exit 1 ;;
-    fail) "$@"; exit 1 ;;
+    fail) run "$@"; exit 1 ;;
     big) yes M3_CHECK_OUTPUT | head -c 1100000; exit $? ;;
     frame:*) ;;
     *) echo "fake sudo: unknown FAKE_CHECK ${mode}" >&2; exit 98 ;;
@@ -6679,6 +6698,22 @@ simpleFoam -case ${task}/case -postProcess -time 2 -fields (U) -dict ${task}/con
     assert_eq "rm -rf -- ${task}" "$(awk -F '\t' '$2 == "remove" { print $12 }' "${evidence}/commands.tsv")" \
         "S72: the removal is the unprivileged bounded rm vector"
     assert_eq "" "$(find "$evidence" ! -user "$(id -u)" -print)" "S72: every evidence file belongs to the runner user"
+    # On the hosted runner, the job summary shows the real check evidence of
+    # this run: the frame records, the check values, the executables, the
+    # check operations, and the measurements. It asserts nothing.
+    if [[ "$AB_CHECK_HOSTED" == yes && -n "${GITHUB_STEP_SUMMARY:-}" && -w "${GITHUB_STEP_SUMMARY:-}" ]] &&
+        ! grep -qF '/rootfake/' "${workspace}/capture_step.sh"; then
+        {
+            printf '### S72 hosted read-only root check\n\n```text\n'
+            grep -vE '^(MATCH|UNCERTAIN|OLDER_UNREADABLE) ' "${evidence}/process-check.txt" | head -n 12 || true
+            grep -E '^(ORIGINAL_RUNNER_UID|PROCESS_CHECK_|CLEANUP_|TASK_MEASURED_|TASK_[A-Z]+_FILE_LIMIT_BYTES)=' \
+                "${evidence}/result.env" || true
+            awk -F '\t' '$2 ~ /^(process-check|process-check-tools|remove)$/ { print $2, $4, $6, $7, $8, $9 }' \
+                "${evidence}/commands.tsv" || true
+            cat "${evidence}/process-check-tools.tsv" "${evidence}/task-bytes.tsv" 2>/dev/null || true
+            printf '```\n'
+        } >> "$GITHUB_STEP_SUMMARY" || true
+    fi
     # The five task-size measurements with their times (contract Section 3).
     ab_check_measurements "$workspace" "S72"
     # The capture and the summary.
@@ -6809,7 +6844,8 @@ COLLECT_CASES
 s77_collect_accepts_zero_and_has_no_range() {
     local value workspace
     for value in 0 1.234e+03; do
-        workspace="$(new_workspace "s77_value_${value}")"
+        # The workspace path stays inside the safe RUNNER_TEMP characters.
+        workspace="$(new_workspace "s77_value_${value//[^A-Za-z0-9_.-]/_}")"
         ab_collect_fixture "$workspace"
         ab_collect_run "$workspace" FAKE_VALUE="$value" > /dev/null
         assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" \
@@ -7413,7 +7449,9 @@ printf "%s" "${METRIC_ROOT_CHECK_SOURCE:-}"')"
     ab_check_bad_launch "S89 linked RUNNER_TEMP" "$source" "${workspace}/rtlink/m3-metric-collection.AbCd1234" \
         "${workspace}/rtlink" "$uid" 0 "$(( now + 2000 ))" "$token"
     ab_check_bad_launch "S89 no scan time" "$source" "$task" "$runner" "$uid" 0 "$(( now + 550 ))" "$token"
-    out="$(timeout --kill-after=2s 20s env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p \
+    # The test bound runs in the foreground, so it is not a monitor that
+    # leads its own process group.
+    out="$(timeout --foreground --kill-after=2s 20s env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p \
         -c "$source" m3-process-guard "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" 2>&1 && echo status=0 || echo "status=$?")"
     assert_contains "$out" "status=2" "S89: the guard refuses to run without its timeout monitor"
     assert_not_contains "$out" "FRAME " "S89: no scan starts without the monitor"
@@ -7538,18 +7576,26 @@ s91_collect_root_check_stops_itself() {
         frame="$(ab_check_frame "$workspace")"
         token="$(ab_check_value "$workspace" PROCESS_CHECK_TOKEN)"
         assert_not_contains "$frame" "END 1 ${token} COMPLETE" "S91 ${mode}: no complete terminal record"
-        read -r start end status <<< "$(awk -F '\t' '$2 == "process-check" { print $6, $7, $8 }' \
+        # The outer status is 124 or 137, as the outer and the root timers
+        # end; the elapsed time, the frame, and the stopped children show
+        # which stop the root monitor used.
+        read -r start end status <<< "$(awk -F '\t' '$2 == "process-check" { print $6, $7, $9 }' \
             "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")"
+        assert_eq "TIMEOUT" "$status" "S91 ${mode}: the check operation ends as TIMEOUT"
         scan="$(ab_check_value "$workspace" PROCESS_CHECK_SCAN_CS)"
         check_end="$(ab_check_value "$workspace" PROCESS_CHECK_END_MS)"
         [[ "$end" =~ ^[0-9]+$ && "$scan" =~ ^[0-9]+$ && "$check_end" =~ ^[0-9]+$ ]] && (( end <= check_end )) ||
             _fail "S91 ${mode}: the check ends by the end of its part of the cleanup" "end: ${end}, check end: ${check_end}"
         if [[ "$mode" == slow ]]; then
-            assert_eq "124" "$status" "S91 slow: the root monitor stops the slow scan with SIGTERM at its interval"
+            assert_contains "$frame" "END 1 ${token} TERMINATED " \
+                "S91 slow: the root monitor stops the slow scan with SIGTERM, and the guard records it"
+            (( end - start < scan * 10 + 5000 )) ||
+                _fail "S91 slow: SIGTERM is enough, so no 5-second grace passes" \
+                      "elapsed: $(( end - start )) ms, scan: ${scan} cs"
         else
-            assert_eq "137" "$status" "S91 ${mode}: the root monitor ends the TERM-ignoring child with SIGKILL"
+            assert_not_contains "$frame" "END 1 " "S91 ${mode}: the guard writes no terminal record before SIGKILL"
             (( end - start >= scan * 10 + 5000 - 300 )) ||
-                _fail "S91 ${mode}: the guard stays until SIGKILL after the 5-second grace" \
+                _fail "S91 ${mode}: the guard stays until the root monitor SIGKILL after the 5-second grace" \
                       "elapsed: $(( end - start )) ms, scan: ${scan} cs"
         fi
         if [[ "$mode" == orphan ]]; then
