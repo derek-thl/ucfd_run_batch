@@ -1795,7 +1795,9 @@ jobs:
           # starts the scan in the monitor group. On SIGTERM it starts no new work. It
           # ends only when every other process of the group has stopped, so a check
           # child that ignores SIGTERM keeps the guard until the monitor SIGKILL, and no
-          # check child outlives the monitor. The guard signals nothing.
+          # check child outlives the monitor. The guard signals nothing. Then it reads
+          # the boot clock for its terminal record; a failed read gives the status
+          # CLOCK_UNAVAILABLE and status 1, never COMPLETE.
           #
           # The scan is the strict check of the continuation head 2902e9ab. A relevant
           # process is a live process with the runner UID as its real, effective, saved,
@@ -2039,7 +2041,11 @@ jobs:
               elif (( scan_rc != 0 )); then
                   status="SCAN_STATUS_${scan_rc}"
               fi
-              m3_now || now=0
+              if ! m3_now; then
+                  [[ "$status" == COMPLETE ]] && status=CLOCK_UNAVAILABLE
+                  now=0
+                  printf "m3 process check: the boot clock cannot be read at the end\n" >&2
+              fi
               printf "END 1 %s %s %s\n" "$token" "$status" "$now"
               [[ "$status" == COMPLETE ]]
           }
@@ -3119,12 +3125,15 @@ jobs:
 
           # metric_check_frame <file> <return-cs> - validate the result frame of the
           # process check against the request, the launch and return times on the boot
-          # clock, and the recorded operation groups. Sets C_ENTRY, C_SCAN, C_MPID,
-          # C_MSTART, C_EUID, C_CPID, C_CSTART, C_USERS, C_UNCERTAIN, C_OLDER, and
-          # C_PROBLEM (empty for one complete valid frame). C_MPID is set for a valid
+          # clock, and the recorded operation groups. Each number is a decimal without a
+          # leading zero, so no arithmetic reads it as octal. The terminal time is from
+          # the launch time to the earlier of the return time and the absolute end; a
+          # return time that is not known refuses the frame. Sets C_ENTRY, C_SCAN,
+          # C_MPID, C_MSTART, C_EUID, C_CPID, C_CSTART, C_USERS, C_UNCERTAIN, C_OLDER,
+          # and C_PROBLEM (empty for one complete valid frame). C_MPID is set for a valid
           # monitor record also in a frame with another problem.
           metric_check_frame() {
-              local file="$1" back="$2" content="" line index=3 count expect group status
+              local file="$1" back="$2" content="" line index=3 count expect group status ended
               local -a lines=()
               C_ENTRY="" C_SCAN="" C_MPID="" C_MSTART="" C_EUID="" C_CPID="" C_CSTART="" C_OLDER=0 C_PROBLEM=""
               C_USERS=() C_UNCERTAIN=()
@@ -3133,9 +3142,13 @@ jobs:
               elif [[ "$content" != *$'\n' ]]; then
                   C_PROBLEM="the frame is empty, or it does not end with a line end"
               fi
+              if [[ ! "$back" =~ ^(0|[1-9][0-9]{0,11})$ ]]; then
+                  C_PROBLEM="${C_PROBLEM:-the return time on the boot clock is not known}"
+                  back=0
+              fi
               { mapfile -t lines < "$file"; } 2> /dev/null || lines=()
               count="${#lines[@]}"
-              if [[ "${lines[0]:-}" =~ ^LAUNCH\ 1\ ([A-Za-z0-9]+)\ ([0-9]{1,12})\ ([0-9]{1,3})$ \
+              if [[ "${lines[0]:-}" =~ ^LAUNCH\ 1\ ([A-Za-z0-9]+)\ (0|[1-9][0-9]{0,11})\ ([1-9][0-9]{0,2})$ \
                     && "${BASH_REMATCH[1]}" == "$CHECK_TOKEN" ]]; then
                   C_ENTRY="${BASH_REMATCH[2]}" C_SCAN="${BASH_REMATCH[3]}"
                   expect=$(( CHECK_END_BOOT_CS - C_ENTRY - 600 ))
@@ -3149,7 +3162,7 @@ jobs:
               if [[ "${lines[1]:-}" != "FRAME 1 ${CHECK_TOKEN} ${TASK_TEMP} ${ORIGINAL_RUNNER_UID} ${CHECK_END_BOOT_CS}" ]]; then
                   C_PROBLEM="${C_PROBLEM:-the frame record does not match the request: '$(metric_text "${lines[1]:-}")'}"
               fi
-              if [[ "${lines[2]:-}" =~ ^MONITOR\ ([0-9]{1,10})\ ([0-9]{1,10})\ ([0-9]{1,20})\ ([0-9]{1,10})$ \
+              if [[ "${lines[2]:-}" =~ ^MONITOR\ ([1-9][0-9]{0,9})\ ([1-9][0-9]{0,9})\ (0|[1-9][0-9]{0,19})\ (0|[1-9][0-9]{0,9})$ \
                     && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] && (( BASH_REMATCH[1] >= 2 )); then
                   C_MPID="${BASH_REMATCH[1]}" C_MSTART="${BASH_REMATCH[3]}" C_EUID="${BASH_REMATCH[4]}"
                   for group in "${M_GROUPS[@]}"; do
@@ -3176,16 +3189,19 @@ jobs:
               else
                   C_PROBLEM="${C_PROBLEM:-the scan end record is missing, or an unknown record comes first: '$(metric_text "${lines[index]:-}")'}"
               fi
-              if [[ "${lines[index]:-}" =~ ^CHILD\ ([0-9]{1,10})\ ([0-9]{1,20})$ ]]; then
+              if [[ "${lines[index]:-}" =~ ^CHILD\ ([1-9][0-9]{0,9})\ (0|[1-9][0-9]{0,19})$ ]]; then
                   C_CPID="${BASH_REMATCH[1]}" C_CSTART="${BASH_REMATCH[2]}"
                   index=$(( index + 1 ))
               else
                   C_PROBLEM="${C_PROBLEM:-the child record is missing or malformed}"
               fi
-              if [[ "${lines[index]:-}" =~ ^END\ 1\ ([A-Za-z0-9]+)\ ([A-Z0-9_]+)\ ([0-9]{1,12})$ \
+              if [[ "${lines[index]:-}" =~ ^END\ 1\ ([A-Za-z0-9]+)\ ([A-Z0-9_]+)\ (0|[1-9][0-9]{0,11})$ \
                     && "${BASH_REMATCH[1]}" == "$CHECK_TOKEN" ]]; then
-                  status="${BASH_REMATCH[2]}"
+                  status="${BASH_REMATCH[2]}" ended="${BASH_REMATCH[3]}"
                   [[ "$status" == COMPLETE ]] || C_PROBLEM="${C_PROBLEM:-the terminal record has the status ${status}}"
+                  if [[ -z "$C_ENTRY" ]] || (( ended < C_ENTRY || ended > back || ended > CHECK_END_BOOT_CS )); then
+                      C_PROBLEM="${C_PROBLEM:-the terminal time ${ended} is not from the launch time ${C_ENTRY:-UNAVAILABLE} to the earlier of the return time ${back} and the absolute end ${CHECK_END_BOOT_CS}}"
+                  fi
                   (( index == count - 1 )) || C_PROBLEM="${C_PROBLEM:-a record follows the terminal record}"
               else
                   C_PROBLEM="${C_PROBLEM:-the terminal record is missing, or it does not match the request}"
@@ -3231,8 +3247,9 @@ jobs:
           # RUNNER_TEMP, the time left, and the executables. Then the one admitted
           # vector runs the fixed source as root. Its frame, the monitor identity, and
           # the stop of the monitor group and the check child are verified from /proc
-          # metadata. Status 0 only for a complete valid frame, a verified stop, and no
-          # user or uncertain process; otherwise the task directory stays.
+          # metadata. Status 0 only for a complete valid frame, a known return time on
+          # the boot clock, a verified stop, and no user or uncertain process;
+          # otherwise the task directory stays.
           metric_process_check() {
               local left up="" rest back="" now first=""
               if [[ ! "$ORIGINAL_RUNNER_UID" =~ ^[1-9][0-9]{0,9}$ || "$UID" != "$ORIGINAL_RUNNER_UID" \
@@ -3308,11 +3325,12 @@ jobs:
                   m3-process-check "$TASK_TEMP" "$RUNNER_TEMP" "$ORIGINAL_RUNNER_UID" "$M_BOOT_CS" "$CHECK_END_BOOT_CS" "$CHECK_TOKEN"
               M_OUT_FILE=""
               M_ERR_FILE=""
+              # The return time on the boot clock. A failed read leaves it empty, and
+              # the check fails; no other time takes its place.
+              up=""
               { read -r up rest < /proc/uptime; } 2> /dev/null || true
               if [[ "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]]; then
                   back=$(( 10#${up/./} ))
-              else
-                  back="$CHECK_END_BOOT_CS"
               fi
               { IFS= read -r first < "${M_DIR}/process-check.err"; } 2> /dev/null || true
               metric_check_frame "${M_DIR}/process-check.txt" "$back"
@@ -3330,6 +3348,10 @@ jobs:
               fi
               if [[ "$M_OUTCOME" != COMPLETED ]]; then
                   metric_check_refuse "the process check ended with ${M_OUTCOME}, status ${M_STATUS}${first:+: $(metric_text "$first")}"
+                  return 1
+              fi
+              if [[ -z "$back" ]]; then
+                  metric_check_refuse "the boot clock cannot be read after the process check"
                   return 1
               fi
               if [[ -n "$C_PROBLEM" ]]; then
