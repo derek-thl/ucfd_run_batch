@@ -6066,7 +6066,9 @@ case "$mode" in
     view)
         run "$@"
         status=$?
-        # The root view, after the check: drop the permission errors.
+        # The root view, after the check: drop the permission errors. One
+        # rename replaces the frame, so the SIGKILL of the outer operation,
+        # which can come at the same time, leaves one whole frame.
         out="$(readlink -f "/proc/$$/fd/1")"
         awk '
             /^UNCERTAIN / && (/: Permission denied$/ || /\/maps: grep status 2$/) {
@@ -6074,7 +6076,7 @@ case "$mode" in
                 next
             }
             /^OLDER_UNREADABLE / && ($2 in hidden) { next }
-            { print }' "$out" > "${calls%/*}/root_view.tmp" && cat "${calls%/*}/root_view.tmp" > "$out"
+            { print }' "$out" > "${calls%/*}/root_view.tmp" && mv -f -- "${calls%/*}/root_view.tmp" "$out"
         exit "$status" ;;
     user) run "$@"; exit $? ;;
     deny) echo "sudo: a password is required" >&2; exit 1 ;;
