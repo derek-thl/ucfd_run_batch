@@ -115,6 +115,45 @@
 # parse the group as the operand. S71 also proves that a group ID below 2 is
 # refused. That part uses a refusing fake sudo, so no kill runs.
 #
+# Checks S72 to S81 cover the M3 mean-speed collection in the evidence
+# workflow (Issue #80, admission 6064804618 of approved proposal 6064220318).
+# They run the extracted capture step with a completed two-cell Case 7 flow
+# result, RAS kEpsilon inputs, a fake OpenFOAM tree, and fake system commands.
+# They prove the volume-weighted mean of the recorded latest time with the two
+# exact vectors and dictionary, NOT_ATTEMPTED after a failed product run, the
+# time, source, snapshot, environment, and output gates, a valid zero value and
+# no scientific range, the time, byte, process-stop, and cleanup limits, the
+# separate product, mesh, convergence, and PointData verdicts, and the
+# unchanged workflow interface.
+#
+# Checks S82 to S86 cover PR #98 review 5461418991: a failed log inventory or
+# log copy (F1), a transient file above the task byte limit (F2), an
+# incomplete process check before the removal (F3), a slow read of the
+# post-processing time record (F4), and a value or volume that does not
+# convert to a finite double (F5).
+#
+# Check S87 covers PR #98 review 5466999244 (F3): a process of the test user
+# that starts before the metric clock and enters the task Case. An unreadable
+# one keeps the Case with REFUSED_PROCESS_CHECK; a readable one with
+# REFUSED_PROCESS_ACTIVE.
+#
+# Checks S88 to S92 cover the corrected #80 contract 6084196797: the measured
+# totals, positive file allowances, and the transient multi-file limitation
+# (S88); and the bounded read-only root check of the cleanup: its fixed source
+# and arguments (S89), the failures that keep the task directory (S90), its
+# self-termination (S91), and its one cleanup clock (S92). The cleanup check
+# reads /proc as root through one exact sudo -n vector. Only the approved
+# GitHub-hosted ubuntu-24.04 runner runs that vector with the real sudo, in the
+# unchanged steps of S72 to S87. Every other run uses the controlled fake
+# boundary of ab_collect_root_fake, which gives and claims no privilege.
+#
+# Check S93 covers PR #98 review 5476930073 (F6): a terminal time of the
+# result frame that is zero, before the launch, after the return, or after the
+# absolute end; a frame number with a leading zero; and a failed final clock
+# read of the guard or launch or return clock read of the collector, also a
+# failed read that sets a valid first field (review 5478239999). Each keeps the
+# task directory with REFUSED_PROCESS_CHECK.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -4699,8 +4738,81 @@ CHECK_LOG
         fi
         printf '    Mesh non-orthogonality Max: 0 average: 0\n    Face pyramids OK.\n\nMesh OK.\n\nEnd\n\n' ;;
     simpleFoam)
+        # FAKE_TERM_CHILD=<file>: leave a child that ignores SIGTERM, write its
+        # PID to the file, and block.
+        if [[ -n "${FAKE_TERM_CHILD:-}" ]]; then
+            ( trap '' TERM; exec sleep 300 ) < /dev/null > /dev/null 2>&1 &
+            printf '%s\n' "$!" > "$FAKE_TERM_CHILD"
+            exec sleep 300
+        fi
         dict="$(after -dict "$@")"
         [[ -f "$dict" ]] || { echo "fake simpleFoam: cannot open ${dict}" >&2; exit 1; }
+        # FAKE_TOUCH_FILE=<file>: change one byte stream during the calculation.
+        if [[ -n "${FAKE_TOUCH_FILE:-}" ]]; then
+            printf '\n' >> "$FAKE_TOUCH_FILE"
+        fi
+        # FAKE_ESCAPE=<file>: a process that leaves the operation group and keeps
+        # its working directory in the Case; its PID goes to the file.
+        if [[ -n "${FAKE_ESCAPE:-}" ]]; then
+            ( cd -- "$case_dir" && exec setsid sleep 60 ) < /dev/null > /dev/null 2>&1 &
+            printf '%s\n' "$!" > "$FAKE_ESCAPE"
+        fi
+        # FAKE_BIG_FILE=<bytes>: a sparse file of that apparent size in the Case.
+        # A writer that a file limit stops ends with the status of that stop.
+        if [[ -n "${FAKE_BIG_FILE:-}" ]]; then
+            truncate -s "$FAKE_BIG_FILE" "${case_dir}/big.bin" || exit $?
+        fi
+        # FAKE_TRANSIENT_BYTES=<bytes>: FAKE_TRANSIENT_FILES (default 1) sparse
+        # files of that apparent size each exist together for a moment; the
+        # task bytes at that moment go to FAKE_TRANSIENT_RECORD.
+        if [[ -n "${FAKE_TRANSIENT_BYTES:-}" ]]; then
+            for (( transient = 0; transient < ${FAKE_TRANSIENT_FILES:-1}; transient++ )); do
+                truncate -s "$FAKE_TRANSIENT_BYTES" "${case_dir}/transient${transient}.bin" || exit $?
+            done
+            du -sb -- "${case_dir%/case}" | cut -f 1 > "$FAKE_TRANSIENT_RECORD"
+            rm -f -- "${case_dir}"/transient*.bin
+        fi
+        # FAKE_OLDER_FIFO=<fifo>, FAKE_OLDER_OUT=<file>: a process that the test
+        # started before the metric clock gets the Case path through the FIFO,
+        # enters the Case, and writes READY to FAKE_OLDER_OUT.
+        if [[ -n "${FAKE_OLDER_FIFO:-}" ]]; then
+            printf '%s\n' "$case_dir" > "$FAKE_OLDER_FIFO"
+            for (( wait_tick = 0; wait_tick < 300; wait_tick++ )); do
+                [[ "$(tail -n 1 "$FAKE_OLDER_OUT" 2>/dev/null)" == READY ]] && break
+                sleep 0.01
+            done
+        fi
+        # FAKE_MAPPED_FILE=<file>: a process of the test user that leaves its
+        # group, maps a file of the Case, closes that file, and moves its
+        # working directory out of the Case. Its PID goes to the file.
+        if [[ -n "${FAKE_MAPPED_FILE:-}" ]]; then
+            setsid python3 -c 'import mmap, os, sys, time
+fd = os.open(os.path.join(sys.argv[1], "system", "controlDict"), os.O_RDONLY)
+mapped = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+os.close(fd)
+os.chdir("/")
+print(os.getpid(), flush=True)
+time.sleep(30)' "$case_dir" < /dev/null > "$FAKE_MAPPED_FILE" 2> /dev/null &
+            for (( wait_tick = 0; wait_tick < 200; wait_tick++ )); do
+                [[ -s "$FAKE_MAPPED_FILE" ]] && break
+                sleep 0.01
+            done
+        fi
+        # FAKE_HIDDEN_USER=<file>: a process of the test user that leaves its
+        # group, keeps its working directory in the Case, and makes its /proc
+        # entries unreadable (PR_SET_DUMPABLE 0). Its PID goes to the file.
+        if [[ -n "${FAKE_HIDDEN_USER:-}" ]]; then
+            setsid python3 -c 'import ctypes, os, sys, time
+os.chdir(sys.argv[1])
+if ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(2)
+print(os.getpid(), flush=True)
+time.sleep(30)' "$case_dir" < /dev/null > "$FAKE_HIDDEN_USER" 2> /dev/null &
+            for (( wait_tick = 0; wait_tick < 200; wait_tick++ )); do
+                [[ -s "$FAKE_HIDDEN_USER" ]] && break
+                sleep 0.01
+            done
+        fi
         start_from="$(awk '$1 == "startFrom" { sub(/;$/, "", $2); print $2 }' "${case_dir}/system/controlDict")"
         if [[ "$start_from" == latestTime ]]; then
             start="$(latest)"
@@ -4733,6 +4845,7 @@ CHECK_LOG
             none) ;;
             header-only) dat "$output" 0 ;;
             two-rows) dat "$output" 2 ;;
+            two-headers) dat "$output" 1; sed -i -e '1p' "$output" ;;
             second-file) dat "$output" 1; dat "${output%.dat}_${time}.dat" 1 ;;
             other-time) dat "$output" 1; dat "${case_dir}/postProcessing/m3MeanSpeed/1/volFieldValue.dat" 1 ;;
             region-folder) dat "${case_dir}/postProcessing/region1/m3MeanSpeed/${start}/volFieldValue.dat" 1 ;;
@@ -5844,6 +5957,1951 @@ sudo -n kill -KILL -- -${group}" "$calls" "S71: the signal comes first, and the 
     assert_eq "2" "$(grep -c 'refused' <<< "$out")" "S71: each refusal is in the log"
 }
 
+# ---- S72 to S81: the M3 mean-speed collection (Issue #80) --------------------
+#
+# The evidence workflow collects the cell-volume-weighted mean speed of Case 7
+# after a successful product run (admission 6064804618, approved proposal
+# 6064220318). These checks run the extracted capture step as GitHub runs it,
+# with a Batch Workspace that holds a completed two-cell Case 7 flow result, a
+# fake OpenFOAM tree, and fake system commands. The two-cell Case comes from
+# the merged metric-validation workflow; the checks add RAS kEpsilon inputs.
+# The fake simpleFoam calculates sum(V_i |U_i|) / sum(V_i) from the copied mesh
+# and U field. A second Case 8 with other speeds must never be used. No check
+# installs OpenFOAM, runs a solver, or dispatches a workflow.
+
+AB_COLLECT_DICTIONARY_SHA="ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef"
+AB_COLLECT_SHA="7c5a0e3e3b1d4c8f9a2b6d0e1f3a5c7e9b1d3f5a"
+
+# The cleanup process check (corrected contract 6084196797, Section 4) reads
+# /proc as root through one exact sudo -n vector. Only the approved ephemeral
+# GitHub-hosted ubuntu-24.04 runner runs that vector with the real sudo, and
+# only in an unchanged extracted step. Everywhere else, each extracted step gets
+# the controlled fake privilege boundary of ab_collect_root_fake, and no test
+# runs the real sudo.
+if [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "${ImageOS:-}" == ubuntu24 ]]; then
+    AB_CHECK_HOSTED=yes
+else
+    AB_CHECK_HOSTED=no
+fi
+AB_CHECK_PREFIX="-n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p -c"
+
+# ab_collect_root_fake <workspace> [find-mode] - the controlled fake privilege
+# boundary of the process check in the extracted capture step. It gives no
+# privilege and claims none:
+# - /usr/bin/sudo becomes <workspace>/rootfake/sudo. It accepts only the exact
+#   admitted vector, records each call in root_calls.tsv (the fixed source as
+#   its SHA-256), and runs the command after "--" as the test user. As in the
+#   worst case of sudo, a SIGTERM of the caller does not stop the command, and
+#   the command writes straight to the inherited output. FAKE_CHECK selects one
+#   behavior: view (the default) then drops the permission errors of the
+#   processes that the test user cannot read, as the root view of a test host
+#   does, because no such host process uses a new test directory; user keeps
+#   them, as a read that is denied even at the admitted boundary; deny refuses
+#   as sudo -n without a rule does; fail runs the check and ends with status 1;
+#   big writes more than the file limit; frame:<kind> writes one controlled
+#   result frame and runs no check. FAKE_CHECK_DELAY delays the root entry.
+#   FAKE_CHECK_CLOCK changes the return clock of ab_check_parent_clock.
+# - with a find mode, /usr/bin/find of the fixed check source becomes
+#   <workspace>/rootfake/find: fail (a read error), slow (a scan that blocks),
+#   ignore (a scan child that ignores SIGTERM), or orphan (the scan ends at once
+#   and leaves a check child that ignores SIGTERM). Each records its PIDs in
+#   root_children. clock removes the boot clock of the fixed source in the
+#   scan, after the launch read, and then runs the real find.
+# - stat reports owner 0 for each file under rootfake, as for an installed
+#   root-owned tool; FAKE_CHECK_OWNER=keep reports the real owner.
+# - the OS record of the hosted-runner gate becomes <workspace>/os-release.
+ab_collect_root_fake() {
+    local workspace="$1" mode="${2:-}" root="${1}/rootfake" step="${1}/capture_step.sh"
+    mkdir -p "$root"
+    chmod 755 "$root"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'calls=%q\nchildren=%q\n' "${workspace}/root_calls.tsv" "${workspace}/root_children"
+        cat <<'ROOT_FAKE'
+set -u
+expected="-n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p -c"
+record="sudo"
+index=0
+for argument in "$@"; do
+    index=$(( index + 1 ))
+    if (( index == 12 )); then
+        argument="<source sha256 $(printf '%s' "$argument" | sha256sum | cut -d ' ' -f 1)>"
+    fi
+    record+=$'\t'"${argument}"
+done
+printf '%s\n' "$record" >> "$calls"
+if (( $# != 19 )) || [[ "${*:1:11}" != "$expected" || "${13}" != m3-process-check ]]; then
+    echo "fake sudo: not the admitted process-check vector" >&2
+    exit 97
+fi
+task="${14}" runner="${15}" uid="${16}" end="${18}" token="${19}"
+# The worst case of sudo: a SIGTERM of the caller does not stop the command
+# (the runner user may be unable to signal the root-owned sudo), and the
+# command writes straight to the inherited output.
+trap ':' TERM
+# FAKE_CHECK_CLOCK=missing|malformed|partial|restore: at the end, the return
+# clock of the collector (see ab_check_parent_clock) is removed, holds a
+# malformed value, holds the current value with no line end (a read sets the
+# valid first field and returns status 1), or is a link to /proc/uptime again.
+fake_clock() {
+    local clock="${calls%/*}/parent_uptime" up idle
+    case "${FAKE_CHECK_CLOCK:-}" in
+        missing) rm -f -- "$clock" ;;
+        malformed) rm -f -- "$clock"; printf 'x 1.00\n' > "$clock" ;;
+        partial)
+            read -r up idle < /proc/uptime
+            rm -f -- "$clock"
+            printf '%s %s' "$up" "$idle" > "$clock" ;;
+        restore) rm -f -- "$clock"; ln -s /proc/uptime "$clock" ;;
+    esac
+}
+trap fake_clock EXIT
+run() {
+    local child status
+    "$@" &
+    child=$!
+    while :; do
+        wait "$child" && status=0 || status=$?
+        [[ -e "/proc/${child}" ]] || return "$status"
+    done
+}
+if [[ -n "${FAKE_CHECK_DELAY:-}" ]]; then
+    sleep "$FAKE_CHECK_DELAY"
+fi
+mode="${FAKE_CHECK:-view}"
+shift 2
+case "$mode" in
+    view)
+        run "$@"
+        status=$?
+        # The root view, after the check: drop the permission errors. One
+        # rename replaces the frame, so the SIGKILL of the outer operation,
+        # which can come at the same time, leaves one whole frame.
+        out="$(readlink -f "/proc/$$/fd/1")"
+        awk '
+            /^UNCERTAIN / && (/: Permission denied$/ || /\/maps: grep status 2$/) {
+                if (match($0, /\/proc\/[0-9]+/)) hidden[substr($0, RSTART, RLENGTH)] = 1
+                next
+            }
+            /^OLDER_UNREADABLE / && ($2 in hidden) { next }
+            { print }' "$out" > "${calls%/*}/root_view.tmp" && mv -f -- "${calls%/*}/root_view.tmp" "$out"
+        exit "$status" ;;
+    user) run "$@"; exit $? ;;
+    deny) echo "sudo: a password is required" >&2; exit 1 ;;
+    fail) run "$@"; exit 1 ;;
+    big) yes M3_CHECK_OUTPUT | head -c 1100000; exit $? ;;
+    frame:*) ;;
+    *) echo "fake sudo: unknown FAKE_CHECK ${mode}" >&2; exit 98 ;;
+esac
+# frame:<kind> - one controlled result frame from this process; no check runs.
+kind="${mode#frame:}"
+read -r up _ < /proc/uptime
+entry=$(( 10#${up/./} ))
+scan=$(( end - entry - 600 ))
+(( scan > 600 )) && scan=600
+read -r line < "/proc/$$/stat"
+read -r -a fields <<< "${line##*) }"
+own="${fields[19]}" pid=$$ start="${fields[19]}"
+if [[ "$kind" == live-monitor ]]; then
+    setsid sleep 30 < /dev/null > /dev/null 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" >> "$children"
+    for (( tick = 0; tick < 100; tick++ )); do
+        if read -r line < "/proc/${pid}/stat" && read -r -a fields <<< "${line##*) }" && [[ "${fields[2]}" == "$pid" ]]; then
+            break
+        fi
+        sleep 0.01
+    done
+    start="${fields[19]}"
+fi
+group="$pid"
+[[ "$kind" == monitor-group ]] && group=$(( pid + 1 ))
+frame=("LAUNCH 1 ${token} ${entry} ${scan}" "FRAME 1 ${token} ${task} ${uid} ${end}" "MONITOR ${pid} ${group} ${start} $(id -u)")
+case "$kind" in
+    unknown) frame+=("NOTE an unknown record") ;;
+    duplicate) frame+=("FRAME 1 ${token} ${task} ${uid} ${end}") ;;
+    target) frame[1]="FRAME 1 ${token} ${runner}/m3-metric-collection.AAAAAAAA ${uid} ${end}" ;;
+    uid) frame[1]="FRAME 1 ${token} ${task} 0 ${end}" ;;
+    scan-long) frame[0]="LAUNCH 1 ${token} ${entry} $(( scan + 100 ))" ;;
+esac
+frame+=("SCAN_END" "CHILD $$ ${own}")
+case "$kind" in
+    token) frame+=("END 1 ${token}0 COMPLETE ${entry}") ;;
+    terminated) frame+=("END 1 ${token} TERMINATED ${entry}") ;;
+    no-end) ;;
+    end-zero) frame+=("END 1 ${token} COMPLETE 0") ;;
+    end-backwards) frame+=("END 1 ${token} COMPLETE $(( entry - 1 ))") ;;
+    end-after-return) frame+=("END 1 ${token} COMPLETE ${end}") ;;
+    end-after-deadline) frame+=("END 1 ${token} COMPLETE $(( end + 1 ))") ;;
+    end-leading-zero) frame+=("END 1 ${token} COMPLETE 0${entry}") ;;
+    *) frame+=("END 1 ${token} COMPLETE ${entry}") ;;
+esac
+[[ "$kind" == after-end ]] && frame+=("SCAN_END")
+if [[ "$kind" == truncated ]]; then
+    printf '%s\n' "${frame[@]:0:${#frame[@]}-1}"
+    printf '%s' "${frame[-1]:0:5}"
+else
+    printf '%s\n' "${frame[@]}"
+fi
+exit 0
+ROOT_FAKE
+    } > "${root}/sudo"
+    chmod 755 "${root}/sudo"
+    if [[ -n "$mode" ]]; then
+        {
+            printf '#!/usr/bin/env bash\n'
+            printf 'children=%q\nmarker=%q\nmode=%q\nclock=%q\n' "${workspace}/root_children" "${workspace}/root_orphan" \
+                "$mode" "${root}/uptime"
+            cat <<'ROOT_FIND'
+case "$mode" in
+    fail) echo "find: simulated read failure" >&2; exit 1 ;;
+    clock)
+        rm -f -- "$clock"
+        exec /usr/bin/find "$@" ;;
+    slow) printf '%s\n' "$$" >> "$children"; exec /usr/bin/sleep 300 ;;
+    ignore)
+        trap '' TERM
+        printf '%s\n' "$$" >> "$children"
+        /usr/bin/sleep 300 &
+        printf '%s\n' "$!" >> "$children"
+        wait "$!"
+        exit 0 ;;
+    orphan)
+        if [[ ! -e "$marker" ]]; then
+            : > "$marker"
+            ( trap '' TERM; exec /usr/bin/sleep 300 ) < /dev/null > /dev/null 2>&1 &
+            printf '%s\n' "$!" >> "$children"
+        fi
+        exit 0 ;;
+esac
+exit 1
+ROOT_FIND
+        } > "${root}/find"
+        chmod 755 "${root}/find"
+        sed -i -e "s|/usr/bin/find|${root}/find|g" "$step"
+        if [[ "$mode" == clock ]]; then
+            # The fixed source reads its boot clock from rootfake/uptime, a
+            # link to /proc/uptime that the fake find removes in the scan.
+            ln -sfn /proc/uptime "${root}/uptime"
+            sed -i -e "s#{ read -r up rest < /proc/uptime; } 2> /dev/null || return 1#{ read -r up rest < ${root}/uptime; } 2> /dev/null || return 1#" "$step"
+            assert_eq "1" "$(grep -cF "< ${root}/uptime;" "$step")" "the fixed source reads its boot clock from the test file"
+        fi
+    fi
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'root=%q\n' "$root"
+        cat <<'ROOT_STAT'
+arguments=("$@")
+last="${arguments[$(( $# > 0 ? $# - 1 : 0 ))]:-}"
+if [[ "${FAKE_CHECK_OWNER:-root}" == root && ( "$last" == "$root" || "$last" == "$root"/* ) ]]; then
+    arguments=("${arguments[@]//%u/0}")
+fi
+exec /usr/bin/stat "${arguments[@]}"
+ROOT_STAT
+    } > "${workspace}/fakebin/stat"
+    chmod +x "${workspace}/fakebin/stat"
+    printf 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\n' > "${workspace}/os-release"
+    sed -i -e "s|/usr/bin/sudo|${root}/sudo|g" \
+        -e "s|^METRIC_OS_RELEASE=/etc/os-release\$|METRIC_OS_RELEASE=${workspace}/os-release|" "$step"
+}
+
+# ab_check_guard <workspace> - stop a test that would run the real sudo outside
+# the hosted runner, or the real sudo with a fake check tool.
+ab_check_guard() {
+    local step="${1}/capture_step.sh"
+    if grep -qF '/usr/bin/sudo' "$step"; then
+        [[ "$AB_CHECK_HOSTED" == yes ]] || _fail "only the hosted runner runs the real sudo; use ab_collect_root_fake"
+        if grep -qF '/rootfake/' "$step"; then
+            _fail "the real sudo never runs a fake check tool"
+        fi
+    fi
+}
+
+# ab_check_frame <workspace> - the result frame of the process check.
+ab_check_frame() {
+    cat "${1}/runner_temp/evidence/m3-mean-speed/process-check.txt" 2>/dev/null || true
+}
+
+# ab_check_source_sha <workspace> - the SHA-256 of the fixed check source of
+# the extracted capture step.
+ab_check_source_sha() {
+    local library
+    library="$(ab_collect_block "$1")"
+    bash --noprofile --norc -c "${library}"'
+printf "%s" "$METRIC_ROOT_CHECK_SOURCE"' | sha256sum | cut -d ' ' -f 1
+}
+
+# ab_check_children_stopped <workspace> <label> - every check child that a fake
+# check tool recorded has stopped. A live one is killed and fails the test.
+ab_check_children_stopped() {
+    local workspace="$1" label="$2" pid
+    [[ -s "${workspace}/root_children" ]] || _fail "${label}: the fake check child must start"
+    while IFS= read -r pid; do
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            _fail "${label}: the check child ${pid} must stop"
+        fi
+    done < "${workspace}/root_children"
+}
+
+# ab_check_vector_once <workspace> <label> - the command record has exactly
+# one privileged row: the process check with the exact admitted vector, the
+# SHA-256 of the fixed source, the unique task directory, RUNNER_TEMP, the
+# original runner UID, two boot-clock values, and the recorded token. In the
+# fake boundary, the fake sudo got that exact vector once.
+ab_check_vector_once() {
+    local workspace="$1" label="$2" rows sudo=/usr/bin/sudo sha uid
+    rows="$(awk -F '\t' 'NR > 1 && $12 ~ /sudo/ { print $2 "\t" $12 }' \
+        "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv" 2>/dev/null || true)"
+    if grep -qF '/rootfake/sudo' "${workspace}/capture_step.sh"; then
+        sudo="${workspace}/rootfake/sudo"
+    fi
+    sha="$(ab_check_source_sha "$workspace")"
+    uid="$(id -u)"
+    [[ "$rows" =~ ^process-check$'\t'"${sudo} ${AB_CHECK_PREFIX} <METRIC_ROOT_CHECK_SOURCE sha256 ${sha}> m3-process-check ${workspace}/runner_temp/m3-metric-collection."[A-Za-z0-9]{8}" ${workspace}/runner_temp ${uid} "[0-9]+" "[0-9]+" "[A-Za-z0-9]{8,64}$ ]] ||
+        _fail "${label}: the one privileged row is the exact admitted process-check vector" "$rows"
+    assert_eq "$(ab_collect_value "$workspace" PROCESS_CHECK_TOKEN)" "${rows##* }" "${label}: the vector carries the recorded token"
+    if [[ "$sudo" != /usr/bin/sudo ]]; then
+        assert_eq "sudo ${AB_CHECK_PREFIX} <source sha256 ${sha}> m3-process-check ${rows#* m3-process-check }" \
+            "$(tr '\t' ' ' < "${workspace}/root_calls.tsv")" "${label}: the fake boundary got the exact vector once"
+    fi
+}
+
+# ab_check_complete <workspace> <label> - a complete process check: the frame
+# from LAUNCH to END COMPLETE with the recorded token, the fixed source hash,
+# the original runner UID, a monitor that leads its own process group and runs
+# as root only through the real admitted vector, a verified stop, a scan of at
+# most 600 centiseconds, and one cleanup clock: the check part ends 12000 ms
+# after the cleanup entry, and the cleanup 20000 ms after it.
+ab_check_complete() {
+    local workspace="$1" label="$2" frame token pid group start euid expected scan entry
+    frame="$(ab_check_frame "$workspace")"
+    token="$(ab_collect_value "$workspace" PROCESS_CHECK_TOKEN)"
+    assert_eq "COMPLETE" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "${label}: the process check is complete"
+    assert_eq "$(id -u)" "$(ab_collect_value "$workspace" ORIGINAL_RUNNER_UID)" "${label}: the original runner UID is recorded"
+    assert_eq "$(ab_check_source_sha "$workspace")" "$(ab_collect_value "$workspace" PROCESS_CHECK_SOURCE_SHA256)" \
+        "${label}: the result records the SHA-256 of the fixed check source"
+    [[ "$token" =~ ^[A-Za-z0-9]{8,64}$ ]] || _fail "${label}: the check token is recorded" "token: ${token}"
+    [[ "$(head -n 1 <<< "$frame")" == "LAUNCH 1 ${token} "* ]] ||
+        _fail "${label}: the frame starts with the launch record" "$frame"
+    [[ "$(tail -n 1 <<< "$frame")" =~ ^END\ 1\ ${token}\ COMPLETE\ [0-9]+$ ]] ||
+        _fail "${label}: the frame ends with one complete terminal record" "$frame"
+    read -r pid group start euid <<< "$(ab_collect_value "$workspace" PROCESS_CHECK_MONITOR)"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" == "$group" && "$start" =~ ^[0-9]+$ ]] ||
+        _fail "${label}: the monitor leads its own process group" "monitor: ${pid} ${group} ${start} ${euid}"
+    expected="$(id -u)"
+    if ! grep -qF '/rootfake/sudo' "${workspace}/capture_step.sh"; then
+        expected=0
+    fi
+    assert_eq "$expected" "$euid" "${label}: the monitor runs as root only through the real admitted vector"
+    assert_eq "YES" "$(ab_collect_value "$workspace" PROCESS_CHECK_STOPPED)" "${label}: the check group is verified stopped"
+    scan="$(ab_collect_value "$workspace" PROCESS_CHECK_SCAN_CS)"
+    [[ "$scan" =~ ^[0-9]+$ ]] && (( scan >= 1 && scan <= 600 )) ||
+        _fail "${label}: the scan has at most 600 centiseconds" "scan: ${scan}"
+    entry="$(ab_collect_value "$workspace" CLEANUP_START_MS)"
+    [[ "$entry" =~ ^[0-9]+$ ]] || _fail "${label}: the cleanup entry is recorded" "entry: ${entry}"
+    assert_eq "$(( entry + 12000 ))" "$(ab_collect_value "$workspace" PROCESS_CHECK_END_MS)" \
+        "${label}: the check part ends 12000 ms after the cleanup entry"
+    assert_eq "$(( entry + 20000 ))" "$(ab_collect_value "$workspace" CLEANUP_END_MS)" \
+        "${label}: the cleanup ends 20000 ms after its entry"
+}
+
+# ab_check_measurements <workspace> <label> - the five task-size measurements
+# in order, each with its byte count and time, and TASK_MEASURED_MAX_BYTES as
+# the largest of them; the result publishes TASK_MEASURED_LIMIT_BYTES.
+ab_check_measurements() {
+    local workspace="$1" label="$2" rows max
+    assert_eq "4294967296" "$(ab_collect_value "$workspace" TASK_MEASURED_LIMIT_BYTES)" \
+        "${label}: the result publishes the measured-total limit"
+    rows="$(cat "${workspace}/runner_temp/evidence/m3-mean-speed/task-bytes.tsv" 2>/dev/null || true)"
+    assert_eq $'label\ntask-bytes-before-copy\ntask-bytes-after-copy\ntask-bytes-before-calculation\ntask-bytes-after-calculation\ntask-bytes-final' \
+        "$(cut -f 1 <<< "$rows")" "${label}: the five measurements are recorded in order"
+    assert_eq $'label\tbytes\ttime_ms' "$(head -n 1 <<< "$rows")" "${label}: the measurement record has its columns"
+    awk -F '\t' 'NR > 1 && !($2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $3 + 0 >= last) { exit 1 } NR > 1 { last = $3 + 0 }' <<< "$rows" ||
+        _fail "${label}: each measurement has its byte count and a time, in order" "$rows"
+    max="$(awk -F '\t' 'NR > 1 && $2 + 0 > max { max = $2 + 0 } END { printf "%.0f", max }' <<< "$rows")"
+    assert_eq "$max" "$(ab_collect_value "$workspace" TASK_MEASURED_MAX_BYTES)" \
+        "${label}: TASK_MEASURED_MAX_BYTES is the largest measurement"
+}
+
+# ab_check_fixture <workspace> [find-mode] - the extracted capture step with the
+# fake privilege boundary, for ab_check_cleanup.
+ab_check_fixture() {
+    ab_capture_fixture "$1"
+    ab_collect_root_fake "$1" "${2:-}"
+}
+
+# ab_check_cleanup <workspace> [NAME=value ...] - run the extracted
+# metric_cleanup on a new task directory under RUNNER_TEMP, after the
+# initialization of metric_collect, as on the hosted runner. The metric end is
+# AB_CHECK_END_IN_MS (default 60000) after the start of the cleanup run. With
+# AB_CHECK_HIDDEN=<file>, a test process with its working directory in the
+# task Case makes its /proc entries unreadable (PR_SET_DUMPABLE 0) first, and
+# its PID goes to the file. With AB_CHECK_FIRST=<reason>, an earlier
+# COMMAND_FAILURE with that reason comes first. The result record is written as
+# at the end of the metric. The task directory path goes to unit_task. Prints
+# status=.
+ab_check_cleanup() {
+    local workspace="$1" library status
+    shift
+    ab_check_guard "$workspace"
+    library="$(ab_collect_block "$workspace")"
+    [[ -n "$library" ]] || _fail "the metric functions must be extracted"
+    : > "${workspace}/unit_task"
+    env PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        CAPTURE_WORK_END="$(( $(date +%s) + 1000 ))" \
+        GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_OS=Linux ImageOS=ubuntu24 \
+        AB_UNIT_TASK="${workspace}/unit_task" \
+        "$@" bash --noprofile --norc -c "${library}"'
+capture_note() { :; }
+mkdir -p "$RUNNER_TEMP" "$EVIDENCE_DIR"
+PREPARE_RESULT=NOT_ATTEMPTED metric_collect > /dev/null
+M_CODE="" M_REASON="" M_FAIL_POINT=NONE
+if [[ -n "${AB_CHECK_FIRST:-}" ]]; then
+    metric_fail COMMAND_FAILURE "$AB_CHECK_FIRST" > /dev/null
+fi
+TASK_TEMP="$(mktemp -d "${RUNNER_TEMP}/m3-metric-collection.XXXXXXXX")"
+mkdir -- "${TASK_TEMP}/case" "${TASK_TEMP}/config" "${TASK_TEMP}/logs"
+printf "%s\n" "$TASK_TEMP" > "$AB_UNIT_TASK"
+if [[ -n "${AB_CHECK_HIDDEN:-}" ]]; then
+    setsid python3 -c "import ctypes, os, sys, time
+os.chdir(sys.argv[1])
+if ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(2)
+print(os.getpid(), flush=True)
+time.sleep(30)" "${TASK_TEMP}/case" < /dev/null > "$AB_CHECK_HIDDEN" 2> /dev/null &
+    for (( tick = 0; tick < 200; tick++ )); do
+        [[ -s "$AB_CHECK_HIDDEN" ]] && break
+        sleep 0.01
+    done
+fi
+M_END_MS=$(( $(metric_now_ms) + ${AB_CHECK_END_IN_MS:-60000} ))
+metric_cleanup
+metric_write_result UNAVAILABLE "${M_CODE:-NONE}" "${M_REASON:-none}"
+' > "${workspace}/unit.out" 2>&1 && status=0 || status=$?
+    printf 'status=%s\n' "$status"
+}
+
+# ab_check_value <workspace> <key> - one value of the result of ab_check_cleanup.
+ab_check_value() {
+    ab_file_value "${1}/runner_temp/evidence/m3-mean-speed/result.env" "$2"
+}
+
+# ab_check_refused <label> <workspace> <reason-text> [NAME=value ...] - run
+# ab_check_cleanup. The cleanup must refuse with REFUSED_PROCESS_CHECK and a
+# reason that has <reason-text>, and keep the task directory.
+ab_check_refused() {
+    local label="$1" workspace="$2" reason="$3"
+    shift 3
+    ab_check_cleanup "$workspace" "$@" > /dev/null
+    [[ "$(ab_check_value "$workspace" CLEANUP_RESULT)" == REFUSED_PROCESS_CHECK ]] ||
+        _fail "${label}: the cleanup refuses with REFUSED_PROCESS_CHECK" \
+              "actual: $(ab_check_value "$workspace" CLEANUP_RESULT)" \
+              "reason: $(ab_check_value "$workspace" MEAN_SPEED_REASON)" "$(tail -n 5 "${workspace}/unit.out")"
+    assert_eq "CLEANUP_FAILURE" "$(ab_check_value "$workspace" MEAN_SPEED_REASON_CODE)" "${label}: the refusal is a cleanup failure"
+    assert_contains "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" "$reason" "${label}: the reason names the cause"
+    [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "${label}: the task directory stays"
+}
+
+# ab_collect_fake_du <workspace> - a du that gives one controlled task-size
+# measurement: FAKE_DU=<label>=<bytes|fail|malformed>, where <label> is the
+# measurement whose output file the call writes. Other calls run the real du.
+ab_collect_fake_du() {
+    local real
+    real="$(command -v du)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\n' "$real"
+        cat <<'FAKE_DU'
+out="$(readlink -f "/proc/$$/fd/1" 2>/dev/null || true)"
+label="${out##*/}"
+label="${label%.out}"
+if [[ -n "${FAKE_DU:-}" && "$label" == "${FAKE_DU%%=*}" ]]; then
+    case "${FAKE_DU#*=}" in
+        fail) echo "du: simulated failure" >&2; exit 1 ;;
+        malformed) printf 'x\t%s\n' "${!#}"; exit 0 ;;
+        *) printf '%s\t%s\n' "${FAKE_DU#*=}" "${!#}"; exit 0 ;;
+    esac
+fi
+exec "$real" "$@"
+FAKE_DU
+    } > "${1}/fakebin/du"
+    chmod +x "${1}/fakebin/du"
+}
+
+# ab_check_slow_readlink <workspace> - a readlink that waits
+# FAKE_READLINK_DELAY seconds before each call.
+ab_check_slow_readlink() {
+    local real
+    real="$(command -v readlink)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\n' "$real"
+        printf '%s\n' 'sleep "${FAKE_READLINK_DELAY:-0}"' 'exec "$real" "$@"'
+    } > "${1}/fakebin/readlink"
+    chmod +x "${1}/fakebin/readlink"
+}
+
+# ab_check_parent_clock <workspace> - the collector reads the two boot clocks of
+# the process check (before the launch and after the return) from
+# <workspace>/parent_uptime, a link to /proc/uptime. FAKE_CHECK_CLOCK of the
+# fake sudo changes that file after the check. The fixed source (its read ends
+# with "|| return 1") and the metric start keep /proc/uptime. A second call
+# only restores the link.
+ab_check_parent_clock() {
+    local workspace="$1" step="${1}/capture_step.sh"
+    rm -f -- "${workspace}/parent_uptime"
+    ln -s /proc/uptime "${workspace}/parent_uptime"
+    sed -i -e "/|| return 1\$/!s#{ read -r up rest < /proc/uptime; }#{ read -r up rest < ${workspace}/parent_uptime; }#" "$step"
+    assert_eq "2" "$(grep -cF "< ${workspace}/parent_uptime;" "$step")" \
+        "the collector reads the two boot clocks of the process check from the test file"
+}
+
+# ab_check_partial_clock <file> - the current boot clock with no line end, so a
+# read of the file sets the valid first field and returns status 1.
+ab_check_partial_clock() {
+    local up idle
+    read -r up idle < /proc/uptime
+    rm -f -- "$1"
+    printf '%s %s' "$up" "$idle" > "$1"
+}
+
+# ab_check_parse <block> <frame-file> <return-cs> - the extracted
+# metric_check_frame of the collection block on one controlled frame, with the
+# request values of review 5476930073: token abcdefgh12, the launch at 500, the
+# absolute end at 1200, and 100 clock ticks each second. The frame is data
+# only: no process starts or gets a signal. Prints the problem, empty for one
+# complete valid frame.
+ab_check_parse() {
+    bash --noprofile --norc -c "${1}"'
+CHECK_TOKEN=abcdefgh12 TASK_TEMP=/tmp/m3-metric-collection.AbCd1234 ORIGINAL_RUNNER_UID=1000
+CHECK_END_BOOT_CS=1200 M_CHECK_LAUNCH_CS=500 M_CHECK_CLK=100
+M_GROUPS=()
+metric_check_frame "$1" "$2"
+printf "%s" "$C_PROBLEM"' parse "$2" "$3"
+}
+
+# ab_check_full_refused <label> <workspace> <reason-text> [<check> <stopped>] -
+# a complete collection with a failed process check: REFUSED_PROCESS_CHECK as
+# the first failure with a reason that has <reason-text>, the check result
+# <check> (default INCOMPLETE) and stop record <stopped> (default YES, a
+# verified stop), no removal, the task directory kept, no accepted value, and
+# an incomplete capture.
+ab_check_full_refused() {
+    local label="$1" workspace="$2" reason="$3" check="${4:-INCOMPLETE}" stopped="${5:-YES}"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "${label}: the cleanup refuses with REFUSED_PROCESS_CHECK"
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "${label}: the refusal is the first failure"
+    assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "$reason" "${label}: the reason names the cause"
+    assert_eq "$check" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "${label}: the check result is ${check}"
+    assert_eq "$stopped" "$(ab_collect_value "$workspace" PROCESS_CHECK_STOPPED)" "${label}: the stop record is ${stopped}"
+    assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+        "${label}: no removal starts"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "${label}: the task directory stays"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "${label}: no value is accepted"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "${label}: no numeric value"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "${label}: GITHUB_ENV has the verdict"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "${label}: the capture is incomplete"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt" 2>/dev/null || true)" \
+        "M3 mean speed: CLEANUP_FAILURE" "${label}: the capture note names the reason"
+}
+
+# ab_collect_ras <flow-case> - RAS kEpsilon inputs: the turbulence dictionary
+# and k, epsilon, and nut at times 1 and 2.
+ab_collect_ras() {
+    local flow="$1" time field
+    cat > "${flow}/constant/turbulenceProperties" <<'COLLECT_RAS'
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      turbulenceProperties;
+}
+
+simulationType      RAS;
+
+RAS
+{
+    RASModel        kEpsilon;
+    turbulence      on;
+    printCoeffs     on;
+}
+COLLECT_RAS
+    for time in 1 2; do
+        for field in k epsilon nut; do
+            {
+                printf 'FoamFile\n{\n    version     2.0;\n    format      ascii;\n'
+                printf '    class       volScalarField;\n    location    "%s";\n    object      %s;\n}\n\n' \
+                    "$time" "$field"
+                printf 'dimensions      [0 2 -2 0 0 0 0];\n\ninternalField   nonuniform List<scalar> 2(0.1 0.2);\n\n'
+                printf 'boundaryField\n{\n    outside\n    {\n        type            zeroGradient;\n    }\n}\n'
+            } > "${flow}/${time}/${field}"
+        done
+    done
+}
+
+# ab_collect_fixture <workspace> - the extracted evidence steps, the fake
+# OpenFOAM tree and system commands, and a Batch Workspace with completed
+# Case 7 and Case 8 flow results: latest time 2, earlier time 1, the flow
+# completion record, and the post-processing time record.
+ab_collect_fixture() {
+    local workspace="$1" batch tree name library task case_id
+    ab_capture_fixture "$workspace"
+    batch="${workspace}/checkout/src/batch_9"
+    tree="${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin"
+    mkdir -p "$tree" "${workspace}/openfoam/openfoam2512/etc" "${workspace}/elsewhere"
+    : > "${workspace}/calls.tsv"
+    ab_metric_write_mesh_awk "${workspace}/mesh_metric.awk"
+    ab_metric_write_fake "${workspace}/metric_fake" "${workspace}/mesh_metric.awk"
+    for name in curl sudo dpkg-query gcc uname; do
+        ln -s "${workspace}/metric_fake" "${workspace}/fakebin/${name}"
+    done
+    for name in foamListTimes checkMesh simpleFoam; do
+        ln -s "${workspace}/metric_fake" "${tree}/${name}"
+    done
+    ln -s "${workspace}/metric_fake" "${workspace}/elsewhere/simpleFoam"
+    cat > "${workspace}/openfoam/openfoam2512/etc/bashrc" <<COLLECT_BASHRC
+if [[ -n "\${FAKE_BASHRC_STATUS:-}" ]]; then return "\${FAKE_BASHRC_STATUS}"; fi
+export WM_PROJECT_VERSION="\${FAKE_WM_VERSION-v2512}"
+export WM_OPTIONS=linux64GccDPInt32Opt
+export WM_COMPILER="\${FAKE_WM_COMPILER-Gcc}"
+export PATH="\${FAKE_EXTRA_PATH:+\${FAKE_EXTRA_PATH}:}${tree}:\${PATH}"
+COLLECT_BASHRC
+    # The two-cell Case and the metric dictionary of the merged validation
+    # workflow.
+    library="$(ab_step_run_body "Run the metric validation" "$METRIC_WORKFLOW" |
+        awk '/<<.METRIC_VALIDATION.$/ { inside = 1; next } /^METRIC_VALIDATION$/ { inside = 0 } inside' |
+        awk '/^case "\$\{1:-\}" in$/ { stop = 1 } !stop { print }')"
+    task="${workspace}/fixture/m3-mean-speed-validation"
+    mkdir -p "$task"
+    env METRIC_TASK_ROOT="${workspace}/fixture" METRIC_TASK_TEMP="$task" bash -c "${library}
+        write_fixture" || _fail "the validation fixture writer must succeed"
+    cp -- "${task}/config/metric-functions" "${workspace}/validation-metric-functions"
+    for case_id in case_7 case_8; do
+        mkdir -p "${batch}/${case_id}/vtk"
+        cp -R -- "${task}/case" "${batch}/${case_id}/flow"
+        ab_collect_ras "${batch}/${case_id}/flow"
+        : > "${batch}/${case_id}/flow/flow.marker"
+        : > "${batch}/${case_id}/flow/case.foam"
+        printf '2\n' > "${batch}/${case_id}/vtk/flow_latest_time.txt"
+        : > "${batch}/${case_id}/vtk/post_processing.complete"
+    done
+    # Case 8 has other speeds, so a wrong Case gives another value.
+    sed -i -e 's/(3 4 0)/(30 40 0)/' "${batch}/case_8/flow/2/U"
+    # Outside the hosted runner, the process check gets the fake boundary.
+    if [[ "$AB_CHECK_HOSTED" != yes ]]; then
+        ab_collect_root_fake "$workspace"
+    fi
+}
+
+# ab_collect_flow <workspace> - the Case 7 flow result directory.
+ab_collect_flow() {
+    printf '%s\n' "${1}/checkout/src/batch_9/case_7/flow"
+}
+
+# ab_collect_run <workspace> [NAME=value ...] - run the extracted capture step
+# as GitHub runs it on the hosted runner, after a successful product run, with
+# the fake OpenFOAM tree and a far deadline. The arguments override the
+# environment. Prints status= and elapsed= lines.
+ab_collect_run() {
+    local workspace="$1" start status
+    shift
+    ab_check_guard "$workspace"
+    start="$(date +%s)"
+    env PATH="${workspace}/fakebin:${PATH}" \
+        GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_OS=Linux ImageOS=ubuntu24 \
+        TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" \
+        EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_ENV="${workspace}/github_env" \
+        GITHUB_WORKSPACE="${workspace}/checkout" \
+        GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 \
+        LIB="${workspace}/runner_temp/evidence_lib.sh" \
+        CAPTURE_DEADLINE="$(( start + 100000 ))" \
+        EVIDENCE_CLOCK_START="$(( start - 1000 ))" \
+        CAPTURE_START_GUARD_SECONDS=60 \
+        CHECKOUT_RESULT=SUCCEEDED BASELINE_RESULT=SUCCEEDED INSTALL_RESULT=SUCCEEDED \
+        PREPARE_RESULT=SUCCEEDED ORCHESTRATOR_STARTED=true OVERALL_RESULT=SUCCEEDED \
+        OPENFOAM_BASELINE=v2512 OPENFOAM_PACKAGE=openfoam2512-default OPENFOAM_VERSION=v2512 \
+        OPENFOAM_BASHRC="${workspace}/openfoam/openfoam2512/etc/bashrc" \
+        METRIC_FAKE_CALLS="${workspace}/calls.tsv" \
+        METRIC_FAKE_PIDS="${workspace}/fake_pids" \
+        "$@" "${AB_STEP_BASH[@]}" "${workspace}/capture_step.sh" > "${workspace}/capture_step.out" 2>&1 \
+        && status=0 || status=$?
+    printf 'status=%s\nelapsed=%s\n' "$status" "$(( $(date +%s) - start ))"
+}
+
+# ab_collect_value <workspace> <key> - one value of the metric result file.
+ab_collect_value() {
+    ab_file_value "${1}/runner_temp/evidence/m3-mean-speed/result.env" "$2"
+}
+
+# ab_collect_tasks <workspace> - the metric task directories under RUNNER_TEMP.
+ab_collect_tasks() {
+    find "${1}/runner_temp" -mindepth 1 -maxdepth 1 -name 'm3-metric-collection.*' -print | LC_ALL=C sort
+}
+
+# ab_collect_summary <workspace> - run the extracted summary step with the
+# values that the capture step published. Prints the job summary.
+ab_collect_summary() {
+    local workspace="$1"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" \
+        CAPTURE_RESULT="$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+        CAPTURE_REASON="$(ab_env_last "$workspace" CAPTURE_REASON)" \
+        VTU_REQUIRED_FIELDS_VERDICT="$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        MESH_QUALITY_VERDICT="$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        CONVERGENCE_VERDICT="$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" \
+        MEAN_SPEED_VERDICT="$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" \
+        MEAN_SPEED_REASON_CODE="$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" \
+        MEAN_SPEED_REASON="$(ab_env_last "$workspace" MEAN_SPEED_REASON)" \
+        MEAN_SPEED_VALUE="$(ab_env_last "$workspace" MEAN_SPEED_VALUE)" \
+        OVERALL_RESULT=SUCCEEDED \
+        "${AB_STEP_BASH[@]}" "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
+        _fail "the extracted summary step must succeed"
+    cat "${workspace}/step_summary"
+}
+
+# ab_collect_expect <label> <reason-code> <setup|-> [NAME=value ...] - one run
+# in a new workspace. <setup> is a function that changes the fixture first. The
+# metric must be UNAVAILABLE with the reason code, no accepted value, a capture
+# step that ends with status 0, and a published verdict. A failed attempt must
+# give a capture note and an incomplete capture. NOT_ATTEMPTED gives neither.
+# The task directory must be gone. Sets AB_COLLECT_LAST to the workspace.
+ab_collect_expect() {
+    local label="$1" code="$2" setup="$3" workspace run argument arguments=()
+    shift 3
+    workspace="$(new_workspace "${label//[^A-Za-z0-9_.-]/_}")"
+    ab_collect_fixture "$workspace"
+    if [[ "$setup" != - ]]; then
+        "$setup" "$workspace"
+    fi
+    for argument in "$@"; do
+        arguments+=("${argument//@WORKSPACE@/${workspace}}")
+    done
+    run="$(ab_collect_run "$workspace" "${arguments[@]}")"
+    [[ "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" == "$code" ]] ||
+        _fail "${label}: the metric reason code must be ${code}" \
+              "actual: $(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+              "reason: $(ab_collect_value "$workspace" MEAN_SPEED_REASON)" \
+              "$(tail -n 8 "${workspace}/capture_step.out" 2>/dev/null)"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "${label}: the metric is UNAVAILABLE"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "${label}: no value is accepted"
+    assert_contains "$run" "status=0" "${label}: the capture step ends with status 0"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "${label}: GITHUB_ENV has the verdict"
+    assert_eq "$code" "$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" "${label}: GITHUB_ENV has the reason code"
+    if [[ "$code" == NOT_ATTEMPTED ]]; then
+        assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "${label}: no attempt gives no capture note"
+    else
+        assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" \
+            "${label}: a failed attempt gives an incomplete capture"
+        assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" \
+            "M3 mean speed: ${code}" "${label}: the capture note names the reason"
+    fi
+    assert_eq "" "$(ab_collect_tasks "$workspace")" "${label}: no task directory remains"
+    AB_COLLECT_LAST="$workspace"
+}
+
+# ab_collect_no_openfoam <workspace> <label> - no metric OpenFOAM command ran.
+ab_collect_no_openfoam() {
+    assert_eq "0" "$(awk -F '\t' '$1 == "foamListTimes" || $1 == "simpleFoam" || $1 == "checkMesh"' \
+        "${1}/calls.tsv" | wc -l)" "${2}: no OpenFOAM command runs"
+}
+
+# ab_collect_no_calculation <workspace> <label> - no simpleFoam command ran.
+ab_collect_no_calculation() {
+    assert_eq "0" "$(awk -F '\t' '$1 == "simpleFoam"' "${1}/calls.tsv" | wc -l)" "${2}: no metric calculation runs"
+}
+
+# ab_collect_tree_sha <directory> - one checksum line for each file, sorted.
+ab_collect_tree_sha() {
+    (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
+}
+
+# ab_collect_block <workspace> - the metric functions of the capture work
+# script, between their begin and end markers.
+ab_collect_block() {
+    awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 } inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }' \
+        "${1}/capture_step.sh"
+}
+
+s72_collect_volume_weighted_mean_of_the_latest_time() {
+    local workspace run flow evidence before after calls task line summary file
+    # A GitHub-hosted runner runs the real admitted check here, never the fake
+    # boundary, so a pass there proves the root monitor assertions below.
+    if [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]; then
+        assert_eq "yes" "$AB_CHECK_HOSTED" "S72: the GitHub-hosted runner runs the real admitted check (ImageOS '${ImageOS:-}')"
+    fi
+    workspace="$(new_workspace s72_collect)"
+    ab_collect_fixture "$workspace"
+    flow="$(ab_collect_flow "$workspace")"
+    evidence="${workspace}/runner_temp/evidence/m3-mean-speed"
+    before="$(ab_collect_tree_sha "$flow")"
+    run="$(ab_collect_run "$workspace")"
+    after="$(ab_collect_tree_sha "$flow")"
+    assert_contains "$run" "status=0" "S72: the capture step ends with status 0"
+    [[ "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" == AVAILABLE ]] ||
+        _fail "S72: the metric must be AVAILABLE" \
+              "code: $(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+              "reason: $(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "$(tail -n 8 "${workspace}/capture_step.out")"
+    assert_eq "NONE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S72: no failure reason"
+    # sum(V_i |U_i|) / sum(V_i) = (1 * 5 + 2 * 3) / 3 = 11/3 m/s at the latest time.
+    assert_eq "3.66666666666666652e+00" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" \
+        "S72: the volume-weighted mean speed of the latest time"
+    awk -v v="$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" 'BEGIN { d = v - 11 / 3; if (d < 0) d = -d; exit !(d <= 1e-6) }' ||
+        _fail "S72: the value must be 11/3 m/s within 1e-6 m/s"
+    assert_eq "m/s" "$(ab_collect_value "$workspace" MEAN_SPEED_UNIT)" "S72: the unit"
+    for line in "SELECTED_TIME=2" "POST_PROCESSING_TIME=2" "OUTPUT_TIME=2" "OUTPUT_CELLS=2" \
+                "OUTPUT_VOLUME=3.00000000000000000e+00" "OUTPUT_REGION=all region0" "OUTPUT_FIELD=volAverage(m3MagU)" \
+                "OUTPUT_PATH=postProcessing/m3MeanSpeed/2/volFieldValue.dat" "DICTIONARY_BYTES=636" \
+                "DICTIONARY_SHA256=${AB_COLLECT_DICTIONARY_SHA}" "INPUTS_UNCHANGED=YES" "INPUT_FILES=15" \
+                "CLEANUP_RESULT=REMOVED" "SOURCE_FLOW_CASE=src/batch_9/case_7/flow" "MAIN_SHA=${AB_COLLECT_SHA}" \
+                "RUN_ID=4545"; do
+        assert_eq "${line#*=}" "$(ab_collect_value "$workspace" "${line%%=*}")" "S72: the result records ${line%%=*}"
+    done
+    # The exact two vectors, each once, on Case 7 only.
+    calls="$(ab_metric_calls "$workspace" | grep -E '^(foamListTimes|simpleFoam|checkMesh|curl|sudo) ' || true)"
+    task="$(sed -n -e 's|^simpleFoam -case \(.*\)/case -postProcess .*|\1|p' <<< "$calls")"
+    [[ "$task" =~ ^${workspace}/runner_temp/m3-metric-collection\.[A-Za-z0-9]{8}$ ]] ||
+        _fail "S72: the calculation runs in one unique task directory under RUNNER_TEMP" "$calls"
+    assert_eq "foamListTimes -case ${flow} -latestTime
+simpleFoam -case ${task}/case -postProcess -time 2 -fields (U) -dict ${task}/config/metric-functions" \
+        "$calls" "S72: the exact selection and calculation vectors, each once"
+    assert_not_contains "$(cat "${workspace}/calls.tsv")" "case_8" "S72: Case 8 is never used"
+    # The isolated snapshot and the unchanged source Case.
+    assert_eq "$before" "$after" "S72: the command does not change the source Case"
+    assert_file_missing "${flow}/postProcessing" "S72: no output reaches the source Case"
+    assert_eq "" "$(ab_collect_tasks "$workspace")" "S72: the cleanup removes the task directory"
+    cmp -s "${workspace}/validation-metric-functions" "${evidence}/metric-functions" ||
+        _fail "S72: the dictionary bytes are the bytes of the merged validation workflow"
+    assert_eq "$AB_COLLECT_DICTIONARY_SHA" "$(ab_sha "${evidence}/metric-functions")" "S72: the dictionary hash"
+    cmp -s "${evidence}/source-before.tsv" "${evidence}/snapshot-before.tsv" ||
+        _fail "S72: the snapshot bytes equal the source bytes"
+    cmp -s "${evidence}/source-before.tsv" "${evidence}/source-after.tsv" ||
+        _fail "S72: the source bytes stay the same after the calculation"
+    cmp -s "${evidence}/snapshot-before.tsv" "${evidence}/snapshot-after.tsv" ||
+        _fail "S72: the snapshot bytes stay the same after the calculation"
+    for file in constant/polyMesh/points constant/polyMesh/faces constant/polyMesh/owner constant/polyMesh/neighbour \
+                constant/polyMesh/boundary constant/transportProperties constant/turbulenceProperties \
+                system/controlDict system/fvSchemes system/fvSolution 2/U 2/p 2/k 2/epsilon 2/nut; do
+        assert_contains "$(cat "${evidence}/source-before.tsv")" "${file}"$'\t'"$(stat -c %s -- "${flow}/${file}")"$'\t'"$(ab_sha "${flow}/${file}")" \
+            "S72: the source manifest records ${file}"
+    done
+    assert_not_contains "$(cat "${evidence}/source-before.tsv")" "1/U" "S72: the earlier time is not copied"
+    assert_eq "$(ab_collect_value "$workspace" OUTPUT_SHA256)" "$(ab_sha "${evidence}/output/volFieldValue.dat")" \
+        "S72: the output copy has the recorded checksum"
+    assert_contains "$(cat "${evidence}/identity.txt")" "WM_PROJECT_VERSION=v2512" "S72: the identity records the version"
+    assert_contains "$(cat "${evidence}/identity.txt")" \
+        "PATH_simpleFoam=${workspace}/openfoam/openfoam2512/platforms/linux64GccDPInt32Opt/bin/simpleFoam" \
+        "S72: the identity records the command path"
+    assert_contains "$(cat "${evidence}/commands.tsv")" $'\tCOMPLETED\t' "S72: the command record has outcomes"
+    assert_eq "" "$(cd "$evidence" && find . -type f \( -name U -o -name p -o -name k -o -name epsilon -o -name nut \
+        -o -name points -o -name faces -o -name owner -o -name neighbour -o -name boundary -o -name '*.vtu' \) -print)" \
+        "S72: the evidence holds no mesh, field, or VTU file"
+    while IFS=$'\t' read -r line file; do
+        [[ "$line" == FILE ]] || continue
+        assert_file_exists "${evidence}/${file}" "S72: the inventory lists an existing file ${file}"
+    done < <(awk -F '\t' '{ print $1 "\t" $4 }' "${evidence}/inventory.txt")
+    assert_eq "$(( $(cd "$evidence" && find . -type f | wc -l) - 2 ))" "$(awk -F '\t' '$1 == "FILE"' "${evidence}/inventory.txt" | wc -l)" \
+        "S72: the inventory lists every evidence file except itself and the result"
+    # The cleanup process check (contract 6084196797, Section 4): the one
+    # admitted privileged vector, the original runner UID as the selector, a
+    # complete frame from a monitor in its own process group, a verified stop,
+    # and an unprivileged removal and evidence.
+    ab_check_vector_once "$workspace" "S72"
+    ab_check_complete "$workspace" "S72"
+    assert_eq "rm -rf -- ${task}" "$(awk -F '\t' '$2 == "remove" { print $12 }' "${evidence}/commands.tsv")" \
+        "S72: the removal is the unprivileged bounded rm vector"
+    assert_eq "" "$(find "$evidence" ! -user "$(id -u)" -print)" "S72: every evidence file belongs to the runner user"
+    # On the hosted runner, the job summary shows the real check evidence of
+    # this run: the frame records, the check values, the executables, the
+    # check operations, and the measurements. It asserts nothing.
+    if [[ "$AB_CHECK_HOSTED" == yes && -n "${GITHUB_STEP_SUMMARY:-}" && -w "${GITHUB_STEP_SUMMARY:-}" ]] &&
+        ! grep -qF '/rootfake/' "${workspace}/capture_step.sh"; then
+        {
+            printf '### S72 hosted read-only root check\n\n```text\n'
+            grep -vE '^(MATCH|UNCERTAIN|OLDER_UNREADABLE) ' "${evidence}/process-check.txt" | head -n 12 || true
+            grep -E '^(ORIGINAL_RUNNER_UID|PROCESS_CHECK_|CLEANUP_|TASK_MEASURED_|TASK_[A-Z]+_FILE_LIMIT_BYTES)=' \
+                "${evidence}/result.env" || true
+            awk -F '\t' '$2 ~ /^(process-check|process-check-tools|remove)$/ { print $2, $4, $6, $7, $8, $9 }' \
+                "${evidence}/commands.tsv" || true
+            cat "${evidence}/process-check-tools.tsv" "${evidence}/task-bytes.tsv" 2>/dev/null || true
+            printf '```\n'
+        } >> "$GITHUB_STEP_SUMMARY" || true
+    fi
+    # The five task-size measurements with their times (contract Section 3).
+    ab_check_measurements "$workspace" "S72"
+    # The capture and the summary.
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S72: the capture is complete"
+    assert_eq "AVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "S72: GITHUB_ENV has the verdict"
+    summary="$(ab_collect_summary "$workspace")"
+    assert_contains "$summary" "| Mean speed | \`AVAILABLE\` |" "S72: the summary shows the verdict"
+    assert_contains "$summary" "| Mean speed (m/s) | 3.66666666666666652e+00 |" "S72: the summary shows the value"
+}
+
+s73_collect_needs_a_successful_product_run() {
+    local label
+    for label in "OVERALL_RESULT=FAILED_EXIT_1" "OVERALL_RESULT=BUDGET_EXCEEDED" "PREPARE_RESULT=INFRASTRUCTURE_FAILURE"; do
+        ab_collect_expect "S73 ${label}" NOT_ATTEMPTED - "$label"
+        ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 ${label}"
+        assert_eq "0" "$(awk -F '\t' '$1 == "dpkg-query"' "${AB_COLLECT_LAST}/calls.tsv" | wc -l)" \
+            "S73 ${label}: no identity command runs"
+    done
+    ab_collect_expect "S73 no flow record" SOURCE_MISMATCH ab_collect_no_marker
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 no flow record"
+    ab_collect_expect "S73 no post-processing record" SOURCE_MISMATCH ab_collect_no_post
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S73 no post-processing record"
+}
+ab_collect_no_marker() { rm -f -- "$(ab_collect_flow "$1")/flow.marker"; }
+ab_collect_no_post() { rm -f -- "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"; }
+
+s74_collect_selects_only_the_recorded_latest_time() {
+    local label
+    for label in "FAKE_LIST_TIMES=" "FAKE_LIST_TIMES=0\n" "FAKE_LIST_TIMES=1\n2\n" "FAKE_LIST_TIMES=1\n" \
+                 "FAKE_LIST_TIMES=two\n"; do
+        ab_collect_expect "S74 ${label}" SOURCE_MISMATCH - "$label"
+        ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 ${label}"
+    done
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "is not a numeric time" \
+        "S74: a time that is not a number has its exact reason"
+    ab_collect_expect "S74 zero record" SOURCE_MISMATCH ab_collect_record_zero "FAKE_LIST_TIMES=0\n"
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 zero record"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "not a result time" \
+        "S74: time 0 is not a result time, also when the record names it"
+    ab_collect_expect "S74 earlier record" SOURCE_MISMATCH ab_collect_record_earlier
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 earlier record"
+    ab_collect_expect "S74 two-line record" SOURCE_MISMATCH ab_collect_record_two_lines
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 two-line record"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "time record is not one numeric time" \
+        "S74: a two-line record has its exact reason"
+    ab_collect_expect "S74 selection failure" COMMAND_FAILURE - FAKE_FAIL=foamListTimes
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S74 selection failure"
+}
+ab_collect_record_earlier() { printf '1\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_zero() { printf '0\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_two_lines() { printf '2\n2\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+
+s75_collect_isolates_exact_input_bytes() {
+    local setup
+    for setup in ab_collect_no_epsilon ab_collect_komega ab_collect_start_time ab_collect_link_field \
+                 ab_collect_hard_link ab_collect_mesh_override ab_collect_unsafe_name; do
+        ab_collect_expect "S75 ${setup#ab_collect_}" SOURCE_MISMATCH "$setup"
+        ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 ${setup#ab_collect_}"
+        if [[ "$setup" == ab_collect_mesh_override ]]; then
+            assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "override" \
+                "S75: a mesh in the time directory has its exact reason"
+        fi
+    done
+    ab_collect_expect "S75 changed copy" INPUT_CHANGED ab_collect_bad_copy
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 changed copy"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "before the calculation" \
+        "S75: a snapshot that differs from the source stops the work before the calculation"
+    ab_collect_expect "S75 copy failure" COMMAND_FAILURE ab_collect_fail_copy
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S75 copy failure"
+    ab_collect_expect "S75 changed source" INPUT_CHANGED - \
+        "FAKE_TOUCH_FILE=@WORKSPACE@/checkout/src/batch_9/case_7/flow/2/U"
+    ab_collect_expect "S75 changed snapshot" INPUT_CHANGED - FAKE_TAMPER=simpleFoam:edit-U
+}
+ab_collect_no_epsilon() { rm -f -- "$(ab_collect_flow "$1")/2/epsilon"; }
+ab_collect_komega() { sed -i -e 's/kEpsilon/kOmega/' "$(ab_collect_flow "$1")/constant/turbulenceProperties"; }
+ab_collect_start_time() {
+    sed -i -e 's/^startFrom .*/startFrom         startTime;/' "$(ab_collect_flow "$1")/system/controlDict"
+}
+ab_collect_link_field() {
+    local flow
+    flow="$(ab_collect_flow "$1")"
+    mv -- "${flow}/2/nut" "${flow}/2/nut.real"
+    ln -s nut.real "${flow}/2/nut"
+}
+ab_collect_hard_link() { ln -- "$(ab_collect_flow "$1")/constant/polyMesh/points" "${1}/points.link"; }
+ab_collect_mesh_override() { mkdir -p "$(ab_collect_flow "$1")/2/polyMesh"; }
+ab_collect_unsafe_name() { printf 'x\n' > "$(ab_collect_flow "$1")/2/bad name"; }
+ab_collect_fail_copy() { ab_fake_fail "$1" cp '--parents'; }
+# ab_collect_bad_copy <workspace> - a cp that copies, and then changes one byte
+# of the snapshot U when it makes the snapshot.
+ab_collect_bad_copy() {
+    local real
+    real="$(command -v cp)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '%q "$@" || exit $?\n' "$real"
+        printf 'for argument in "$@"; do [[ "$argument" == --parents ]] && printf x >> "${@: -1}/2/U"; done\n'
+        printf 'exit 0\n'
+    } > "${1}/fakebin/cp"
+    chmod +x "${1}/fakebin/cp"
+}
+
+s76_collect_output_fails_closed() {
+    local entry
+    ab_collect_expect "S76 command failure" COMMAND_FAILURE - FAKE_FAIL=simpleFoam
+    while IFS='|' read -r entry code; do
+        ab_collect_expect "S76 ${entry}" "$code" - "$entry"
+    done <<'COLLECT_CASES'
+FAKE_OUTPUT=none|MISSING_OUTPUT
+FAKE_OUTPUT=region-folder|MISSING_OUTPUT
+FAKE_OUTPUT=second-file|DUPLICATE_OUTPUT
+FAKE_OUTPUT=other-time|DUPLICATE_OUTPUT
+FAKE_OUTPUT=two-rows|DUPLICATE_OUTPUT
+FAKE_OUTPUT=two-headers|DUPLICATE_OUTPUT
+FAKE_REGION=all region1|PARSE_FAILURE
+FAKE_COLUMN=volAverage(U)|PARSE_FAILURE
+FAKE_ROW_TIME=1|PARSE_FAILURE
+FAKE_DAT_CELLS=|PARSE_FAILURE
+FAKE_VALUE=abc|PARSE_FAILURE
+FAKE_DAT_VOLUME=0|INVALID_VOLUME
+FAKE_DAT_VOLUME=-3|INVALID_VOLUME
+FAKE_VALUE=nan|NON_FINITE_VALUE
+FAKE_VALUE=inf|NON_FINITE_VALUE
+FAKE_VALUE=-1.5e+00|NEGATIVE_VALUE
+COLLECT_CASES
+}
+
+s77_collect_accepts_zero_and_has_no_range() {
+    local value workspace
+    for value in 0 1.234e+03; do
+        # The workspace path stays inside the safe RUNNER_TEMP characters.
+        workspace="$(new_workspace "s77_value_${value//[^A-Za-z0-9_.-]/_}")"
+        ab_collect_fixture "$workspace"
+        ab_collect_run "$workspace" FAKE_VALUE="$value" > /dev/null
+        assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" \
+            "S77: the value ${value} is AVAILABLE"
+        assert_eq "$value" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S77: the value ${value} stays as written"
+    done
+}
+
+s78_collect_requires_the_proven_environment() {
+    local label
+    for label in "FAKE_PACKAGE_VERSION=2512.0-1" "FAKE_ARCH=aarch64" "FAKE_WM_VERSION=v2506" \
+                 "FAKE_WM_COMPILER=Clang" "FAKE_BASHRC_STATUS=1" "FAKE_EXTRA_PATH=@WORKSPACE@/elsewhere" \
+                 "OPENFOAM_BASELINE=v2506"; do
+        ab_collect_expect "S78 ${label}" ENVIRONMENT_MISMATCH - "$label"
+        ab_collect_no_openfoam "$AB_COLLECT_LAST" "S78 ${label}"
+        assert_eq "0" "$(awk -F '\t' '$1 == "curl" || $1 == "sudo"' "${AB_COLLECT_LAST}/calls.tsv" | wc -l)" \
+            "S78 ${label}: no package is installed"
+        # The task directory exists, so the cleanup runs the one admitted
+        # process-check vector, and no other privileged vector runs.
+        ab_check_vector_once "$AB_COLLECT_LAST" "S78 ${label}"
+    done
+}
+
+s79_collect_limits_stops_and_cleanup() {
+    local workspace run elapsed child pid library out group start
+    # A blocked calculation with a child that ignores SIGTERM stops in the
+    # metric window, and the capture, summary, and upload stay eligible.
+    workspace="$(new_workspace s79_timeout)"
+    ab_collect_fixture "$workspace"
+    run="$(ab_collect_run "$workspace" FAKE_TERM_CHILD="${workspace}/term_child" \
+        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 40 ))")"
+    elapsed="$(sed -n -e 's/^elapsed=//p' <<< "$run")"
+    child="$(cat "${workspace}/term_child" 2>/dev/null || true)"
+    if [[ "$child" =~ ^[0-9]+$ ]] && kill -0 "$child" 2>/dev/null; then
+        kill -KILL "$child" 2>/dev/null || true
+        _fail "S79: the TERM-ignoring child must stop in the metric window"
+    fi
+    [[ "$child" =~ ^[0-9]+$ ]] || _fail "S79: the blocked calculation must start" "$(tail -n 8 "${workspace}/capture_step.out")"
+    assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S79: a blocked calculation is TIMEOUT"
+    assert_eq "REMOVED" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S79: the cleanup still removes the task directory"
+    assert_contains "$run" "status=0" "S79: the capture step ends with status 0"
+    (( elapsed <= 40 )) || _fail "S79: the metric work ends before the capture work limit" "elapsed: ${elapsed}"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S79: the capture is incomplete"
+    assert_contains "$(ab_collect_summary "$workspace")" "| Mean speed | \`UNAVAILABLE\` |" "S79: the summary still runs"
+    # No time for the metric work: nothing starts.
+    ab_collect_expect "S79 no budget" TIMEOUT - "CAPTURE_DEADLINE=$(( $(date +%s) + 180 + 25 ))"
+    ab_collect_no_openfoam "$AB_COLLECT_LAST" "S79 no budget"
+    # The input, log, and task-directory byte limits.
+    ab_collect_expect "S79 file count" RESOURCE_LIMIT ab_collect_many_files
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S79 file count"
+    ab_collect_expect "S79 input bytes" RESOURCE_LIMIT ab_collect_big_input
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S79 input bytes"
+    ab_collect_expect "S79 log bytes" RESOURCE_LIMIT - FAKE_STDOUT_BYTES=1048577
+    assert_contains "$(cat "${AB_COLLECT_LAST}/runner_temp/evidence/m3-mean-speed/excluded.tsv")" $'\t1048577\t' \
+        "S79: the excluded log keeps its size"
+    ab_collect_expect "S79 task bytes" RESOURCE_LIMIT - FAKE_BIG_FILE=4294967297
+    # A process that leaves the group and keeps its working directory in the
+    # task directory stops the removal.
+    workspace="$(new_workspace s79_user)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_ESCAPE="${workspace}/escape" > /dev/null
+    pid="$(cat "${workspace}/escape" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || _fail "S79: the process that leaves the group must start"
+    kill -0 "$pid" 2>/dev/null || _fail "S79: the process check sends no signal to a process that it finds"
+    kill -KILL "$pid" 2>/dev/null || true
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S79: a process in the task directory stops the removal"
+    assert_eq "REFUSED_PROCESS_ACTIVE" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S79: the cleanup refusal is explicit"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S79: the task directory stays while a process uses it"
+    # A failed removal.
+    ab_collect_failed_removal
+    # A capture that stops before the metric work publishes UNAVAILABLE with
+    # NOT_COMPLETED, never AVAILABLE.
+    workspace="$(new_workspace s79_not_reached)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" LIB="${workspace}/missing-library.sh" > /dev/null
+    assert_eq "FAILED" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S79: the capture work does not run"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "S79: no metric after a stopped capture"
+    assert_eq "NOT_COMPLETED" "$(ab_env_last "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S79: a capture that stops before the metric work gives NOT_COMPLETED"
+    assert_contains "$(ab_collect_summary "$workspace")" "| Mean speed | \`UNAVAILABLE\` |" \
+        "S79: the summary shows the stopped metric"
+    # A process group that the stop cannot empty: kill -0 fails with EPERM, and
+    # the stop says NOT_STOPPED by its deadline. NOT_STOPPED is a process-stop
+    # failure.
+    group="$(ab_metric_foreign_group)"
+    [[ -n "$group" ]] || _fail "S79: the test host must have a process group that the test user may not signal"
+    workspace="$(new_workspace s79_stop)"
+    ab_collect_fixture "$workspace"
+    library="$(ab_collect_block "$workspace")"
+    [[ -n "$library" ]] || _fail "S79: the metric functions must be extracted"
+    start="$(date +%s%3N)"
+    out="$(env PATH="${workspace}/fakebin:${PATH}" bash -c "set -euo pipefail
+        ${library}
+        metric_stop_group ${group} probe \$(( \$(date +%s%3N) + 2000 )) && echo stop-status=0 || echo stop-status=\$?
+        echo stop=\${M_STOP}
+        M_CODE='' M_REASON='' M_OUTCOME=NOT_STOPPED M_GROUP=${group} M_STATUS=0 M_LIMIT=2000
+        metric_require metric COMMAND_FAILURE && echo require-status=0 || echo require-status=\$?
+        echo code=\${M_CODE}" 2>&1 || true)"
+    assert_contains "$out" "stop-status=1" "S79: the stop does not take a group of another user as empty"
+    assert_contains "$out" "stop=NOT_STOPPED" "S79: the stop records NOT_STOPPED"
+    (( $(date +%s%3N) - start <= 3500 )) || _fail "S79: the stop ends by its deadline"
+    assert_contains "$out" "require-status=1" "S79: NOT_STOPPED stops the metric work"
+    assert_contains "$out" "code=PROCESS_STOP_FAILURE" "S79: NOT_STOPPED is a process-stop failure"
+}
+ab_collect_many_files() {
+    local flow index
+    flow="$(ab_collect_flow "$1")"
+    for (( index = 0; index < 245; index++ )); do : > "${flow}/2/extra${index}"; done
+}
+ab_collect_big_input() { truncate -s 2147483649 "$(ab_collect_flow "$1")/2/big"; }
+ab_collect_failed_removal() {
+    local workspace
+    workspace="$(new_workspace s79_remove)"
+    ab_collect_fixture "$workspace"
+    ab_fake_fail "$workspace" rm '*m3-metric-collection.*'
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S79: a failed removal is a cleanup failure"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S79: no value after a failed removal"
+    assert_contains "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "FAILED" "S79: the cleanup result shows the failure"
+}
+
+s80_collect_keeps_the_other_verdicts_separate() {
+    local workspace batch summary
+    workspace="$(new_workspace s80_separate)"
+    ab_collect_fixture "$workspace"
+    batch="${workspace}/checkout/src/batch_9"
+    ab_checkmesh_log "${batch}/case_7/flow/log.checkMesh" failed
+    printf '<VTKFile><Piece><PointData><DataArray Name="U"/></PointData></Piece></VTKFile>\n' \
+        > "${batch}/case_7/vtk/flow_latest_100.vtu"
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S80: the metric is AVAILABLE"
+    assert_eq "MESH_QUALITY_REVIEW_REQUIRED" "$(ab_env_last "$workspace" MESH_QUALITY_VERDICT)" \
+        "S80: failed mesh checks stay blocking for mesh acceptance"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" VTU_REQUIRED_FIELDS_VERDICT)" \
+        "S80: missing required PointData stays incomplete"
+    assert_ne "CONVERGED" "$(ab_env_last "$workspace" CONVERGENCE_VERDICT)" "S80: the metric gives no convergence"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/phase-results.txt")" "OVERALL_RESULT=SUCCEEDED" \
+        "S80: the product result stays"
+    assert_not_contains "$(cat "${workspace}/runner_temp/evidence/mesh-quality.txt")" "MEAN_SPEED" \
+        "S80: the mesh evidence holds no metric value"
+    summary="$(ab_collect_summary "$workspace")"
+    assert_contains "$summary" "| Mesh quality | \`MESH_QUALITY_REVIEW_REQUIRED\` |" "S80: the mesh row stays separate"
+    assert_contains "$summary" "| VTU required fields | \`INCOMPLETE\` |" "S80: the PointData row stays separate"
+    assert_contains "$summary" "| Mean speed | \`AVAILABLE\` |" "S80: the metric row is separate"
+}
+
+s81_collect_keeps_the_workflow_interface() {
+    local workspace body name constant
+    workspace="$(new_workspace s81_interface)"
+    ab_collect_fixture "$workspace"
+    body="$(cat "${workspace}/capture_step.sh")"
+    assert_eq $'on:\n  workflow_dispatch:' \
+        "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$WORKFLOW")" \
+        "S81: workflow_dispatch without inputs is the only trigger"
+    assert_contains "$(cat "$WORKFLOW")" $'permissions:\n  contents: read' "S81: the token can only read contents"
+    assert_contains "$(cat "$WORKFLOW")" $'  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120' \
+        "S81: the job, runner, and 120-minute setting stay"
+    assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
+        "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S81: the step list stays"
+    assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
+        "S81: the Orchestrator vector stays"
+    assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
+        "S81: the capture step guard stays 10 minutes"
+    for constant in 'work_cap_seconds=480' 'deadline_reserve_seconds=180'; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$body")" "S81: the capture keeps ${constant}"
+    done
+    assert_eq "1" "$(grep -cF -- 'foamListTimes -case "$SOURCE_FLOW_CASE" -latestTime' <<< "$body")" \
+        "S81: the exact selection vector appears once"
+    assert_eq "1" "$(grep -cF -- "simpleFoam -case \"\$CASE_DIR\" -postProcess -time \"\$SELECTED_TIME\" -fields '(U)' -dict \"\$TASK_TEMP/config/metric-functions\"" <<< "$body")" \
+        "S81: the exact calculation vector appears once"
+    assert_eq "2" "$(grep -cE '^[[:space:]]*metric_foam_op [A-Za-z-]+ [A-Z]+ ' <<< "$body")" \
+        "S81: the metric work runs only the two OpenFOAM vectors"
+    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=90000' \
+                    'METRIC_CLEANUP_MS=20000' 'METRIC_KILL_GRACE_MS=5000' 'METRIC_STOP_RESERVE_MS=1000' \
+                    'METRIC_MAX_FILES=256' 'METRIC_MAX_INPUT_BYTES=2147483648' 'METRIC_MAX_TASK_BYTES=4294967296' \
+                    'METRIC_LOG_LIMIT=1048576' 'METRIC_LOGS_LIMIT=8388608' 'METRIC_EVIDENCE_LIMIT=10485760' \
+                    "METRIC_DICTIONARY_SHA256=${AB_COLLECT_DICTIONARY_SHA}"; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$body")" "S81: the metric work sets ${constant}"
+    done
+    for name in "name: openfoam-v2512-evidence" "path: \${{ runner.temp }}/evidence" "include-hidden-files: true" \
+                "retention-days: 90"; do
+        assert_contains "$(cat "$WORKFLOW")" "$name" "S81: the upload keeps ${name}"
+    done
+}
+
+s82_collect_failed_log_evidence_fails_closed() {
+    # F1: the log inventory or the log copy fails. The evidence is incomplete,
+    # so no value is accepted.
+    ab_collect_expect "S82 log inventory" COMMAND_FAILURE ab_collect_fail_log_sizes
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
+    ab_collect_expect "S82 log copy" COMMAND_FAILURE ab_collect_fail_log_copy
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" LOGS_RETAINED)" "NO_" "S82: the logs are not retained"
+    # A failed listing of the evidence inventory is not an empty inventory.
+    ab_collect_expect "S82 evidence inventory" COMMAND_FAILURE ab_collect_fail_inventory
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" INVENTORY)" "UNAVAILABLE_" "S82: the inventory is not complete"
+}
+ab_collect_fail_log_sizes() { ab_fake_fail "$1" find '*m3-metric-collection.*/logs'; }
+ab_collect_fail_log_copy() { ab_fake_fail "$1" cp '*m3-mean-speed/logs/'; }
+ab_collect_fail_inventory() { ab_fake_fail "$1" find './inventory.txt'; }
+
+s83_collect_task_bytes_stay_in_the_limit() {
+    local workspace observed evidence label before
+    # F2 single-file RLIMIT_FSIZE check: one file above the file allowance of
+    # the calculation is stopped by the kernel file-size limit, so the task
+    # directory never holds that file. (S88 has the multi-file limitation.)
+    workspace="$(new_workspace s83_transient)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_TRANSIENT_BYTES=4294967297 \
+        FAKE_TRANSIENT_RECORD="${workspace}/observed_task_bytes" > /dev/null
+    observed="$(cat "${workspace}/observed_task_bytes" 2>/dev/null || true)"
+    if [[ "$observed" =~ ^[0-9]+$ ]] && (( observed > 4294967296 )); then
+        _fail "S83: RLIMIT_FSIZE stops the single file above its allowance, so the task directory never holds it" \
+              "observed: ${observed}"
+    fi
+    assert_eq "RESOURCE_LIMIT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S83: a file above the task byte limit is RESOURCE_LIMIT"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S83: no value is accepted"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S83: the capture is incomplete"
+    # The file limit of the copy and of the calculation is the task bytes left
+    # after the measurement just before the operation.
+    evidence="${workspace}/runner_temp/evidence/m3-mean-speed"
+    for label in copy:task-bytes-before-copy:TASK_COPY_FILE_LIMIT_BYTES \
+                 metric:task-bytes-before-calculation:TASK_CALCULATION_FILE_LIMIT_BYTES; do
+        before="$(cut -f 1 "${evidence}/$(cut -d : -f 2 <<< "$label").out" 2>/dev/null || true)"
+        [[ "$before" =~ ^[0-9]+$ ]] || _fail "S83: the measurement before ${label%%:*} is recorded"
+        assert_eq "$(( 4294967296 - before ))" "$(ab_collect_value "$workspace" "${label##*:}")" \
+            "S83: the ${label%%:*} file limit is the task bytes left"
+        assert_eq "$(( 4294967296 - before ))" \
+            "$(awk -F '\t' -v op="${label%%:*}" '$2 == op { print $5 }' "${evidence}/commands.tsv")" \
+            "S83: the ${label%%:*} operation runs with that file limit"
+    done
+    # An input file above the 1048577-byte limit of the other operations
+    # copies, because the copy has the task bytes left.
+    workspace="$(new_workspace s83_large_input)"
+    ab_collect_fixture "$workspace"
+    truncate -s 2097152 "$(ab_collect_flow "$workspace")/2/large"
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S83: a 2097152-byte input copies"
+    assert_eq "16" "$(ab_collect_value "$workspace" INPUT_FILES)" "S83: the large input is in the snapshot"
+    # Two files, each in its file limit, that together take the task directory
+    # above the limit, are seen by the measurement after the calculation.
+    ab_collect_expect "S83 measured total" RESOURCE_LIMIT - FAKE_BIG_FILE=4293918720 FAKE_STDOUT_BYTES=1048577
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "the task directory has" \
+        "S83: the measurement after the calculation sees the total"
+}
+
+s84_collect_cleanup_needs_a_complete_process_check() {
+    local workspace pid
+    # F3: a process check that cannot read a process of the test user keeps
+    # the task directory. The failures come at the fixed check boundary: the
+    # find of the fixed check source fails, and a read is denied even there.
+    workspace="$(new_workspace s84_failed_scan)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace" fail
+    ab_collect_run "$workspace" > /dev/null
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S84: a failed process check stops the removal"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: the refusal names the process check"
+    assert_contains "$(ab_check_frame "$workspace")" "UNCERTAIN find: simulated read failure" \
+        "S84: the frame keeps the exact scan error"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays after a failed process check"
+    workspace="$(new_workspace s84_hidden_user)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_collect_run "$workspace" FAKE_HIDDEN_USER="${workspace}/hidden_user" FAKE_CHECK=user > /dev/null
+    pid="$(cat "${workspace}/hidden_user" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        _fail "S84: the hidden process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+    fi
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S84: an unreadable process of the test user stops the removal"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: the refusal names the incomplete process check"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S84: no value is accepted"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays while the process check is incomplete"
+    # A process that only maps a file of the task directory also uses it.
+    workspace="$(new_workspace s84_mapped_file)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_MAPPED_FILE="${workspace}/mapped_file" > /dev/null
+    pid="$(cat "${workspace}/mapped_file" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        _fail "S84: the mapping process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+    fi
+    assert_eq "REFUSED_PROCESS_ACTIVE" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "S84: a mapped file of the task directory stops the removal"
+    assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "/maps" "S84: the reason names the mapped file"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S84: the task directory stays while a file of it is mapped"
+}
+
+s85_collect_time_record_read_is_bounded() {
+    local workspace start finish end used
+    # F4: a slow read of the post-processing time record stops in its limit,
+    # and the metric work ends by its absolute end.
+    workspace="$(new_workspace s85_slow_record)"
+    ab_collect_fixture "$workspace"
+    ab_fake_hang "$workspace" cat '*flow_latest_time.txt'
+    ab_fake_hang "$workspace" head '*flow_latest_time.txt'
+    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 45 ))" > /dev/null
+    ab_assert_fakes_stopped "$workspace" "S85"
+    assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S85: a slow time-record read is TIMEOUT"
+    start="$(ab_collect_value "$workspace" METRIC_START_MS)"
+    finish="$(ab_collect_value "$workspace" METRIC_FINISH_MS)"
+    end="$(ab_collect_value "$workspace" METRIC_END_MS)"
+    used="$(ab_collect_value "$workspace" WORK_USED_MS)"
+    [[ "$finish" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] && (( finish <= end )) ||
+        _fail "S85: the metric work ends by its absolute end" "finish: ${finish}, end: ${end}"
+    [[ "$used" =~ ^[0-9]+$ ]] && (( used >= 1000 )) ||
+        _fail "S85: the read counts against the work budget" "used: ${used} ms"
+    [[ "$start" =~ ^[0-9]+$ ]] || _fail "S85: the start is recorded"
+    # The read takes at most 65 bytes, and the record must be one line of at
+    # most 64 bytes with no NUL byte.
+    ab_collect_expect "S85 long record" SOURCE_MISMATCH ab_collect_record_long
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "more than 64 bytes" \
+        "S85: a record above 64 bytes is refused"
+    ab_collect_expect "S85 NUL record" SOURCE_MISMATCH ab_collect_record_nul
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "NUL byte" \
+        "S85: a record with a NUL byte is refused"
+}
+ab_collect_record_long() { printf '%064d\n' 2 > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_collect_record_nul() { printf '2\n\0' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+
+s86_collect_value_and_volume_convert_to_finite_doubles() {
+    # F5: a token that does not convert to a finite double, and a volume that
+    # converts to zero.
+    ab_collect_expect "S86 speed 1e9999" NON_FINITE_VALUE - FAKE_VALUE=1e9999
+    ab_collect_expect "S86 volume 1e-9999" INVALID_VOLUME - FAKE_DAT_VOLUME=1e-9999
+}
+
+# ab_collect_host_unreadable - the live processes of the test user whose /proc
+# fd entry the test user cannot read, as "<count>: <name>(<pid>) ...". Such a
+# process makes every cleanup refuse, so a test that expects a removed task
+# directory needs a host without one.
+ab_collect_host_unreadable() {
+    local status proc item uid name state count=0 list=""
+    local -a lines=()
+    uid="$(id -u)"
+    for status in /proc/[0-9]*/status; do
+        proc="${status%/status}"
+        { mapfile -t lines < "$status"; } 2>/dev/null || continue
+        name="" state="" item=""
+        for item in "${lines[@]}"; do
+            case "$item" in
+                Name:*) name="${item#Name:}"; name="${name//[[:space:]]/}" ;;
+                State:*) state="${item#State:}"; state="${state//[[:space:]]/}"; state="${state:0:1}" ;;
+                Uid:*) item=" ${item#Uid:} "; item="${item//[[:space:]]/ }"; break ;;
+            esac
+        done
+        [[ "$item" == *" ${uid} "* && "$state" != Z && "$state" != X ]] || continue
+        if [[ ! -r "${proc}/fd" && -e "$proc" ]]; then
+            count=$(( count + 1 ))
+            list="${list} ${name}(${proc#/proc/})"
+        fi
+    done
+    printf '%s:%s\n' "$count" "${list:- none}"
+}
+
+# ab_collect_older_run <workspace> <dumpable> [NAME=value ...] - start a process
+# of the test user before the capture step, so it starts before the metric
+# clock. During the fake calculation, it gets the Case path, enters the Case,
+# and, for dumpable 0, makes its /proc entries unreadable (PR_SET_DUMPABLE 0).
+# Then run the capture step with the other arguments. Sets AB_OLDER_PID.
+ab_collect_older_run() {
+    local workspace="$1" dumpable="$2" fifo_fd tick
+    shift 2
+    AB_OLDER_PID=""
+    mkfifo -- "${workspace}/older.fifo"
+    exec {fifo_fd}<>"${workspace}/older.fifo"
+    setsid python3 -u -c 'import ctypes, os, sys, time
+print(os.getpid(), flush=True)
+target = sys.stdin.readline().rstrip("\n")
+if not target.startswith(sys.argv[1] + "/runner_temp/m3-metric-collection.") or not target.endswith("/case"):
+    raise SystemExit(2)
+os.chdir(target)
+if sys.argv[2] == "0" and ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(3)
+print("READY", flush=True)
+time.sleep(30)' "$workspace" "$dumpable" <&"$fifo_fd" > "${workspace}/older.out" 2> /dev/null &
+    for (( tick = 0; tick < 200; tick++ )); do
+        [[ -s "${workspace}/older.out" ]] && break
+        sleep 0.01
+    done
+    AB_OLDER_PID="$(head -n 1 "${workspace}/older.out")"
+    ab_collect_run "$workspace" FAKE_OLDER_FIFO="${workspace}/older.fifo" \
+        FAKE_OLDER_OUT="${workspace}/older.out" "$@" > /dev/null
+    exec {fifo_fd}>&-
+}
+
+s87_collect_older_process_in_the_case_keeps_it() {
+    local workspace rows dumpable boundary entry result
+    local -a cases=("0 user" "1 default")
+    # F3 (review 5466999244): the start time of a process does not prove that
+    # it does not use the task directory. A read that is denied even at the
+    # admitted boundary stays uncertain (the fake boundary in user mode). On
+    # the hosted runner, the complete root read of the same unreadable older
+    # process finds it, and that never permits the removal.
+    printf 'HOST_UNREADABLE_TEST_USER_PROCESSES=%s\n' "$(ab_collect_host_unreadable)"
+    if [[ "$AB_CHECK_HOSTED" == yes ]]; then
+        cases+=("0 root")
+    fi
+    for entry in "${cases[@]}"; do
+        read -r dumpable boundary <<< "$entry"
+        workspace="$(new_workspace "s87_older_${dumpable}_${boundary}")"
+        ab_collect_fixture "$workspace"
+        if [[ "$boundary" == user ]]; then
+            ab_collect_root_fake "$workspace"
+            ab_collect_older_run "$workspace" "$dumpable" FAKE_CHECK=user
+        else
+            ab_collect_older_run "$workspace" "$dumpable"
+        fi
+        rows="$(ab_check_frame "$workspace")"
+        if [[ "$AB_OLDER_PID" =~ ^[0-9]+$ ]]; then
+            kill -KILL "$AB_OLDER_PID" 2>/dev/null || true
+        else
+            _fail "S87: the older process must start" "$(tail -n 5 "${workspace}/capture_step.out")"
+        fi
+        [[ "$(tail -n 1 "${workspace}/older.out")" == READY ]] ||
+            _fail "S87: the older process must enter the task Case during the calculation"
+        if [[ "$boundary" == user ]]; then
+            result=REFUSED_PROCESS_CHECK
+            assert_contains "$rows" "OLDER_UNREADABLE /proc/${AB_OLDER_PID}" \
+                "S87: the test process started before the metric clock and is unreadable"
+            assert_contains "$rows" "UNCERTAIN /usr/bin/find: '/proc/${AB_OLDER_PID}/" \
+                "S87: the unreadable older process makes the process check uncertain"
+        else
+            result=REFUSED_PROCESS_ACTIVE
+            assert_contains "$rows" "MATCH /proc/${AB_OLDER_PID}/" "S87: the older process in the Case is found"
+        fi
+        assert_eq "$result" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+            "S87 dumpable ${dumpable}: the cleanup refusal is ${result}"
+        assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+            "S87 dumpable ${dumpable}: the removal stops"
+        assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S87: no value is accepted"
+        assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S87: no numeric value"
+        assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S87: the capture is incomplete"
+        [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S87 dumpable ${dumpable}: the task directory stays"
+    done
+}
+
+# ---- S88 to S92: the corrected collection contract (#80, 6084196797) -------
+#
+# S88 covers the settled F2 task-byte contract (Section 3): measured totals at
+# five checkpoints, a positive file allowance before the copy and the
+# calculation, and an honest probe of the transient multi-file limitation. S89
+# to S92 cover the bounded read-only root check of the cleanup (Section 4): the
+# fixed source and its arguments, the failures that keep the task directory,
+# the self-termination of the check, and the one cleanup clock. These checks
+# use the controlled fake boundary of ab_collect_root_fake also on the hosted
+# runner; there, S72 to S87 run the real admitted vector.
+
+s88_collect_task_measurements_and_allowances() {
+    local workspace evidence observed max allowance
+    # A zero allowance before the copy or the calculation starts neither.
+    ab_collect_expect "S88 zero copy allowance" RESOURCE_LIMIT ab_collect_fake_du \
+        FAKE_DU=task-bytes-before-copy=4294967296
+    evidence="${AB_COLLECT_LAST}/runner_temp/evidence/m3-mean-speed"
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "no file allowance" \
+        "S88: the reason names the zero copy allowance"
+    assert_eq "" "$(awk -F '\t' '$2 == "copy"' "${evidence}/commands.tsv")" "S88: no copy starts with a zero allowance"
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S88 zero copy allowance"
+    ab_collect_expect "S88 zero calculation allowance" RESOURCE_LIMIT ab_collect_fake_du \
+        FAKE_DU=task-bytes-before-calculation=4294967296
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "no file allowance" \
+        "S88: the reason names the zero calculation allowance"
+    ab_collect_no_calculation "$AB_COLLECT_LAST" "S88 zero calculation allowance"
+    # A failed or a malformed measurement keeps its exact first reason.
+    ab_collect_expect "S88 failed measurement" COMMAND_FAILURE ab_collect_fake_du FAKE_DU=task-bytes-after-copy=fail
+    assert_eq "the task-bytes-after-copy operation ended with status 1" \
+        "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "S88: a failed measurement keeps its exact reason"
+    assert_contains "$(cat "${AB_COLLECT_LAST}/runner_temp/evidence/m3-mean-speed/task-bytes.tsv" 2>/dev/null || true)" \
+        $'task-bytes-after-copy\tUNAVAILABLE\t' "S88: the failed measurement is recorded"
+    ab_collect_expect "S88 malformed measurement" COMMAND_FAILURE ab_collect_fake_du FAKE_DU=task-bytes-final=malformed
+    assert_contains "$(ab_collect_value "$AB_COLLECT_LAST" MEAN_SPEED_REASON)" "task-bytes-final" \
+        "S88: a malformed measurement names its checkpoint"
+    # The transient multi-file limitation probe: two sparse files, each inside
+    # the file allowance, exist together during the calculation with more than
+    # 4294967296 apparent task bytes, and go before the next measurement. The
+    # model does not bound that total continuously, and the result says so.
+    workspace="$(new_workspace s88_transient_files)"
+    ab_collect_fixture "$workspace"
+    ab_collect_run "$workspace" FAKE_TRANSIENT_FILES=2 FAKE_TRANSIENT_BYTES=2147483648 \
+        FAKE_TRANSIENT_RECORD="${workspace}/observed_task_bytes" > /dev/null
+    observed="$(cat "${workspace}/observed_task_bytes" 2>/dev/null || true)"
+    [[ "$observed" =~ ^[0-9]+$ ]] && (( observed > 4294967296 )) ||
+        _fail "S88: the probe holds more than 4294967296 apparent task bytes at one moment" "observed: ${observed}"
+    [[ "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" == AVAILABLE ]] ||
+        _fail "S88: the probe hides no other failure and gives the complete result" \
+              "code: $(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+              "reason: $(ab_collect_value "$workspace" MEAN_SPEED_REASON)"
+    assert_eq "3.66666666666666652e+00" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S88: the probe gives the value"
+    assert_eq "REMOVED" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S88: the probe cleanup removes the task directory"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S88: the probe capture is complete"
+    ab_check_measurements "$workspace" "S88 probe"
+    max="$(ab_collect_value "$workspace" TASK_MEASURED_MAX_BYTES)"
+    [[ "$max" =~ ^[0-9]+$ ]] && (( max < 4294967296 )) ||
+        _fail "S88: no measurement sees the transient total" "measured maximum: ${max}"
+    allowance="$(ab_collect_value "$workspace" TASK_CALCULATION_FILE_LIMIT_BYTES)"
+    [[ "$allowance" =~ ^[0-9]+$ ]] && (( allowance > 2147483648 )) ||
+        _fail "S88: each transient file is inside the calculation allowance" "allowance: ${allowance}"
+    assert_contains "$(ab_collect_value "$workspace" TASK_BYTES_CONTROL)" "not continuously bounded" \
+        "S88: the result states the limitation"
+    printf 'S88_TRANSIENT_PROBE observed=%s measured_max=%s calculation_allowance=%s\n' "$observed" "$max" "$allowance"
+}
+
+# ab_check_launch <source> <argument...> - run the fixed check source as its
+# launch, as the test user, in the clean environment of the admitted vector.
+# Prints the output and a status= line.
+ab_check_launch() {
+    local source="$1" status
+    shift
+    timeout --kill-after=2s 20s env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p \
+        -c "$source" m3-process-check "$@" 2>&1 && status=0 || status=$?
+    printf 'status=%s\n' "$status"
+}
+
+# ab_check_bad_launch <label> <source> <argument...> - the launch refuses the
+# arguments with status 2 and a reason, and starts no monitor or scan.
+ab_check_bad_launch() {
+    local label="$1" source="$2" out
+    shift 2
+    out="$(ab_check_launch "$source" "$@")"
+    assert_contains "$out" "status=2" "${label}: the launch refuses"
+    assert_contains "$out" "m3 process check: " "${label}: the refusal has a reason"
+    assert_not_contains "$out" "LAUNCH " "${label}: no monitor or scan starts"
+}
+
+s89_collect_root_check_source_and_arguments() {
+    local workspace block source line runner task uid token up now out entry scan label
+    # The fixed source: one read-only literal, the exact outer vector once, and
+    # only the seven admitted installed executables in the source.
+    workspace="$(new_workspace s89_source)"
+    block="$(ab_step_run_body "Capture the evidence" | awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 }
+        inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }')"
+    source="$(bash --noprofile --norc -c "${block}"'
+printf "%s" "${METRIC_ROOT_CHECK_SOURCE:-}"')"
+    [[ -n "$source" ]] || _fail "S89: the collection block must define the fixed check source METRIC_ROOT_CHECK_SOURCE"
+    assert_eq "1" "$(grep -cx 'readonly METRIC_ROOT_CHECK_SOURCE' <<< "$block")" "S89: the fixed source is read-only"
+    (( $(grep -nx 'readonly METRIC_ROOT_CHECK_SOURCE' <<< "$block" | cut -d : -f 1) <
+       $(grep -nF '"$METRIC_ROOT_CHECK_SOURCE"' <<< "$block" | head -n 1 | cut -d : -f 1) )) ||
+        _fail "S89: the source is read-only before its first use"
+    for line in '    metric_op process-check CLEANUP /usr/bin/sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \' \
+                '        /usr/bin/bash --noprofile --norc -p -c "$METRIC_ROOT_CHECK_SOURCE" \' \
+                '        m3-process-check "$TASK_TEMP" "$RUNNER_TEMP" "$ORIGINAL_RUNNER_UID" "$M_BOOT_CS" "$CHECK_END_BOOT_CS" "$CHECK_TOKEN"'; do
+        assert_eq "1" "$(grep -cxF -- "$line" <<< "$block")" "S89: the exact outer vector has the line: ${line}"
+    done
+    assert_eq "2" "$(grep -v '^[[:space:]]*#' <<< "$block" | grep -c 'sudo')" \
+        "S89: sudo is only in the admitted vector and in its executable check"
+    assert_eq "/usr/bin/bash /usr/bin/find /usr/bin/getconf /usr/bin/grep /usr/bin/prlimit /usr/bin/sleep /usr/bin/timeout" \
+        "$(grep -oE '/usr/bin/[a-z]+' <<< "$source" | LC_ALL=C sort -u | paste -sd ' ' -)" \
+        "S89: the fixed source uses only the seven admitted installed executables"
+    assert_eq "0" "$(grep -v '^[[:space:]]*#' <<< "$source" |
+        grep -cE '(^|[^A-Za-z_-])(eval|source|setsid|kill|sudo|mktemp|nohup|disown)([^A-Za-z_-]|$)|--foreground|BASH_ENV')" \
+        "S89: the fixed source loads no script, signals nothing, and makes no other group or session"
+    for line in 'exec /usr/bin/prlimit --core=1 --fsize=1048577 -- \' \
+                '/usr/bin/timeout --signal=TERM --kill-after=5s "$duration" \' \
+                '/usr/bin/bash --noprofile --norc -p -c "$FIXED_GUARD_SOURCE" m3-process-guard "$@"'; do
+        assert_eq "1" "$(grep -cF -- "$line" <<< "$source")" "S89: the monitor chain has: ${line}"
+    done
+    for line in 'METRIC_CHECK_MS=12000' 'METRIC_REMOVE_MS=8000'; do
+        assert_eq "1" "$(grep -cx -- "$line" <<< "$block")" "S89: the cleanup sets ${line}"
+    done
+    # The launch repeats the argument checks, as the test user here.
+    runner="${workspace}/rt"
+    task="${runner}/m3-metric-collection.AbCd1234"
+    mkdir -p "$task" "${runner}/sub/m3-metric-collection.AbCd1234" "${workspace}/-rt/m3-metric-collection.AbCd1234" \
+        "${workspace}/r t/m3-metric-collection.AbCd1234"
+    ln -s "$task" "${runner}/m3-metric-collection.LinkLink"
+    ln -s "$runner" "${workspace}/rtlink"
+    uid="$(id -u)"
+    token=abcdefgh12
+    read -r up _ < /proc/uptime
+    now=$(( 10#${up/./} ))
+    ab_check_bad_launch "S89 five arguments" "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))"
+    ab_check_bad_launch "S89 seven arguments" "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" extra
+    ab_check_bad_launch "S89 root UID" "$source" "$task" "$runner" 0 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 malformed UID" "$source" "$task" "$runner" "${uid}x" 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 nested task" "$source" "${runner}/sub/m3-metric-collection.AbCd1234" "$runner" "$uid" 0 \
+        "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 task name" "$source" "${runner}/m3-metric-collection.AbCd" "$runner" "$uid" 0 \
+        "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 relative RUNNER_TEMP" "$source" "rt/m3-metric-collection.AbCd1234" rt "$uid" 0 \
+        "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 dot-dot component" "$source" "${runner}/../rt/m3-metric-collection.AbCd1234" "${runner}/../rt" \
+        "$uid" 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 option-like component" "$source" "${workspace}/-rt/m3-metric-collection.AbCd1234" \
+        "${workspace}/-rt" "$uid" 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 whitespace component" "$source" "${workspace}/r t/m3-metric-collection.AbCd1234" \
+        "${workspace}/r t" "$uid" 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 malformed end" "$source" "$task" "$runner" "$uid" 0 12e3 "$token"
+    ab_check_bad_launch "S89 end before start" "$source" "$task" "$runner" "$uid" "$(( now + 3000 ))" "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 short token" "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" abc
+    ab_check_bad_launch "S89 token with a separator" "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" 'abcdefgh;x'
+    ab_check_bad_launch "S89 linked task" "$source" "${runner}/m3-metric-collection.LinkLink" "$runner" "$uid" 0 \
+        "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 linked RUNNER_TEMP" "$source" "${workspace}/rtlink/m3-metric-collection.AbCd1234" \
+        "${workspace}/rtlink" "$uid" 0 "$(( now + 2000 ))" "$token"
+    ab_check_bad_launch "S89 no scan time" "$source" "$task" "$runner" "$uid" 0 "$(( now + 550 ))" "$token"
+    # The test bound runs in the foreground, so it is not a monitor that
+    # leads its own process group.
+    out="$(timeout --foreground --kill-after=2s 20s env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p \
+        -c "$source" m3-process-guard "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" 2>&1 && echo status=0 || echo "status=$?")"
+    assert_contains "$out" "status=2" "S89: the guard refuses to run without its timeout monitor"
+    assert_not_contains "$out" "FRAME " "S89: no scan starts without the monitor"
+    # A parent that leads the process group of the guard, but is not the
+    # timeout monitor, is refused too.
+    out="$(timeout --foreground --kill-after=2s 20s setsid bash --noprofile --norc -c \
+        'env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc -p -c "$1" m3-process-guard "${@:2}"; exit $?' \
+        parent "$source" "$task" "$runner" "$uid" 0 "$(( now + 2000 ))" "$token" 2>&1 && echo status=0 || echo "status=$?")"
+    assert_contains "$out" "status=2" "S89: the guard refuses a group leader that is not its timeout monitor"
+    assert_not_contains "$out" "FRAME " "S89: no scan starts under another group leader"
+    # A valid launch: the scan time comes from the absolute end, and the guard
+    # runs under its monitor, in the monitor process group.
+    read -r up _ < /proc/uptime
+    now=$(( 10#${up/./} ))
+    out="$(ab_check_launch "$source" "$task" "$runner" "$uid" 0 "$(( now + 700 ))" "$token")"
+    [[ "$(head -n 1 <<< "$out")" =~ ^LAUNCH\ 1\ ${token}\ ([0-9]+)\ ([0-9]+)$ ]] ||
+        _fail "S89: the launch writes its record first" "$out"
+    entry="${BASH_REMATCH[1]}" scan="${BASH_REMATCH[2]}"
+    assert_eq "$(( now + 700 - entry - 600 ))" "$scan" "S89: the scan time is the time to the absolute end less 600 centiseconds"
+    assert_eq "FRAME 1 ${token} ${task} ${uid} $(( now + 700 ))" "$(sed -n -e 2p <<< "$out")" \
+        "S89: the guard records the target, the original UID, and the absolute end"
+    [[ "$(sed -n -e 3p <<< "$out")" =~ ^MONITOR\ ([0-9]+)\ ([0-9]+)\ [0-9]+\ ${uid}$ && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] ||
+        _fail "S89: the guard runs under its monitor, in the monitor process group" "$out"
+    # The collector checks the hosted runner, RUNNER_TEMP, and the caller
+    # environment before any elevation.
+    for label in RUNNER_ENVIRONMENT=self-hosted ImageOS=ubuntu22; do
+        workspace="$(new_workspace "s89_gate_${label%%=*}")"
+        ab_check_fixture "$workspace"
+        ab_check_refused "S89 ${label}" "$workspace" "GitHub-hosted ubuntu-24.04 runner" "$label"
+        [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S89 ${label}: no elevation starts off the hosted runner"
+        assert_eq "NOT_RUN" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S89 ${label}: the check does not run"
+    done
+    workspace="$(new_workspace s89_option_temp)"
+    ab_check_fixture "$workspace"
+    ab_check_refused "S89 option-like RUNNER_TEMP" "$workspace" "RUNNER_TEMP" RUNNER_TEMP="${workspace}/-runner_temp"
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S89: no elevation starts with an unsafe RUNNER_TEMP"
+    workspace="$(new_workspace s89_linked_temp)"
+    ab_check_fixture "$workspace"
+    mkdir -p "${workspace}/real_temp"
+    ln -s real_temp "${workspace}/linked_temp"
+    ab_check_refused "S89 linked RUNNER_TEMP" "$workspace" "canonical" RUNNER_TEMP="${workspace}/linked_temp"
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S89: no elevation starts with a linked RUNNER_TEMP"
+    workspace="$(new_workspace s89_hook)"
+    ab_check_fixture "$workspace"
+    printf 'printf "%%s\\n" "$0" >> %q\n' "${workspace}/hook_calls" > "${workspace}/hook.sh"
+    ab_check_cleanup "$workspace" BASH_ENV="${workspace}/hook.sh" ENV="${workspace}/hook.sh" > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" "S89: the cleanup with a caller hook completes"
+    assert_not_contains "$(cat "${workspace}/hook_calls" 2>/dev/null || true)" "m3-process-" \
+        "S89: the caller BASH_ENV never runs in the fixed check"
+}
+
+s90_collect_root_check_failures_keep_the_task_directory() {
+    local workspace kind pid
+    # A denied privilege request in a complete collection.
+    workspace="$(new_workspace s90_denied)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_collect_run "$workspace" FAKE_CHECK=deny > /dev/null
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" "S90: a denied check stops the removal"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" "S90: the refusal names the check"
+    assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "status 1" "S90: the reason has the status"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/m3-mean-speed/process-check.err" 2>/dev/null || true)" \
+        "a password is required" "S90: the evidence keeps the refusal of the privilege request"
+    assert_eq "INCOMPLETE" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "S90: the check is incomplete"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S90: no value is accepted"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S90: no numeric value"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S90: the capture is incomplete"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "S90: the task directory stays after a denied check"
+    # A missing, writable, or not root-owned executable stops the check before
+    # any elevation.
+    workspace="$(new_workspace s90_missing)"
+    ab_check_fixture "$workspace"
+    sed -i -e "s|/usr/bin/getconf|${workspace}/rootfake/getconf|g" "${workspace}/capture_step.sh"
+    ab_check_refused "S90 missing executable" "$workspace" "is missing"
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S90: no elevation starts with a missing executable"
+    workspace="$(new_workspace s90_writable)"
+    ab_check_fixture "$workspace" fail
+    chmod 775 "${workspace}/rootfake/find"
+    ab_check_refused "S90 writable executable" "$workspace" "group- or world-writable"
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S90: no elevation starts with a writable executable"
+    workspace="$(new_workspace s90_owner)"
+    ab_check_fixture "$workspace"
+    ab_check_refused "S90 executable owner" "$workspace" "not owned by root" FAKE_CHECK_OWNER=keep
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S90: no elevation starts with an executable of another owner"
+    # A failed check, an output above the file limit, and a read that is
+    # denied even at the admitted boundary.
+    workspace="$(new_workspace s90_failed)"
+    ab_check_fixture "$workspace"
+    ab_check_refused "S90 failed check" "$workspace" "status 1" FAKE_CHECK=fail
+    ab_check_refused "S90 output limit" "$workspace" "status 153" FAKE_CHECK=big
+    ab_check_refused "S90 denied read" "$workspace" "is not complete for" FAKE_CHECK=user AB_CHECK_HIDDEN="${workspace}/hidden"
+    pid="$(cat "${workspace}/hidden" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    else
+        _fail "S90: the unreadable process must start" "$(tail -n 5 "${workspace}/unit.out")"
+    fi
+    assert_contains "$(ab_check_frame "$workspace")" "UNCERTAIN /usr/bin/find: '/proc/${pid}/" \
+        "S90: the denied read stays uncertain"
+    # Controlled frames: a complete valid frame with a verified stop permits
+    # the removal; each defect of the frame refuses it.
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" \
+        "S90: a complete valid frame and a verified stop permit the removal"
+    for kind in unknown duplicate token target uid no-end truncated after-end scan-long terminated monitor-group; do
+        ab_check_refused "S90 frame ${kind}" "$workspace" "not one complete valid frame" "FAKE_CHECK=frame:${kind}"
+    done
+    : > "${workspace}/root_children"
+    ab_check_refused "S90 live monitor" "$workspace" "did not stop" FAKE_CHECK=frame:live-monitor
+    assert_eq "NO" "$(ab_check_value "$workspace" PROCESS_CHECK_STOPPED)" "S90: a live monitor is not a verified stop"
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] && kill -KILL "$pid" 2>/dev/null || true
+    done < "${workspace}/root_children"
+}
+
+s91_collect_root_check_stops_itself() {
+    local mode workspace frame token start end status scan check_end
+    # The root monitor owns TERM and KILL. A slow scan stops at its interval;
+    # a check child that ignores SIGTERM keeps the guard alive until the
+    # monitor sends SIGKILL, also after an early scanner exit. The metric end
+    # is 15500 ms after the cleanup start, so the scan interval is short.
+    for mode in slow ignore orphan; do
+        workspace="$(new_workspace "s91_${mode}")"
+        ab_check_fixture "$workspace" "$mode"
+        ab_check_refused "S91 ${mode}" "$workspace" "process check" AB_CHECK_END_IN_MS=15500
+        ab_check_children_stopped "$workspace" "S91 ${mode}"
+        assert_eq "YES" "$(ab_check_value "$workspace" PROCESS_CHECK_STOPPED)" \
+            "S91 ${mode}: the check group and its children are verified stopped"
+        frame="$(ab_check_frame "$workspace")"
+        token="$(ab_check_value "$workspace" PROCESS_CHECK_TOKEN)"
+        assert_not_contains "$frame" "END 1 ${token} COMPLETE" "S91 ${mode}: no complete terminal record"
+        # The outer status is 124 or 137, as the outer and the root timers
+        # end; the elapsed time, the frame, and the stopped children show
+        # which stop the root monitor used.
+        read -r start end status <<< "$(awk -F '\t' '$2 == "process-check" { print $6, $7, $9 }' \
+            "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")"
+        assert_eq "TIMEOUT" "$status" "S91 ${mode}: the check operation ends as TIMEOUT"
+        scan="$(ab_check_value "$workspace" PROCESS_CHECK_SCAN_CS)"
+        check_end="$(ab_check_value "$workspace" PROCESS_CHECK_END_MS)"
+        [[ "$end" =~ ^[0-9]+$ && "$scan" =~ ^[0-9]+$ && "$check_end" =~ ^[0-9]+$ ]] && (( end <= check_end )) ||
+            _fail "S91 ${mode}: the check ends by the end of its part of the cleanup" "end: ${end}, check end: ${check_end}"
+        if [[ "$mode" == slow ]]; then
+            assert_contains "$frame" "END 1 ${token} TERMINATED " \
+                "S91 slow: the root monitor stops the slow scan with SIGTERM, and the guard records it"
+            (( end - start < scan * 10 + 5000 )) ||
+                _fail "S91 slow: SIGTERM is enough, so no 5-second grace passes" \
+                      "elapsed: $(( end - start )) ms, scan: ${scan} cs"
+        else
+            assert_not_contains "$frame" "END 1 " "S91 ${mode}: the guard writes no terminal record before SIGKILL"
+            (( end - start >= scan * 10 + 5000 - 300 )) ||
+                _fail "S91 ${mode}: the guard stays until the root monitor SIGKILL after the 5-second grace" \
+                      "elapsed: $(( end - start )) ms, scan: ${scan} cs"
+        fi
+        if [[ "$mode" == orphan ]]; then
+            assert_contains "$frame" $'\nSCAN_END\n' "S91 orphan: the scan ends before its child"
+        fi
+    done
+}
+
+s92_collect_root_check_keeps_one_cleanup_clock() {
+    local workspace entry cleanup_end check_end start limit scan end_cs entry_cs launch_cs
+    # Too little reserve: no check starts, and the removal keeps 8000 ms.
+    workspace="$(new_workspace s92_reserve)"
+    ab_check_fixture "$workspace"
+    ab_check_refused "S92 reserve" "$workspace" "ms for the process check" AB_CHECK_END_IN_MS=13000
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S92: no elevation starts without its reserve"
+    assert_eq "" "$(awk -F '\t' '$2 ~ /^process-check/' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+        "S92: no check operation starts without its reserve"
+    entry="$(ab_check_value "$workspace" CLEANUP_START_MS)"
+    cleanup_end="$(ab_check_value "$workspace" CLEANUP_END_MS)"
+    check_end="$(ab_check_value "$workspace" PROCESS_CHECK_END_MS)"
+    [[ "$entry" =~ ^[0-9]+$ && "$cleanup_end" =~ ^[0-9]+$ ]] && (( cleanup_end - entry <= 13000 )) ||
+        _fail "S92: the cleanup end is the earlier metric end" "entry: ${entry}, end: ${cleanup_end}"
+    assert_eq "$(( cleanup_end - 8000 ))" "$check_end" "S92: the removal keeps 8000 ms of the cleanup"
+    # A slow executable check before the launch uses the same check part: the
+    # end stays 12000 ms after the cleanup entry, and the scan is shorter.
+    workspace="$(new_workspace s92_delayed_launch)"
+    ab_check_fixture "$workspace"
+    ab_check_slow_readlink "$workspace"
+    ab_check_cleanup "$workspace" FAKE_READLINK_DELAY=0.2 > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" "S92: the delayed check still completes"
+    entry="$(ab_check_value "$workspace" CLEANUP_START_MS)"
+    check_end="$(ab_check_value "$workspace" PROCESS_CHECK_END_MS)"
+    assert_eq "$(( entry + 12000 ))" "$check_end" "S92: the check part does not restart after the executable check"
+    read -r limit start <<< "$(awk -F '\t' '$2 == "process-check" { print $4, $6 }' \
+        "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")"
+    [[ "$start" =~ ^[0-9]+$ ]] && (( start - entry >= 1500 && limit <= check_end - start )) ||
+        _fail "S92: the delay before the launch reduces the check limit" "entry: ${entry}, start: ${start}, limit: ${limit}"
+    scan="$(ab_check_value "$workspace" PROCESS_CHECK_SCAN_CS)"
+    end_cs="$(ab_check_value "$workspace" PROCESS_CHECK_END_BOOT_CS)"
+    entry_cs="$(ab_check_value "$workspace" PROCESS_CHECK_ENTRY_BOOT_CS)"
+    [[ "$scan" =~ ^[0-9]+$ && "$end_cs" =~ ^[0-9]+$ && "$entry_cs" =~ ^[0-9]+$ ]] &&
+        (( scan == end_cs - entry_cs - 600 && scan < 600 )) ||
+        _fail "S92: the scan is the time left to the absolute end less 600 centiseconds" \
+              "scan: ${scan}, end: ${end_cs}, entry: ${entry_cs}"
+    # A late root entry cannot restart the clock or enlarge the scan.
+    workspace="$(new_workspace s92_late_entry)"
+    ab_check_fixture "$workspace"
+    ab_check_cleanup "$workspace" FAKE_CHECK_DELAY=1.5 > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" "S92: the late check still completes"
+    scan="$(ab_check_value "$workspace" PROCESS_CHECK_SCAN_CS)"
+    end_cs="$(ab_check_value "$workspace" PROCESS_CHECK_END_BOOT_CS)"
+    entry_cs="$(ab_check_value "$workspace" PROCESS_CHECK_ENTRY_BOOT_CS)"
+    launch_cs="$(ab_check_value "$workspace" PROCESS_CHECK_LAUNCH_BOOT_CS)"
+    [[ "$scan" =~ ^[0-9]+$ && "$end_cs" =~ ^[0-9]+$ && "$entry_cs" =~ ^[0-9]+$ && "$launch_cs" =~ ^[0-9]+$ ]] &&
+        (( entry_cs - launch_cs >= 150 && scan == end_cs - entry_cs - 600 && scan < 600 )) ||
+        _fail "S92: the late root entry reduces the scan from the same absolute end" \
+              "scan: ${scan}, end: ${end_cs}, entry: ${entry_cs}, launch: ${launch_cs}"
+}
+
+s93_collect_root_check_terminal_clock_records() {
+    local workspace block frame row label ended back expect text status pid launch child problem kind token
+    # The parser (review 5476930073, F6): the terminal time of a complete
+    # frame is from the launch time to the earlier of the return time and the
+    # absolute end. Each number of the frame is a decimal number without a
+    # leading zero, because bash arithmetic reads such a number as octal. The
+    # request values are those of the review: launch 500, absolute end 1200.
+    workspace="$(new_workspace s93_parse)"
+    block="$(ab_step_run_body "Capture the evidence" | awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 }
+        inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }')"
+    frame="${workspace}/frame.txt"
+    for row in "valid|599|600|accept" "at the launch time|500|600|accept" "at the return time|600|600|accept" \
+               "at the absolute end|1200|1300|accept" \
+               "zero|0|600|reject|the terminal time" "backwards|499|600|reject|the terminal time" \
+               "after the return|601|600|reject|the terminal time" \
+               "after the absolute end|1201|1300|reject|the terminal time" \
+               "after both ends|1201|600|reject|the terminal time" \
+               "leading zero|0599|600|reject|the terminal record" "no return time|599||reject|the return time" \
+               "clock failure|0|600|reject|the status CLOCK_UNAVAILABLE|CLOCK_UNAVAILABLE" \
+               "monitor PID with a leading zero|599|600|reject|the monitor record|COMPLETE|0700000000" \
+               "launch time with a leading zero|599|600|reject|the launch record|COMPLETE|900000000|0500" \
+               "child PID with a leading zero|599|600|reject|the child record|COMPLETE|900000000|500|0900000001"; do
+        IFS='|' read -r label ended back expect text status pid launch child <<< "$row"
+        pid="${pid:-900000000}" launch="${launch:-500}" child="${child:-900000001}"
+        printf '%s\n' "LAUNCH 1 abcdefgh12 ${launch} 100" "FRAME 1 abcdefgh12 /tmp/m3-metric-collection.AbCd1234 1000 1200" \
+            "MONITOR ${pid} ${pid} 550 0" SCAN_END "CHILD ${child} 551" "END 1 abcdefgh12 ${status:-COMPLETE} ${ended}" \
+            > "$frame"
+        problem="$(ab_check_parse "$block" "$frame" "$back")"
+        if [[ "$expect" == accept ]]; then
+            assert_eq "" "$problem" "S93 parser ${label}: one complete valid frame is accepted"
+        else
+            assert_contains "$problem" "$text" "S93 parser ${label}: the frame is refused with its cause"
+        fi
+    done
+    # The cleanup: each bad terminal time keeps the task directory, and a
+    # valid frame is the control.
+    workspace="$(new_workspace s93_frames)"
+    ab_check_fixture "$workspace"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" "S93: one complete valid frame permits the removal"
+    for kind in end-zero end-backwards end-after-return end-after-deadline end-leading-zero; do
+        ab_check_refused "S93 frame ${kind}" "$workspace" "not one complete valid frame" "FAKE_CHECK=frame:${kind}"
+        assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+            "S93 frame ${kind}: no removal starts"
+    done
+    # The collector: a failed return clock read fails the check, also after
+    # a valid frame. The fake sudo removes the clock file, or makes it
+    # malformed, after the check. An earlier failure stays the first reason.
+    workspace="$(new_workspace s93_return_clock)"
+    ab_check_fixture "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_refused "S93 missing return clock" "$workspace" "the boot clock cannot be read after the process check" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=missing
+    assert_eq "INCOMPLETE" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 missing return clock: the check is incomplete"
+    ab_check_parent_clock "$workspace"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=malformed AB_CHECK_FIRST="an earlier failure" > /dev/null
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_check_value "$workspace" CLEANUP_RESULT)" \
+        "S93 malformed return clock: the cleanup refuses with REFUSED_PROCESS_CHECK"
+    assert_eq "COMMAND_FAILURE" "$(ab_check_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S93 malformed return clock: the earlier failure stays the first reason code"
+    assert_eq "an earlier failure" "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" \
+        "S93 malformed return clock: the earlier failure stays the first reason"
+    [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "S93 malformed return clock: the task directory stays"
+    # A failed read that sets a valid first field (the current clock with no
+    # line end: read status 1) gives no time either (review 5478239999). First
+    # the return read after a valid frame, then the launch read, which must
+    # start no elevation.
+    ab_check_parent_clock "$workspace"
+    ab_check_refused "S93 partial return clock" "$workspace" "the boot clock cannot be read after the process check" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=partial
+    assert_eq "INCOMPLETE" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 partial return clock: the check is incomplete"
+    assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+        "S93 partial return clock: no removal starts"
+    workspace="$(new_workspace s93_launch_clock)"
+    ab_check_fixture "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_check_refused "S93 partial launch clock" "$workspace" "the boot clock cannot be read, so the task directory stays" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S93 partial launch clock: no elevation starts"
+    assert_eq "NOT_RUN" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 partial launch clock: the check does not run"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore AB_CHECK_FIRST="an earlier failure" > /dev/null
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_check_value "$workspace" CLEANUP_RESULT)" \
+        "S93 partial launch clock: the cleanup refuses with REFUSED_PROCESS_CHECK after an earlier failure"
+    assert_eq "COMMAND_FAILURE" "$(ab_check_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S93 partial launch clock: the earlier failure stays the first reason code"
+    assert_eq "an earlier failure" "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" \
+        "S93 partial launch clock: the earlier failure stays the first reason"
+    [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "S93 partial launch clock: the task directory stays"
+    # The same failed launch read in a complete collection.
+    workspace="$(new_workspace s93_launch_collect)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_collect_run "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore > /dev/null
+    ab_check_full_refused "S93 launch clock" "$workspace" "the boot clock cannot be read, so the task directory stays" \
+        NOT_RUN UNAVAILABLE
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S93 launch clock: no elevation starts"
+    # The same malformed return clock in a complete collection.
+    workspace="$(new_workspace s93_return_collect)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_collect_run "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=malformed > /dev/null
+    ab_check_full_refused "S93 return clock" "$workspace" "the boot clock cannot be read after the process check"
+    # The guard: a failed final clock read fails the check. The real guard
+    # and scan run at the fake boundary; the fake find removes the clock file
+    # of the fixed source in the scan, after the launch read.
+    workspace="$(new_workspace s93_final_clock)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace" clock
+    ab_collect_run "$workspace" > /dev/null
+    ab_check_full_refused "S93 final clock" "$workspace" "the boot clock cannot be read at the end"
+    token="$(ab_collect_value "$workspace" PROCESS_CHECK_TOKEN)"
+    assert_contains "$(ab_check_frame "$workspace")" $'SCAN_END\n' "S93 final clock: the scan ends"
+    assert_contains "$(ab_check_frame "$workspace")" "END 1 ${token} CLOCK_UNAVAILABLE " \
+        "S93 final clock: the guard records the failed clock read in its terminal record"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -5933,6 +7991,28 @@ AB_OBSERVATIONS=(
     s69_metric_process_checks_do_not_depend_on_permission
     s70_metric_stop_ends_by_the_operation_deadline
     s71_metric_root_signal_vector_takes_a_small_group_id
+    s72_collect_volume_weighted_mean_of_the_latest_time
+    s73_collect_needs_a_successful_product_run
+    s74_collect_selects_only_the_recorded_latest_time
+    s75_collect_isolates_exact_input_bytes
+    s76_collect_output_fails_closed
+    s77_collect_accepts_zero_and_has_no_range
+    s78_collect_requires_the_proven_environment
+    s79_collect_limits_stops_and_cleanup
+    s80_collect_keeps_the_other_verdicts_separate
+    s81_collect_keeps_the_workflow_interface
+    s82_collect_failed_log_evidence_fails_closed
+    s83_collect_task_bytes_stay_in_the_limit
+    s84_collect_cleanup_needs_a_complete_process_check
+    s85_collect_time_record_read_is_bounded
+    s86_collect_value_and_volume_convert_to_finite_doubles
+    s87_collect_older_process_in_the_case_keeps_it
+    s88_collect_task_measurements_and_allowances
+    s89_collect_root_check_source_and_arguments
+    s90_collect_root_check_failures_keep_the_task_directory
+    s91_collect_root_check_stops_itself
+    s92_collect_root_check_keeps_one_cleanup_clock
+    s93_collect_root_check_terminal_clock_records
 )
 
 # One observation runs in this process when the caller names it. The scenario
