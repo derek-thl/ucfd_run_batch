@@ -3301,8 +3301,9 @@ jobs:
                   metric_check_refuse "the cleanup reserve leaves ${left} ms for the process check, not more than $(( METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )) ms"
                   return 1
               fi
-              # The absolute check end on the boot clock, from the same end in ms.
-              { read -r up rest < /proc/uptime; } 2> /dev/null || true
+              # The absolute check end on the boot clock, from the same end in ms. A read
+              # that fails gives no time, also when it set a valid first field.
+              { read -r up rest < /proc/uptime; } 2> /dev/null || up=""
               now="$(metric_now_ms)"
               if [[ ! "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]]; then
                   metric_check_refuse "the boot clock cannot be read"
@@ -3325,10 +3326,11 @@ jobs:
                   m3-process-check "$TASK_TEMP" "$RUNNER_TEMP" "$ORIGINAL_RUNNER_UID" "$M_BOOT_CS" "$CHECK_END_BOOT_CS" "$CHECK_TOKEN"
               M_OUT_FILE=""
               M_ERR_FILE=""
-              # The return time on the boot clock. A failed read leaves it empty, and
-              # the check fails; no other time takes its place.
+              # The return time on the boot clock. A failed read leaves it empty, also
+              # when it set a valid first field, and the check fails; no other time
+              # takes its place.
               up=""
-              { read -r up rest < /proc/uptime; } 2> /dev/null || true
+              { read -r up rest < /proc/uptime; } 2> /dev/null || up=""
               if [[ "$up" =~ ^[0-9]{1,10}[.][0-9]{2}$ ]]; then
                   back=$(( 10#${up/./} ))
               fi
