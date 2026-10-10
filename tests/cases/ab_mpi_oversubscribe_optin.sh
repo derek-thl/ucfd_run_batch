@@ -147,6 +147,12 @@
 # unchanged steps of S72 to S87. Every other run uses the controlled fake
 # boundary of ab_collect_root_fake, which gives and claims no privilege.
 #
+# Check S93 covers PR #98 review 5476930073 (F6): a terminal time of the
+# result frame that is zero, before the launch, after the return, after the
+# absolute end, or not a plain decimal number, and a failed final clock read
+# of the guard or return clock read of the collector. Each keeps the task
+# directory with REFUSED_PROCESS_CHECK.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -5983,21 +5989,23 @@ AB_CHECK_PREFIX="-n -- /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash
 # privilege and claims none:
 # - /usr/bin/sudo becomes <workspace>/rootfake/sudo. It accepts only the exact
 #   admitted vector, records each call in root_calls.tsv (the fixed source as
-#   its SHA-256), and runs the command after "--" as the test user. As with
-#   sudo, a SIGTERM of the caller does not stop the command, and the command
-#   writes straight to the inherited output. FAKE_CHECK selects one behavior:
-#   view (the default) then drops the permission errors of the processes that
-#   the test user cannot read, as the root view of a test host does, because
-#   no such host process uses a new test directory; user keeps
+#   its SHA-256), and runs the command after "--" as the test user. As in the
+#   worst case of sudo, a SIGTERM of the caller does not stop the command, and
+#   the command writes straight to the inherited output. FAKE_CHECK selects one
+#   behavior: view (the default) then drops the permission errors of the
+#   processes that the test user cannot read, as the root view of a test host
+#   does, because no such host process uses a new test directory; user keeps
 #   them, as a read that is denied even at the admitted boundary; deny refuses
 #   as sudo -n without a rule does; fail runs the check and ends with status 1;
 #   big writes more than the file limit; frame:<kind> writes one controlled
 #   result frame and runs no check. FAKE_CHECK_DELAY delays the root entry.
+#   FAKE_CHECK_CLOCK changes the return clock of ab_check_parent_clock.
 # - with a find mode, /usr/bin/find of the fixed check source becomes
 #   <workspace>/rootfake/find: fail (a read error), slow (a scan that blocks),
 #   ignore (a scan child that ignores SIGTERM), or orphan (the scan ends at once
 #   and leaves a check child that ignores SIGTERM). Each records its PIDs in
-#   root_children.
+#   root_children. clock removes the boot clock of the fixed source in the
+#   scan, after the launch read, and then runs the real find.
 # - stat reports owner 0 for each file under rootfake, as for an installed
 #   root-owned tool; FAKE_CHECK_OWNER=keep reports the real owner.
 # - the OS record of the hosted-runner gate becomes <workspace>/os-release.
@@ -6026,10 +6034,20 @@ if (( $# != 19 )) || [[ "${*:1:11}" != "$expected" || "${13}" != m3-process-chec
     exit 97
 fi
 task="${14}" runner="${15}" uid="${16}" end="${18}" token="${19}"
-# As sudo: the caller cannot stop the command with SIGTERM (the runner user
-# cannot signal the root-owned sudo), and the command writes straight to the
-# inherited output.
+# The worst case of sudo: a SIGTERM of the caller does not stop the command
+# (the runner user may be unable to signal the root-owned sudo), and the
+# command writes straight to the inherited output.
 trap ':' TERM
+# FAKE_CHECK_CLOCK=missing|malformed: at the end, the return clock of the
+# collector (see ab_check_parent_clock) is removed, or holds a malformed value.
+fake_clock() {
+    local clock="${calls%/*}/parent_uptime"
+    case "${FAKE_CHECK_CLOCK:-}" in
+        missing) rm -f -- "$clock" ;;
+        malformed) rm -f -- "$clock"; printf 'x 1.00\n' > "$clock" ;;
+    esac
+}
+trap fake_clock EXIT
 run() {
     local child status
     "$@" &
@@ -6101,6 +6119,11 @@ case "$kind" in
     token) frame+=("END 1 ${token}0 COMPLETE ${entry}") ;;
     terminated) frame+=("END 1 ${token} TERMINATED ${entry}") ;;
     no-end) ;;
+    end-zero) frame+=("END 1 ${token} COMPLETE 0") ;;
+    end-backwards) frame+=("END 1 ${token} COMPLETE $(( entry - 1 ))") ;;
+    end-after-return) frame+=("END 1 ${token} COMPLETE ${end}") ;;
+    end-after-deadline) frame+=("END 1 ${token} COMPLETE $(( end + 1 ))") ;;
+    end-leading-zero) frame+=("END 1 ${token} COMPLETE 0${entry}") ;;
     *) frame+=("END 1 ${token} COMPLETE ${entry}") ;;
 esac
 [[ "$kind" == after-end ]] && frame+=("SCAN_END")
@@ -6117,10 +6140,14 @@ ROOT_FAKE
     if [[ -n "$mode" ]]; then
         {
             printf '#!/usr/bin/env bash\n'
-            printf 'children=%q\nmarker=%q\nmode=%q\n' "${workspace}/root_children" "${workspace}/root_orphan" "$mode"
+            printf 'children=%q\nmarker=%q\nmode=%q\nclock=%q\n' "${workspace}/root_children" "${workspace}/root_orphan" \
+                "$mode" "${root}/uptime"
             cat <<'ROOT_FIND'
 case "$mode" in
     fail) echo "find: simulated read failure" >&2; exit 1 ;;
+    clock)
+        rm -f -- "$clock"
+        exec /usr/bin/find "$@" ;;
     slow) printf '%s\n' "$$" >> "$children"; exec /usr/bin/sleep 300 ;;
     ignore)
         trap '' TERM
@@ -6142,6 +6169,13 @@ ROOT_FIND
         } > "${root}/find"
         chmod 755 "${root}/find"
         sed -i -e "s|/usr/bin/find|${root}/find|g" "$step"
+        if [[ "$mode" == clock ]]; then
+            # The fixed source reads its boot clock from rootfake/uptime, a
+            # link to /proc/uptime that the fake find removes in the scan.
+            ln -sfn /proc/uptime "${root}/uptime"
+            sed -i -e "s#{ read -r up rest < /proc/uptime; } 2> /dev/null || return 1#{ read -r up rest < ${root}/uptime; } 2> /dev/null || return 1#" "$step"
+            assert_eq "1" "$(grep -cF "< ${root}/uptime;" "$step")" "the fixed source reads its boot clock from the test file"
+        fi
     fi
     {
         printf '#!/usr/bin/env bash\n'
@@ -6293,8 +6327,10 @@ ab_check_fixture() {
 # AB_CHECK_END_IN_MS (default 60000) after the start of the cleanup run. With
 # AB_CHECK_HIDDEN=<file>, a test process with its working directory in the
 # task Case makes its /proc entries unreadable (PR_SET_DUMPABLE 0) first, and
-# its PID goes to the file. The result record is written as at the end of the
-# metric. The task directory path goes to unit_task. Prints status=.
+# its PID goes to the file. With AB_CHECK_FIRST=<reason>, an earlier
+# COMMAND_FAILURE with that reason comes first. The result record is written as
+# at the end of the metric. The task directory path goes to unit_task. Prints
+# status=.
 ab_check_cleanup() {
     local workspace="$1" library status
     shift
@@ -6312,6 +6348,9 @@ capture_note() { :; }
 mkdir -p "$RUNNER_TEMP" "$EVIDENCE_DIR"
 PREPARE_RESULT=NOT_ATTEMPTED metric_collect > /dev/null
 M_CODE="" M_REASON="" M_FAIL_POINT=NONE
+if [[ -n "${AB_CHECK_FIRST:-}" ]]; then
+    metric_fail COMMAND_FAILURE "$AB_CHECK_FIRST" > /dev/null
+fi
 TASK_TEMP="$(mktemp -d "${RUNNER_TEMP}/m3-metric-collection.XXXXXXXX")"
 mkdir -- "${TASK_TEMP}/case" "${TASK_TEMP}/config" "${TASK_TEMP}/logs"
 printf "%s\n" "$TASK_TEMP" > "$AB_UNIT_TASK"
@@ -6392,6 +6431,59 @@ ab_check_slow_readlink() {
         printf '%s\n' 'sleep "${FAKE_READLINK_DELAY:-0}"' 'exec "$real" "$@"'
     } > "${1}/fakebin/readlink"
     chmod +x "${1}/fakebin/readlink"
+}
+
+# ab_check_parent_clock <workspace> - the collector reads the two boot clocks of
+# the process check (before the launch and after the return) from
+# <workspace>/parent_uptime, a link to /proc/uptime. FAKE_CHECK_CLOCK of the
+# fake sudo changes that file after the check. The fixed source and the metric
+# start keep /proc/uptime. A second call only restores the link.
+ab_check_parent_clock() {
+    local workspace="$1" step="${1}/capture_step.sh"
+    ln -sfn /proc/uptime "${workspace}/parent_uptime"
+    sed -i -e "s#{ read -r up rest < /proc/uptime; } 2> /dev/null || true#{ read -r up rest < ${workspace}/parent_uptime; } 2> /dev/null || true#" "$step"
+    assert_eq "2" "$(grep -cF "< ${workspace}/parent_uptime;" "$step")" \
+        "the collector reads the two boot clocks of the process check from the test file"
+}
+
+# ab_check_parse <block> <frame-file> <return-cs> - the extracted
+# metric_check_frame of the collection block on one controlled frame, with the
+# request values of review 5476930073: token abcdefgh12, the launch at 500, the
+# absolute end at 1200, and 100 clock ticks each second. The frame is data
+# only: no process starts or gets a signal. Prints the problem, empty for one
+# complete valid frame.
+ab_check_parse() {
+    bash --noprofile --norc -c "${1}"'
+CHECK_TOKEN=abcdefgh12 TASK_TEMP=/tmp/m3-metric-collection.AbCd1234 ORIGINAL_RUNNER_UID=1000
+CHECK_END_BOOT_CS=1200 M_CHECK_LAUNCH_CS=500 M_CHECK_CLK=100
+M_GROUPS=()
+metric_check_frame "$1" "$2"
+printf "%s" "$C_PROBLEM"' parse "$2" "$3"
+}
+
+# ab_check_full_refused <label> <workspace> <reason-text> - a complete
+# collection with a failed process check: REFUSED_PROCESS_CHECK as the first
+# failure with a reason that has <reason-text>, an incomplete check with a
+# verified stop, no removal, the task directory kept, no accepted value, and
+# an incomplete capture.
+ab_check_full_refused() {
+    local label="$1" workspace="$2" reason="$3"
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
+        "${label}: the cleanup refuses with REFUSED_PROCESS_CHECK"
+    assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "${label}: the refusal is the first failure"
+    assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "$reason" "${label}: the reason names the cause"
+    assert_eq "INCOMPLETE" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "${label}: the check is incomplete"
+    assert_eq "YES" "$(ab_collect_value "$workspace" PROCESS_CHECK_STOPPED)" "${label}: the check group is verified stopped"
+    assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+        "${label}: no removal starts"
+    [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "${label}: the task directory stays"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "${label}: no value is accepted"
+    assert_eq "UNAVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "${label}: no numeric value"
+    assert_eq "UNAVAILABLE" "$(ab_env_last "$workspace" MEAN_SPEED_VERDICT)" "${label}: GITHUB_ENV has the verdict"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "${label}: the capture is incomplete"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt" 2>/dev/null || true)" \
+        "M3 mean speed: CLEANUP_FAILURE" "${label}: the capture note names the reason"
 }
 
 # ab_collect_ras <flow-case> - RAS kEpsilon inputs: the turbulence dictionary
@@ -7667,6 +7759,87 @@ s92_collect_root_check_keeps_one_cleanup_clock() {
               "scan: ${scan}, end: ${end_cs}, entry: ${entry_cs}, launch: ${launch_cs}"
 }
 
+s93_collect_root_check_terminal_clock_records() {
+    local workspace block frame row label ended back expect text status pid problem kind token
+    # The parser (review 5476930073, F6): the terminal time of a complete
+    # frame is a decimal number without a leading zero, from the launch time
+    # to the earlier of the return time and the absolute end. The request
+    # values are those of the review: launch 500, absolute end 1200.
+    workspace="$(new_workspace s93_parse)"
+    block="$(ab_step_run_body "Capture the evidence" | awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 }
+        inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }')"
+    frame="${workspace}/frame.txt"
+    for row in "valid|599|600|accept" "at the launch time|500|600|accept" "at the return time|600|600|accept" \
+               "at the absolute end|1200|1300|accept" \
+               "zero|0|600|reject|the terminal time" "backwards|499|600|reject|the terminal time" \
+               "after the return|601|600|reject|the terminal time" \
+               "after the absolute end|1201|1300|reject|the terminal time" \
+               "after both ends|1201|600|reject|the terminal time" \
+               "leading zero|0599|600|reject|the terminal record" "no return time|599||reject|the return time" \
+               "clock failure|0|600|reject|the status CLOCK_UNAVAILABLE|CLOCK_UNAVAILABLE" \
+               "monitor PID with a leading zero|599|600|reject|the monitor record|COMPLETE|0700000000"; do
+        IFS='|' read -r label ended back expect text status pid <<< "$row"
+        pid="${pid:-900000000}"
+        printf '%s\n' "LAUNCH 1 abcdefgh12 500 100" "FRAME 1 abcdefgh12 /tmp/m3-metric-collection.AbCd1234 1000 1200" \
+            "MONITOR ${pid} ${pid} 550 0" SCAN_END "CHILD 900000001 551" "END 1 abcdefgh12 ${status:-COMPLETE} ${ended}" \
+            > "$frame"
+        problem="$(ab_check_parse "$block" "$frame" "$back")"
+        if [[ "$expect" == accept ]]; then
+            assert_eq "" "$problem" "S93 parser ${label}: one complete valid frame is accepted"
+        else
+            assert_contains "$problem" "$text" "S93 parser ${label}: the frame is refused with its cause"
+        fi
+    done
+    # The cleanup: each bad terminal time keeps the task directory, and a
+    # valid frame is the control.
+    workspace="$(new_workspace s93_frames)"
+    ab_check_fixture "$workspace"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid > /dev/null
+    assert_eq "REMOVED" "$(ab_check_value "$workspace" CLEANUP_RESULT)" "S93: one complete valid frame permits the removal"
+    for kind in end-zero end-backwards end-after-return end-after-deadline end-leading-zero; do
+        ab_check_refused "S93 frame ${kind}" "$workspace" "not one complete valid frame" "FAKE_CHECK=frame:${kind}"
+        assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+            "S93 frame ${kind}: no removal starts"
+    done
+    # The collector: a failed return clock read fails the check, also after
+    # a valid frame. The fake sudo removes the clock file, or makes it
+    # malformed, after the check. An earlier failure stays the first reason.
+    workspace="$(new_workspace s93_return_clock)"
+    ab_check_fixture "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_refused "S93 missing return clock" "$workspace" "the boot clock cannot be read after the process check" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=missing
+    assert_eq "INCOMPLETE" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 missing return clock: the check is incomplete"
+    ab_check_parent_clock "$workspace"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=malformed AB_CHECK_FIRST="an earlier failure" > /dev/null
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_check_value "$workspace" CLEANUP_RESULT)" \
+        "S93 malformed return clock: the cleanup refuses with REFUSED_PROCESS_CHECK"
+    assert_eq "COMMAND_FAILURE" "$(ab_check_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S93 malformed return clock: the earlier failure stays the first reason code"
+    assert_eq "an earlier failure" "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" \
+        "S93 malformed return clock: the earlier failure stays the first reason"
+    [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "S93 malformed return clock: the task directory stays"
+    # The same malformed return clock in a complete collection.
+    workspace="$(new_workspace s93_return_collect)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_collect_run "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=malformed > /dev/null
+    ab_check_full_refused "S93 return clock" "$workspace" "the boot clock cannot be read after the process check"
+    # The guard: a failed final clock read fails the check. The real guard
+    # and scan run at the fake boundary; the fake find removes the clock file
+    # of the fixed source in the scan, after the launch read.
+    workspace="$(new_workspace s93_final_clock)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace" clock
+    ab_collect_run "$workspace" > /dev/null
+    ab_check_full_refused "S93 final clock" "$workspace" "the boot clock cannot be read at the end"
+    token="$(ab_collect_value "$workspace" PROCESS_CHECK_TOKEN)"
+    assert_contains "$(ab_check_frame "$workspace")" $'SCAN_END\n' "S93 final clock: the scan ends"
+    assert_contains "$(ab_check_frame "$workspace")" "END 1 ${token} CLOCK_UNAVAILABLE " \
+        "S93 final clock: the guard records the failed clock read in its terminal record"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -7777,6 +7950,7 @@ AB_OBSERVATIONS=(
     s90_collect_root_check_failures_keep_the_task_directory
     s91_collect_root_check_stops_itself
     s92_collect_root_check_keeps_one_cleanup_clock
+    s93_collect_root_check_terminal_clock_records
 )
 
 # One observation runs in this process when the caller names it. The scenario
