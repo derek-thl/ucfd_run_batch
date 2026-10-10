@@ -150,8 +150,9 @@
 # Check S93 covers PR #98 review 5476930073 (F6): a terminal time of the
 # result frame that is zero, before the launch, after the return, or after the
 # absolute end; a frame number with a leading zero; and a failed final clock
-# read of the guard or return clock read of the collector. Each keeps the task
-# directory with REFUSED_PROCESS_CHECK.
+# read of the guard or launch or return clock read of the collector, also a
+# failed read that sets a valid first field (review 5478239999). Each keeps the
+# task directory with REFUSED_PROCESS_CHECK.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -6038,13 +6039,20 @@ task="${14}" runner="${15}" uid="${16}" end="${18}" token="${19}"
 # (the runner user may be unable to signal the root-owned sudo), and the
 # command writes straight to the inherited output.
 trap ':' TERM
-# FAKE_CHECK_CLOCK=missing|malformed: at the end, the return clock of the
-# collector (see ab_check_parent_clock) is removed, or holds a malformed value.
+# FAKE_CHECK_CLOCK=missing|malformed|partial|restore: at the end, the return
+# clock of the collector (see ab_check_parent_clock) is removed, holds a
+# malformed value, holds the current value with no line end (a read sets the
+# valid first field and returns status 1), or is a link to /proc/uptime again.
 fake_clock() {
-    local clock="${calls%/*}/parent_uptime"
+    local clock="${calls%/*}/parent_uptime" up idle
     case "${FAKE_CHECK_CLOCK:-}" in
         missing) rm -f -- "$clock" ;;
         malformed) rm -f -- "$clock"; printf 'x 1.00\n' > "$clock" ;;
+        partial)
+            read -r up idle < /proc/uptime
+            rm -f -- "$clock"
+            printf '%s %s' "$up" "$idle" > "$clock" ;;
+        restore) rm -f -- "$clock"; ln -s /proc/uptime "$clock" ;;
     esac
 }
 trap fake_clock EXIT
@@ -6438,14 +6446,25 @@ ab_check_slow_readlink() {
 # ab_check_parent_clock <workspace> - the collector reads the two boot clocks of
 # the process check (before the launch and after the return) from
 # <workspace>/parent_uptime, a link to /proc/uptime. FAKE_CHECK_CLOCK of the
-# fake sudo changes that file after the check. The fixed source and the metric
-# start keep /proc/uptime. A second call only restores the link.
+# fake sudo changes that file after the check. The fixed source (its read ends
+# with "|| return 1") and the metric start keep /proc/uptime. A second call
+# only restores the link.
 ab_check_parent_clock() {
     local workspace="$1" step="${1}/capture_step.sh"
-    ln -sfn /proc/uptime "${workspace}/parent_uptime"
-    sed -i -e "s#{ read -r up rest < /proc/uptime; } 2> /dev/null || true#{ read -r up rest < ${workspace}/parent_uptime; } 2> /dev/null || true#" "$step"
+    rm -f -- "${workspace}/parent_uptime"
+    ln -s /proc/uptime "${workspace}/parent_uptime"
+    sed -i -e "/|| return 1\$/!s#{ read -r up rest < /proc/uptime; }#{ read -r up rest < ${workspace}/parent_uptime; }#" "$step"
     assert_eq "2" "$(grep -cF "< ${workspace}/parent_uptime;" "$step")" \
         "the collector reads the two boot clocks of the process check from the test file"
+}
+
+# ab_check_partial_clock <file> - the current boot clock with no line end, so a
+# read of the file sets the valid first field and returns status 1.
+ab_check_partial_clock() {
+    local up idle
+    read -r up idle < /proc/uptime
+    rm -f -- "$1"
+    printf '%s %s' "$up" "$idle" > "$1"
 }
 
 # ab_check_parse <block> <frame-file> <return-cs> - the extracted
@@ -6463,20 +6482,21 @@ metric_check_frame "$1" "$2"
 printf "%s" "$C_PROBLEM"' parse "$2" "$3"
 }
 
-# ab_check_full_refused <label> <workspace> <reason-text> - a complete
-# collection with a failed process check: REFUSED_PROCESS_CHECK as the first
-# failure with a reason that has <reason-text>, an incomplete check with a
-# verified stop, no removal, the task directory kept, no accepted value, and
+# ab_check_full_refused <label> <workspace> <reason-text> [<check> <stopped>] -
+# a complete collection with a failed process check: REFUSED_PROCESS_CHECK as
+# the first failure with a reason that has <reason-text>, the check result
+# <check> (default INCOMPLETE) and stop record <stopped> (default YES, a
+# verified stop), no removal, the task directory kept, no accepted value, and
 # an incomplete capture.
 ab_check_full_refused() {
-    local label="$1" workspace="$2" reason="$3"
+    local label="$1" workspace="$2" reason="$3" check="${4:-INCOMPLETE}" stopped="${5:-YES}"
     assert_eq "REFUSED_PROCESS_CHECK" "$(ab_collect_value "$workspace" CLEANUP_RESULT)" \
         "${label}: the cleanup refuses with REFUSED_PROCESS_CHECK"
     assert_eq "CLEANUP_FAILURE" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
         "${label}: the refusal is the first failure"
     assert_contains "$(ab_collect_value "$workspace" MEAN_SPEED_REASON)" "$reason" "${label}: the reason names the cause"
-    assert_eq "INCOMPLETE" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "${label}: the check is incomplete"
-    assert_eq "YES" "$(ab_collect_value "$workspace" PROCESS_CHECK_STOPPED)" "${label}: the check group is verified stopped"
+    assert_eq "$check" "$(ab_collect_value "$workspace" PROCESS_CHECK_RESULT)" "${label}: the check result is ${check}"
+    assert_eq "$stopped" "$(ab_collect_value "$workspace" PROCESS_CHECK_STOPPED)" "${label}: the stop record is ${stopped}"
     assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
         "${label}: no removal starts"
     [[ -n "$(ab_collect_tasks "$workspace")" ]] || _fail "${label}: the task directory stays"
@@ -7824,6 +7844,43 @@ s93_collect_root_check_terminal_clock_records() {
     assert_eq "an earlier failure" "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" \
         "S93 malformed return clock: the earlier failure stays the first reason"
     [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "S93 malformed return clock: the task directory stays"
+    # A failed read that sets a valid first field (the current clock with no
+    # line end: read status 1) gives no time either (review 5478239999). First
+    # the return read after a valid frame, then the launch read, which must
+    # start no elevation.
+    ab_check_parent_clock "$workspace"
+    ab_check_refused "S93 partial return clock" "$workspace" "the boot clock cannot be read after the process check" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=partial
+    assert_eq "INCOMPLETE" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 partial return clock: the check is incomplete"
+    assert_eq "" "$(awk -F '\t' '$2 == "remove"' "${workspace}/runner_temp/evidence/m3-mean-speed/commands.tsv")" \
+        "S93 partial return clock: no removal starts"
+    workspace="$(new_workspace s93_launch_clock)"
+    ab_check_fixture "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_check_refused "S93 partial launch clock" "$workspace" "the boot clock cannot be read, so the task directory stays" \
+        FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S93 partial launch clock: no elevation starts"
+    assert_eq "NOT_RUN" "$(ab_check_value "$workspace" PROCESS_CHECK_RESULT)" "S93 partial launch clock: the check does not run"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_check_cleanup "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore AB_CHECK_FIRST="an earlier failure" > /dev/null
+    assert_eq "REFUSED_PROCESS_CHECK" "$(ab_check_value "$workspace" CLEANUP_RESULT)" \
+        "S93 partial launch clock: the cleanup refuses with REFUSED_PROCESS_CHECK after an earlier failure"
+    assert_eq "COMMAND_FAILURE" "$(ab_check_value "$workspace" MEAN_SPEED_REASON_CODE)" \
+        "S93 partial launch clock: the earlier failure stays the first reason code"
+    assert_eq "an earlier failure" "$(ab_check_value "$workspace" MEAN_SPEED_REASON)" \
+        "S93 partial launch clock: the earlier failure stays the first reason"
+    [[ -d "$(cat "${workspace}/unit_task")" ]] || _fail "S93 partial launch clock: the task directory stays"
+    # The same failed launch read in a complete collection.
+    workspace="$(new_workspace s93_launch_collect)"
+    ab_collect_fixture "$workspace"
+    ab_collect_root_fake "$workspace"
+    ab_check_parent_clock "$workspace"
+    ab_check_partial_clock "${workspace}/parent_uptime"
+    ab_collect_run "$workspace" FAKE_CHECK=frame:valid FAKE_CHECK_CLOCK=restore > /dev/null
+    ab_check_full_refused "S93 launch clock" "$workspace" "the boot clock cannot be read, so the task directory stays" \
+        NOT_RUN UNAVAILABLE
+    [[ ! -s "${workspace}/root_calls.tsv" ]] || _fail "S93 launch clock: no elevation starts"
     # The same malformed return clock in a complete collection.
     workspace="$(new_workspace s93_return_collect)"
     ab_collect_fixture "$workspace"
