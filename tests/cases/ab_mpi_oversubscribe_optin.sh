@@ -148,9 +148,9 @@
 # boundary of ab_collect_root_fake, which gives and claims no privilege.
 #
 # Check S93 covers PR #98 review 5476930073 (F6): a terminal time of the
-# result frame that is zero, before the launch, after the return, after the
-# absolute end, or not a plain decimal number, and a failed final clock read
-# of the guard or return clock read of the collector. Each keeps the task
+# result frame that is zero, before the launch, after the return, or after the
+# absolute end; a frame number with a leading zero; and a failed final clock
+# read of the guard or return clock read of the collector. Each keeps the task
 # directory with REFUSED_PROCESS_CHECK.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
@@ -7760,11 +7760,12 @@ s92_collect_root_check_keeps_one_cleanup_clock() {
 }
 
 s93_collect_root_check_terminal_clock_records() {
-    local workspace block frame row label ended back expect text status pid problem kind token
+    local workspace block frame row label ended back expect text status pid launch child problem kind token
     # The parser (review 5476930073, F6): the terminal time of a complete
-    # frame is a decimal number without a leading zero, from the launch time
-    # to the earlier of the return time and the absolute end. The request
-    # values are those of the review: launch 500, absolute end 1200.
+    # frame is from the launch time to the earlier of the return time and the
+    # absolute end. Each number of the frame is a decimal number without a
+    # leading zero, because bash arithmetic reads such a number as octal. The
+    # request values are those of the review: launch 500, absolute end 1200.
     workspace="$(new_workspace s93_parse)"
     block="$(ab_step_run_body "Capture the evidence" | awk '/^# ---- M3 mean speed: begin ----$/ { inside = 1 }
         inside && !done { print } /^# ---- M3 mean speed: end ----$/ { done = 1 }')"
@@ -7777,11 +7778,13 @@ s93_collect_root_check_terminal_clock_records() {
                "after both ends|1201|600|reject|the terminal time" \
                "leading zero|0599|600|reject|the terminal record" "no return time|599||reject|the return time" \
                "clock failure|0|600|reject|the status CLOCK_UNAVAILABLE|CLOCK_UNAVAILABLE" \
-               "monitor PID with a leading zero|599|600|reject|the monitor record|COMPLETE|0700000000"; do
-        IFS='|' read -r label ended back expect text status pid <<< "$row"
-        pid="${pid:-900000000}"
-        printf '%s\n' "LAUNCH 1 abcdefgh12 500 100" "FRAME 1 abcdefgh12 /tmp/m3-metric-collection.AbCd1234 1000 1200" \
-            "MONITOR ${pid} ${pid} 550 0" SCAN_END "CHILD 900000001 551" "END 1 abcdefgh12 ${status:-COMPLETE} ${ended}" \
+               "monitor PID with a leading zero|599|600|reject|the monitor record|COMPLETE|0700000000" \
+               "launch time with a leading zero|599|600|reject|the launch record|COMPLETE|900000000|0500" \
+               "child PID with a leading zero|599|600|reject|the child record|COMPLETE|900000000|500|0900000001"; do
+        IFS='|' read -r label ended back expect text status pid launch child <<< "$row"
+        pid="${pid:-900000000}" launch="${launch:-500}" child="${child:-900000001}"
+        printf '%s\n' "LAUNCH 1 abcdefgh12 ${launch} 100" "FRAME 1 abcdefgh12 /tmp/m3-metric-collection.AbCd1234 1000 1200" \
+            "MONITOR ${pid} ${pid} 550 0" SCAN_END "CHILD ${child} 551" "END 1 abcdefgh12 ${status:-COMPLETE} ${ended}" \
             > "$frame"
         problem="$(ab_check_parse "$block" "$frame" "$back")"
         if [[ "$expect" == accept ]]; then
