@@ -1024,7 +1024,7 @@ For a new transport case, setup MUST:
 
 It MUST NOT rotate STL or build transport mesh dictionaries as part of v4 transport setup.
 
-Reason: transport reuses the converged flow mesh at runtime. Geometry/mesh work in the transport template would be overwritten later.
+Reason: transport reuses the available flow mesh at runtime. Geometry/mesh work in the transport template would be overwritten later. Mesh reuse does not establish numerical convergence or scientific acceptance.
 
 ### 14.8 Setup logs and outputs
 
@@ -2591,3 +2591,118 @@ A replacement is compatible when all of the following are true:
 - acceptance tests pass;
 - GitHub handoff states any intentional spec deviation explicitly.
 
+## 30. M3 functional qualification and deferred scientific validation
+
+### 30.1 Authority and scope
+
+This section applies to Case 7 M3 qualification on stock OpenCFD OpenFOAM v2512.
+
+Authority: [human Owner decision 6118379564](https://github.com/derek-thl/ucfd_run_batch/issues/80#issuecomment-6118379564), approved proposal `M3_PIPELINE_FIRST_SCOPE_37606C7E_R1`, Sections B.1–B.9.
+
+The amendment takes effect only after the bounded #80 contract, approved documentation integration, and an updated exact-main #99 Execution Frontier.
+
+Assess four results separately: runtime compatibility, pipeline functional compatibility, numerical convergence, and scientific accuracy/regression.
+
+Documentation integration alone MUST NOT establish M3 acceptance.
+
+### 30.2 MAINLINE runtime compatibility
+
+M3 MUST use the approved OpenCFD package and exact `WM_PROJECT_VERSION=v2512`.
+
+Verify environment initialization, the selected command paths, usable executables, and required shared libraries. Package installation alone MUST NOT establish compatibility.
+
+Record package version, bashrc, `WM_PROJECT_VERSION`, `WM_OPTIONS`, compiler, OS, architecture, and relevant command identities. An unresolved package-loading, library, command-compatibility, or initialization failure MUST block functional qualification.
+
+Use retained execution evidence where sufficient. State the exact run SHA and every reuse limit.
+
+### 30.3 MAINLINE pipeline functional compatibility
+
+The M3 selection remains `setup -> mesh -> flow -> post-processing`. Post-processing is flow-only. Transport remains outside M3.
+
+Verify the Orchestrator order and selected Stage Runners. Verify the approved DOE Batch CSV row, Case, Batch ID, and Batch Workspace mapping.
+
+Verify actual Stage results and required Case inputs, setup records, mesh artifacts, solver invocation, reconstruction, and flow-only post-processing. Required command failures, missing required outputs, and corrupted artifacts MUST block functional qualification.
+
+Verify readable `flow_0.vtu` and `flow_latest_<time>.vtu`, and `flow_latest_time.txt`. Verify PointData `U p wallDistance` for flow time 0 and `U p` for the latest flow result.
+
+Retain required summaries, logs, markers, Failure Artifacts, artifact inventory, and evidence integrity. Preserve all existing Stage failure propagation and capture failure behavior.
+
+Retain actual Case 7 cell-volume-weighted mean speed at the latest reconstructed flow time:
+
+`sum(V_i * |U_i|) / sum(V_i)`
+
+Require m/s, a finite non-negative result, positive total volume, time, region, cell count, input identity, exact calculation command, and provenance.
+
+The approved collector's configuration inputs, snapshots, runtime commands, parser, resource limits, failure behavior, and cleanup gates MUST remain unchanged. A synthetic fixture MUST NOT substitute for actual Case 7 output evidence.
+
+A successful workflow, Stage result, or completion marker alone MUST NOT establish functional acceptance. `flow.marker` is not the `SIMPLE solution converged` marker.
+
+### 30.4 DEFERRED numerical convergence
+
+After this amendment takes effect, report `NUMERICAL_CONVERGENCE=NOT_ACCEPTED_DEFERRED`. Report `SCIENTIFIC_REGRESSION_NOT_ESTABLISHED`.
+
+Numerical convergence MUST NOT be a blocking M3 functional prerequisite. Deferral MUST NOT change a numerical result to PASS.
+
+Preserve the [original numerical criterion](https://github.com/derek-thl/ucfd_run_batch/issues/80#issuecomment-5796082318): solver-reported convergence under approved controls, `1e-4` for U, p, and configured turbulence fields, the solver marker, actual configuration, final residuals, final time, and continuity record. Add no separate persistence window.
+
+Defer marker acceptance, residual-control compliance, residual history, continuity acceptance, numerical-control optimization, relaxation-factor optimization, numerical-scheme optimization, iteration-limit/end-time selection, and full scientific runtime-configuration provenance to [Issue #100](https://github.com/derek-thl/ucfd_run_batch/issues/100).
+
+A missing Run 2 scientific configuration record MUST NOT automatically block functional qualification. Configuration needed to prove a retained functional or collector requirement remains mandatory.
+
+Preserve raw numerical findings. Do not modify solver controls, relax residual thresholds, or extend end time under this section.
+
+### 30.5 Scientific and mesh boundary
+
+Apply [#96](https://github.com/derek-thl/ucfd_run_batch/issues/96) and the B.4 Owner amendment to Case 7/M3 only.
+
+Retain concavity findings and raw failed-check results. A warning is not a mesh pass. The concave-cell count alone does not require automatic rejection or a remedy campaign.
+
+Negative or zero volume, invalid/open topology, invalid owner/neighbour connectivity, incorrect face orientation, invalid/inverted face-pyramid geometry, and other invalid finite-volume control volumes remain blocking. A value outside an accepted project mesh limit remains blocking.
+
+Scientific numerical-quality conditions, convergence, continuity acceptance, and scientific quantity-of-interest comparisons MUST NOT become indirect M3 functional prerequisites.
+
+Missing scientific limits remain unresolved. They MUST NOT become PASS or excuse an invalid control volume. Observed values and package defaults MUST NOT become acceptance thresholds.
+
+Grant no scientific mesh acceptance or blanket mesh waiver. A non-converged field MAY support explicitly labeled pipeline interoperability testing only.
+
+Functional pipeline qualification does not establish numerical convergence, CFD solution accuracy, scientific regression acceptance, or production-model acceptance.
+
+### 30.6 Preserved historical evidence
+
+[Run 2](https://github.com/derek-thl/ucfd_run_batch/actions/runs/35849247240), attempt 1, used SHA `22e4a181ae614707eda706e10292323ea2f04352`, Case 7, stock v2512, and `simpleFoam`.
+
+Run 2 reached Time 3000 without `SIMPLE solution converged`. Some initial residuals exceed `1e-4`. The approved convergence requirement failed.
+
+Actual runtime `system/fvSolution`, `system/controlDict`, and `system/fvSchemes` were not retained. Preserve `RUN_2_RUNTIME_CONTROL_RECORD=UNAVAILABLE`. Do not reconstruct these records or repeat the completed search.
+
+Preserve [the completed assessment](https://github.com/derek-thl/ucfd_run_batch/issues/80#issuecomment-6104793419) and [Owner availability result](https://github.com/derek-thl/ucfd_run_batch/issues/80#issuecomment-6105461931).
+
+PR #98 integration and its CI evidence remain complete at `37606c7e6c139a8db55abd61e627eab44239859c`. That integration does not establish M3 acceptance.
+
+### 30.7 Dependencies and activation
+
+[Issue #100](https://github.com/derek-thl/ucfd_run_batch/issues/100) is a deferred Case 7 Flow child of [M5 Issue #81](https://github.com/derek-thl/ucfd_run_batch/issues/81). M3 functional acceptance MUST NOT depend on this child.
+
+Activation condition: `DEFERRED_UNTIL_OWNER_DECLARED_MAINLINE_COMPLETE`.
+
+The human Owner MUST declare accepted M1, M2 rights/build, M3 functional qualification, and M4 runtime/pipeline qualification on #99 with acceptance links.
+
+That operational milestone excludes Issue #100, M5 scientific qualification, and M6 full scientific qualification. M5 and M6 remain required for full migration completion. Completed M5 or M6 MUST NOT be an activation prerequisite for Issue #100.
+
+The M3 dependency in [M4 Issue #78](https://github.com/derek-thl/ucfd_run_batch/issues/78) means accepted M3 functional qualification. Preserve M2, source rights, build, and separate transport authority.
+
+Preserve the [#76 roadmap](https://github.com/derek-thl/ucfd_run_batch/issues/76) and [#77 final qualification](https://github.com/derek-thl/ucfd_run_batch/issues/77).
+
+### 30.8 Evidence and execution authority
+
+After the amendment takes effect, assess retained functional evidence with PASS, FAIL, NOT_VERIFIED, or NOT_APPLICABLE. Do not infer PASS from missing evidence.
+
+Recommend M3 functional acceptance only when every applicable functional requirement has sufficient evidence. Otherwise identify the smallest missing functional gate and propose a bounded next action.
+
+This section authorizes no OpenFOAM execution, solver tuning, Case modification, new capture, scientific acceptance, or Production Model Acceptance.
+
+Existing attempt and budget limits remain binding. A new production execution requires a separate Owner decision with exact Case, SHA, purpose, scope, attempt count, budget, and stop conditions. Unused time grants no attempt.
+
+Do not request a new run merely to recover historical numerical evidence.
+
+See [the deferred memorandum](reports/M3_NUMERICAL_CONVERGENCE_BACKLOG.md) for evidence, limitations, and responsibilities.
