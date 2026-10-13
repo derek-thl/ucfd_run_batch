@@ -953,6 +953,1729 @@ jobs:
               exit $?
           fi
 
+          # ---- Functional receipt: begin ----
+          # The Case 7 functional-record receipt (Issue #80, admission 6136000731 of the
+          # approved contract 6127203837, Sections 4, 5, and 8 to 10). After the
+          # collection, the capture keeps the six exact Case 7 source records, the
+          # selected Setup-entry fragments, and one result for each of the checks F1 to
+          # F10 in functional-receipt/. The receipt only reads its sources. It writes no
+          # source file, runs no source text, expands no macro or include, uses no
+          # template file, and runs no OpenFOAM command.
+          #
+          # The checkpoint is POST_ORCHESTRATOR_CAPTURE: the receipt reads the records at
+          # the capture, after every Stage, not just after Setup. A missing, linked,
+          # unreadable, oversized, or changed record, a record that is not a regular file,
+          # and an ambiguous, unsupported, or duplicate entry are source gaps: the check
+          # is NOT_VERIFIED, and no capture note is written. A reference source (a DOE
+          # Batch CSV or a geometry log) that changes during the read is a source gap of
+          # each result that compares with it. An observed wrong value is FAIL. A NUL
+          # byte in the time record or the signature is FAIL, because a shell read ends
+          # at it: no prefix is used. A failed or stopped operation, a limit of the
+          # receipt itself, a retained record that a read cannot give completely, and a
+          # result.env that cannot be written completely give INCOMPLETE and a capture
+          # note. COMPLETE is evidence construction only, never M3 acceptance. F4 stays
+          # NOT_VERIFIED, because no payload-readback witness exists, and F10 needs the
+          # GitHub artifact receipt, which exists only after the upload.
+          #
+          # Limits: the receipt work ends by the earlier of 30 seconds after its start and
+          # 10 seconds before the capture work limit, with the stop and the verification.
+          # Each retained file and text record holds at most 65536 bytes, the subtree at
+          # most 262144 bytes, and each named Setup scan reads at most 1048576 source
+          # bytes. The collection evidence and the receipt together hold at most the
+          # existing 10485760-byte added-evidence ceiling. No limit grows, and no earlier
+          # evidence is trimmed.
+          FR_WORK_SECONDS=30
+          FR_FILE_LIMIT=65536
+          FR_TREE_LIMIT=262144
+          FR_SCAN_LIMIT=1048576
+          FR_COMBINED_LIMIT=10485760
+          # result.env holds at most 2048 bytes; the other receipt files keep them free.
+          FR_RESULT_RESERVE=2048
+          # One selected entry holds at most 4096 bytes.
+          FR_ENTRY_LIMIT=4096
+          # The latest-time record holds at most 64 bytes.
+          FR_TIME_LIMIT=64
+          FR_ENTRY_COUNT=57
+          FR_METRIC_DICTIONARY_SHA256=ca8014349e58428377f5fa6d0b890e5850c2b13af42527a05e8ddb5146d137ef
+          FR_TIME_RE='^[0-9]+([.][0-9]+)?$'
+          FR_RECORD_IDS=(DOE_ROW SETUP_METADATA FLOW_MARKER RESTART_MARKER LATEST_TIME POST_SIGNATURE)
+          FR_RECORD_PATHS=(case_7/flow/doe_row.csv case_7/flow/setup_metadata.env case_7/flow/flow.marker
+                           case_7/flow/restart.marker case_7/vtk/flow_latest_time.txt case_7/vtk/post_processing.complete)
+          FR_DICTIONARIES=(system/blockMeshDict system/snappyHexMeshDict system/decomposeParDict 0/U 0/k 0/epsilon)
+          FR_SIGNATURE_KEYS=(flow_latest transport_ready transport_times scalar_field flow_zero_fields flow_result_fields vtu_point_data)
+          FR_METRIC_FILES=(identity.txt source-before.tsv source-after.tsv snapshot-before.tsv snapshot-after.tsv commands.tsv
+                           metric-functions inventory.txt task-bytes.tsv process-check.txt output/volFieldValue.dat)
+
+          # The two geometry reads of setup_cases.sh (rotate_stl_and_domain), with the
+          # same program text, so the receipt reads the logs as Setup did on the runner.
+          FR_ROTATION_AWK='BEGIN{IGNORECASE=1}
+                  /Set centre of rotation to/ {
+                      for (i=1; i<=NF; ++i) gsub("[()]","",$i);
+                      print $(NF-2),$(NF-1),$NF;
+                      exit
+                  }'
+          FR_BOUNDS_AWK='BEGIN{IGNORECASE=1}
+                  /bounding box|overall bounds/ {
+                      for (i=1; i<=NF; ++i) gsub("[()]","",$i);
+                      print $(NF-5),$(NF-4),$(NF-3),$(NF-2),$(NF-1),$NF;
+                      exit
+                  }'
+
+          # The entry selection. Input: the approved and the Batch Workspace DOE Batch
+          # CSV files, the six dictionaries, and the retained doe_row.csv and
+          # setup_metadata.env. The scanner reads only the named entries of the current
+          # ASCII layout: words, quoted strings, punctuation, comments, nested
+          # dictionaries, and entry values to their semicolon. It is not a general
+          # parser. A file with a byte outside printable ASCII, an unbalanced block, or an
+          # open comment, string, or entry at its end makes its entries UNSUPPORTED. A
+          # directive or macro at a keyword position, or a pattern keyword on the path,
+          # makes the entries AMBIGUOUS. A macro or a directive in a selected value makes
+          # it UNSUPPORTED. The expected values come from the DOE row, the geometry logs,
+          # and the committed Setup defaults, with the unchanged Setup formulas: Setup
+          # writes blockMeshDict with sed and the other entries with foamDictionary -set,
+          # which writes each number with the default precision of 6 significant digits.
+          # The Orchestrator passes only -i, -O, and -j to Setup, so these defaults apply:
+          # RAS kEpsilon, NP 8, snap off, addLayers off, H 40, RDR 300, extents
+          # 10,20,5,8, SFGS 1.0, U_OAI_BASE 5, and ZERO_WS_MODE keep. Prints CHECK and
+          # ENTRY rows, and writes each found fragment to its numbered file.
+          FR_ENTRY_AWK='
+          function trim(s) { gsub(/\r/, "", s); sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+          function isnum(s) { return s ~ /^[-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?$/ }
+          function isfloat(s) { return s ~ /^[ \t]*[-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?[ \t]*$/ }
+          function cells(line, arr,    n) {
+              n = split(line, arr, ",")
+              if (n > 0 && substr(line, length(line)) == ",") n--
+              return n
+          }
+          function column(aliases,    n, a, i) {
+              n = split(aliases, a, " ")
+              for (i = 1; i <= n; i++) if (tolower(a[i]) in col) return col[tolower(a[i])]
+              return -1
+          }
+          function cell(idx) { return (idx >= 0 && idx < nrc) ? trim(rc[idx + 1]) : "" }
+          function sanitize(s) {
+              s = trim(s); gsub(/[[:space:]]+/, "_", s); gsub(/[^0-9A-Za-z._-]/, "_", s); gsub(/_+/, "_", s)
+              sub(/^_/, "", s); sub(/_$/, "", s)
+              return (s == "" ? "NA" : s)
+          }
+          function floor2(x) { return (x >= 0) ? int(x) : int(x) - (x == int(x) ? 0 : 1) }
+          function normwd(wd,    a) {
+              a = wd - 360 * floor2(wd / 360); if (a < 0) a += 360; if (a >= 360) a -= 360
+              return sprintf("%.3f", a)
+          }
+          function rotangle(wd,    a, q) { a = wd + 25; q = int(a / 360); a -= 360 * q; if (a < 0) a += 360; return sprintf("%.3f", a) }
+          function rot2d(ux, uy) { return sprintf("%.9f %.9f", cth * ux - sth * uy, sth * ux + cth * uy) }
+          function written(s,    n, t, i, out, x) {
+              gsub(/\(/, " ( ", s); gsub(/\)/, " ) ", s)
+              n = split(s, t, " "); out = ""
+              for (i = 1; i <= n; i++) {
+                  x = t[i]
+                  if (isnum(x)) x = (x ~ /^[-+]?[0-9]+$/) ? sprintf("%d", x + 0) : sprintf("%.6g", x + 0)
+                  out = out (i > 1 ? " " : "") x
+              }
+              return out
+          }
+          function same(a, e,    na, ne, ta, te, i) {
+              na = split(a, ta, " "); ne = split(e, te, " ")
+              if (na != ne) return 0
+              for (i = 1; i <= na; i++) {
+                  if (isnum(te[i])) { if (!isnum(ta[i]) || ta[i] + 0 != te[i] + 0) return 0 }
+                  else if (ta[i] != te[i]) return 0
+              }
+              return 1
+          }
+          function b64(s,    i, n, c1, c2, c3, out) {
+              n = length(s); out = ""
+              for (i = 1; i <= n; i += 3) {
+                  c1 = ord[substr(s, i, 1)]; c2 = (i + 1 <= n) ? ord[substr(s, i + 1, 1)] : 0; c3 = (i + 2 <= n) ? ord[substr(s, i + 2, 1)] : 0
+                  out = out substr(B64, int(c1 / 4) + 1, 1) substr(B64, (c1 % 4) * 16 + int(c2 / 16) + 1, 1)
+                  out = out ((i + 1 <= n) ? substr(B64, (c2 % 16) * 4 + int(c3 / 64) + 1, 1) : "=")
+                  out = out ((i + 2 <= n) ? substr(B64, c3 % 64 + 1, 1) : "=")
+              }
+              return out
+          }
+          function field(s) { gsub(/[\t\r\n]/, " ", s); return (s == "" ? "-" : s) }
+          function req(file, path, mode, kind) {
+              nq++; qf[nq] = file; qp[nq] = path; qm[nq] = mode; qk[nq] = kind
+              gsub(/[.]/, SUBSEP, path); wanted[file, path] = nq; qkey[nq] = path
+          }
+          function start_dict() { lst = 0; incom = 0; st = 0; d = 0; split("", L); split("", LS) }
+          function finish_dict() {
+              if (bad[cur] == "" && (incom || st != 0 || d != 0)) bad[cur] = "the dictionary ends inside a comment, an entry, or a block"
+          }
+          function scope(    i, p) { p = ""; for (i = 1; i <= d; i++) p = (i == 1 ? sc[i] : p SUBSEP sc[i]); return p }
+          function fragment(l1, c1, l2, c2,    s, i) {
+              if (l1 == l2) return substr(L[l1], c1, c2 - c1 + 1)
+              s = substr(L[l1], c1); for (i = l1 + 1; i < l2; i++) s = s "\n" L[i]
+              return s "\n" substr(L[l2], 1, c2)
+          }
+          function entry_end(ln, c2,    p, n, i, v) {
+              p = scope(); p = (p == "" ? key : p SUBSEP key)
+              n = wanted[cur, p]
+              if (!n) return
+              cnt[n]++
+              if (cnt[n] > 1) return
+              v = ""; for (i = 1; i <= nv; i++) v = v (i > 1 ? " " : "") vt[i]
+              val[n] = v; mac[n] = vmac
+              off[n] = LS[kl] + kc - 1; byt[n] = LS[ln] + c2 - off[n]
+              frag[n] = fragment(kl, kc, ln, c2)
+          }
+          function token(t, x, ln, c1, c2) {
+              if (bad[cur] != "") return
+              if (st == 3) { if (t == "P" && x == "{") { st = 4; skip = 1 } else st = 0; return }
+              if (st == 4) { if (t == "P" && x == "{") skip++; else if (t == "P" && x == "}" && --skip == 0) st = 0; return }
+              if (st == 0) {
+                  if (t == "P") {
+                      if (x == "}") { if (d == 0) bad[cur] = "the dictionary has an unbalanced brace"; else d--; return }
+                      if (x != ";") bad[cur] = "the dictionary has [" x "] at a keyword position"
+                      return
+                  }
+                  if (t == "W" && (substr(x, 1, 1) == "#" || substr(x, 1, 1) == "$")) { dirt[cur] = 1; st = 3; return }
+                  key = x; kq = (t == "S"); kl = ln; kc = c1; st = 1
+                  return
+              }
+              if (st == 1) {
+                  if (kq) pat[cur, scope()] = 1
+                  if (t == "P" && x == "{") { d++; sc[d] = key; st = 0; return }
+                  nv = 0; pd = 0; bd = 0; vmac = 0; st = 2
+              }
+              if (t == "P") {
+                  if (x == "(" || x == "[") pd++
+                  else if (x == ")" || x == "]") { if (--pd < 0) { bad[cur] = "the dictionary has an unbalanced bracket"; return } }
+                  else if (x == "{") bd++
+                  else if (x == "}") { if (bd == 0) { bad[cur] = "an entry ends at a brace without a semicolon"; return } bd-- }
+                  else if (x == ";" && pd == 0 && bd == 0) { entry_end(ln, c2); st = 0; return }
+              } else if (t == "W" && (substr(x, 1, 1) == "$" || substr(x, 1, 1) == "#")) vmac = 1
+              vt[++nv] = x
+          }
+          function scan(s, ln,    n, pos, c, two, e, q, c2) {
+              n = length(s); pos = 1
+              while (pos <= n) {
+                  if (incom) { e = index(substr(s, pos), "*/"); if (!e) return; pos += e + 1; incom = 0; continue }
+                  c = substr(s, pos, 1)
+                  if (c == " " || c == "\t" || c == "\r") { pos++; continue }
+                  two = substr(s, pos, 2)
+                  if (two == "//") return
+                  if (two == "/*") { incom = 1; pos += 2; continue }
+                  if (c == "\"") {
+                      q = pos + 1
+                      while (q <= n) { c2 = substr(s, q, 1); if (c2 == "\\") { q += 2; continue } if (c2 == "\"") break; q++ }
+                      if (q > n) { bad[cur] = "the dictionary has an open string"; return }
+                      token("S", substr(s, pos, q - pos + 1), ln, pos, q); pos = q + 1
+                  } else if (index("{}();[]", c)) {
+                      token("P", c, ln, pos, pos); pos++
+                  } else {
+                      q = pos
+                      while (q <= n) {
+                          c2 = substr(s, q, 1); two = substr(s, q, 2)
+                          if (index(" \t\r{}();\"[]", c2) || two == "//" || two == "/*") break
+                          q++
+                      }
+                      token("W", substr(s, pos, q - pos), ln, pos, q - 1); pos = q
+                  }
+                  if (bad[cur] != "") return
+              }
+          }
+          BEGIN {
+              FS = ","
+              for (i = 1; i < 128; i++) ord[sprintf("%c", i)] = i
+              B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+              BM = "case_7/flow/system/blockMeshDict"
+              m = split(ENVIRON["FR_ENTRY_LIST"], lines, "\n")
+              for (i = 1; i <= m; i++) if (split(lines[i], q, "\t") == 4) req(q[1], q[2], q[3], q[4])
+              n = split(ENVIRON["FR_SOURCE_LABELS"], lab, "\n"); split(ENVIRON["FR_SOURCE_PATHS"], pth, "\n")
+              split(ENVIRON["FR_SOURCE_STATUS"], sts, "\n"); split(ENVIRON["FR_SOURCE_REASONS"], whys, "\n")
+              split(ENVIRON["FR_SOURCE_BYTES"], szs, "\n")
+              for (i = 1; i <= n; i++) { label_of[pth[i]] = lab[i]; status_of[lab[i]] = sts[i]; reason_of[lab[i]] = whys[i]; bytes_of[lab[i]] = szs[i] }
+              APPROVED = "src/output_batch_1.csv"; BATCH = "src/batch_9/output_batch_9.csv"
+          }
+          FILENAME != curfile {
+              if (curfile != "" && isdict) finish_dict()
+              curfile = FILENAME; cur = ""; isdict = 0
+              if (FILENAME in label_of) cur = label_of[FILENAME]
+              else if (FILENAME == ENVIRON["FR_DOE"]) cur = "DOE"
+              else if (FILENAME == ENVIRON["FR_META"]) cur = "META"
+              if (cur ~ /^case_7\/flow\/(system|0)\//) { isdict = 1; start_dict() }
+          }
+          cur == APPROVED { if (FNR == 1) ahead = $0; else if (!afound && $1 == casewant) { arow = $0; afound = 1 } next }
+          cur == BATCH { bl[FNR] = $0; bn = FNR; next }
+          cur == "DOE" { dl[FNR] = $0; dn = FNR; next }
+          cur == "META" { ml[FNR] = $0; mn = FNR; next }
+          isdict {
+              L[FNR] = $0; LS[FNR] = lst
+              if (bad[cur] == "") {
+                  if (lst + length($0) > scanlimit) bad[cur] = "the dictionary has more than " scanlimit " bytes"
+                  else if ($0 ~ /[^\t\r -~]/) bad[cur] = "the dictionary has a byte outside printable ASCII"
+                  else scan($0, FNR)
+              }
+              lst += length($0) + 1
+              next
+          }
+          END {
+              if (curfile != "" && isdict) finish_dict()
+              # The DOE row: the approved row, the Batch Workspace DOE Batch CSV, and
+              # doe_row.csv.
+              rowok = 0; rowwhy = ""
+              if (status_of[BATCH] != "OK") rowwhy = BATCH " is " status_of[BATCH] ": " reason_of[BATCH]
+              else {
+                  hdr = bl[1]; gsub(/\r/, "", hdr); nrows = 0
+                  for (i = 2; i <= bn; i++) { r = bl[i]; gsub(/\r/, "", r); if (r ~ /^[[:space:]]*$/) continue; if (!nrows) { row = r; rowno = i } nrows++ }
+                  if (nrows != 1) rowwhy = BATCH " has " nrows " data rows, not one"
+                  else rowok = 1
+              }
+              # Each CHECK and ENTRY row ends with the reference sources that its
+              # PASS or FAIL compares with, or "-".
+              doedep = "-"
+              if (status_of[APPROVED] != "OK") { doer = "NOT_VERIFIED"; doewhy = APPROVED " is " status_of[APPROVED] ": " reason_of[APPROVED] }
+              else if (!afound) { doer = "FAIL"; doewhy = APPROVED " has no Case 7 row"; doedep = APPROVED }
+              else if (status_of[BATCH] != "OK") { doer = "NOT_VERIFIED"; doewhy = rowwhy }
+              else if (bn != 2 || bl[1] != ahead || bl[2] != arow || bytes_of[BATCH] + 0 != length(ahead) + length(arow) + 2) {
+                  doer = "FAIL"; doewhy = BATCH " is not the approved header and Case 7 row of " APPROVED; doedep = APPROVED " " BATCH
+              } else if (ENVIRON["FR_DOE"] == "") { doer = "NOT_VERIFIED"; doewhy = "doe_row.csv is not retained" }
+              else {
+                  h = bl[1]; gsub(/\r/, "", h); r = bl[2]; gsub(/\r/, "", r)
+                  if (dn == 2 && dl[1] == h && dl[2] == r && ENVIRON["FR_DOE_BYTES"] + 0 == length(h) + length(r) + 2) {
+                      doer = "PASS"; doewhy = "doe_row.csv is the header and the Case 7 row of " BATCH; doedep = APPROVED " " BATCH
+                  } else { doer = "FAIL"; doewhy = "doe_row.csv differs from the header and the Case 7 row of " BATCH; doedep = BATCH }
+              }
+              print "CHECK\tDOE_ROW\t" doer "\t" field(doewhy) "\t" doedep
+              # The values that Setup derives from the row.
+              if (rowok) {
+                  nh = cells(hdr, hc); for (i = 1; i <= nh; i++) col[tolower(trim(hc[i]))] = i - 1
+                  nrc = cells(row, rc)
+                  raw_case = cell(column("Case case"))
+                  ws = cell(column("WS ws wind_speed U_ref u_ref met__WS_mps"))
+                  wd = cell(column("WD wd wind_direction ref_wind_dir relative_wind_direction met__WD_deg"))
+                  cid = sanitize(raw_case); if (cid != "NA" && cid !~ /^case_/) cid = "case_" cid
+                  if (!isfloat(ws) || !isfloat(wd)) { rowok = 0; rowwhy = "the DOE row has no numeric WS or WD" }
+                  else {
+                      wdn = normwd(wd + 0); rot = rotangle(wdn + 0)
+                      pi = atan2(0, -1); t = rot * pi / 180.0
+                      sth = sprintf("%.9f", sin(t)) + 0; cth = sprintf("%.9f", cos(t)) + 0
+                  }
+              }
+              # setup_metadata.env: the ten Setup keys, each once.
+              metadep = "-"
+              if (ENVIRON["FR_META"] == "") { metar = "NOT_VERIFIED"; metawhy = "setup_metadata.env is not retained" }
+              else if (!rowok) { metar = "NOT_VERIFIED"; metawhy = "the expected values need the DOE row: " rowwhy }
+              else {
+                  metadep = BATCH
+                  split("case_type csv_file row_number case_id case_name wd ws ws_for_setup sim_type ras_model", mk, " ")
+                  mv["case_type"] = "flow"; mv["csv_file"] = ENVIRON["FR_CSV_PATH"]; mv["row_number"] = rowno ""
+                  mv["case_id"] = cid; mv["case_name"] = cid "/flow"; mv["wd"] = wdn; mv["ws"] = ws; mv["ws_for_setup"] = ws
+                  mv["sim_type"] = "RAS"; mv["ras_model"] = "kEpsilon"
+                  metar = "PASS"; metawhy = ""; mbytes = 0
+                  if (cid != "case_7") { metar = "FAIL"; metawhy = "the DOE row is " cid ", not case_7" }
+                  for (i = 1; i <= mn; i++) {
+                      mbytes += length(ml[i]) + 1
+                      e = index(ml[i], "=")
+                      if (!e) { if (metar == "PASS") { metar = "FAIL"; metawhy = "setup_metadata.env has the line [" ml[i] "] without a key" } continue }
+                      k = substr(ml[i], 1, e - 1); mc[k]++; mval[k] = substr(ml[i], e + 1)
+                      if (!(k in mv) && metar == "PASS") { metar = "FAIL"; metawhy = "setup_metadata.env has the unknown key " k }
+                  }
+                  for (i = 1; i <= 10 && metar == "PASS"; i++) {
+                      k = mk[i]
+                      if (mc[k] != 1) { metar = "FAIL"; metawhy = "setup_metadata.env has " k " " (mc[k] + 0) " times, not once" }
+                      else if (mval[k] != mv[k]) { metar = "FAIL"; metawhy = "setup_metadata.env: " k " is [" mval[k] "], expected [" mv[k] "]" }
+                  }
+                  if (metar == "PASS" && mbytes != ENVIRON["FR_META_BYTES"] + 0) { metar = "FAIL"; metawhy = "setup_metadata.env does not end with a line end" }
+                  if (metar == "PASS") metawhy = "the ten Setup keys match the DOE row and the Setup defaults"
+              }
+              print "CHECK\tSETUP_METADATA\t" metar "\t" field(metawhy) "\t" metadep
+              # The expected entry values.
+              geook = (geo == "OK")
+              if (geook) {
+                  xmin = sprintf("%.3f", cx - 300 - 10 * 40); xmax = sprintf("%.3f", cx + 300 + 20 * 40)
+                  ymin = sprintf("%.3f", cy - 300 - 5 * 40); ymax = sprintf("%.3f", cy + 300 + 5 * 40)
+                  zmin = lz; zmax = sprintf("%.3f", uz + 8 * 40); dx = sprintf("%.3f", 1.0 * 40)
+                  s1 = xmax - xmin; nx = int(s1 / dx + 0.999999); if (nx < 1) nx = 1
+                  s1 = ymax - ymin; ny = int(s1 / dx + 0.999999); if (ny < 1) ny = 1
+                  s1 = zmax - zmin; nz = int(s1 / dx + 0.999999); if (nz < 1) nz = 1
+                  rdh = sprintf("%.3f", uz + 40); rdrext = sprintf("%.3f", 300 * 1000)
+                  ex["xMin"] = xmin; ex["xMax"] = xmax; ex["yMin"] = ymin; ex["yMax"] = ymax; ex["zMin"] = zmin; ex["zMax"] = zmax
+                  ex["nx"] = nx ""; ex["ny"] = ny ""; ex["nz"] = nz ""
+              }
+              for (n = 1; n <= nq; n++) {
+                  path = qp[n]; e = ""; ok = 1; ewhy = ""
+                  if (qk[n] == "geometry" && !geook) { ok = 0; ewhy = "the expected value needs the Setup geometry logs: " geo }
+                  else if (qk[n] == "row" && !rowok) { ok = 0; ewhy = "the expected value needs the DOE row: " rowwhy }
+                  else if (qf[n] == BM) e = ex[path]
+                  else if (path == "snap" || path == "addLayers") e = "off"
+                  else if (path ~ /point1$|origin$/) e = written("(" cx " " cy " " zmin ")")
+                  else if (path ~ /point2$|locationInMesh$/) e = written("(" cx " " cy " " rdh ")")
+                  else if (path == "geometry.refinementDomain.radius") e = written("300")
+                  else if (path == "geometry.refineGroundPlane.radius") e = written("300000.000")
+                  else if (path == "numberOfSubdomains") e = written("8")
+                  else if (path ~ /inlet[.]Uref$/) e = written(ws)
+                  else if (path ~ /_oai_/) {
+                      plant = path; sub(/^boundaryField[.]/, "", plant); sub(/_oai_.*/, "", plant)
+                      if (plant == "f18p1") e = (path ~ /_oai_a/) ? rot2d(0, -5) : rot2d(0, 5)
+                      else e = (path ~ /_oai_a/) ? rot2d(5, 0) : rot2d(-5, 0)
+                      e = written("uniform (" e " 0)")
+                  } else {
+                      patch = path; sub(/^boundaryField[.]/, "", patch); sub(/[.]value$/, "", patch)
+                      split(patch, pp, "_")
+                      prefix = "P" substr(pp[1], 5) "_" toupper(pp[2]) "_" toupper(pp[3])
+                      rawv = cell(column(prefix "__Uexit_mps"))
+                      if (rawv == "") rawv = cell(column(prefix "_U"))
+                      if (rawv == "") { ok = 0; ewhy = "the DOE row has no " prefix "__Uexit_mps value, so Setup skips the patch" }
+                      else if (rawv ~ /\(.*\)/) e = written(rawv ~ /^uniform/ ? rawv : "uniform " rawv)
+                      else if (isfloat(rawv)) e = written(sprintf("uniform (0 0 %.9g)", rawv))
+                      else { ok = 0; ewhy = "the DOE value " rawv " is not valid, so Setup skips the patch" }
+                  }
+                  f = qf[n]; outcome = "FOUND"; result = ""; why = ""; eused = "-"
+                  edep = (qk[n] == "geometry") ? "st_log sc_log" : ((qk[n] == "row") ? BATCH : "-")
+                  if (status_of[f] != "OK") { outcome = status_of[f]; why = reason_of[f] }
+                  else if (bad[f] != "") { outcome = "UNSUPPORTED"; why = bad[f] }
+                  else if (dirt[f]) { outcome = "AMBIGUOUS"; why = "the dictionary has a directive or macro at a keyword position, which can change the entry" }
+                  else {
+                      k = qkey[n]; m = split(k, kp, SUBSEP); pre = ""
+                      for (i = 0; i < m && outcome == "FOUND"; i++) {
+                          if (i) pre = (i == 1 ? kp[1] : pre SUBSEP kp[i])
+                          if ((f, pre) in pat) { outcome = "AMBIGUOUS"; why = "a pattern keyword on the entry path can also match the entry" }
+                      }
+                      if (outcome != "FOUND") { }
+                      else if (!cnt[n]) { outcome = "MISSING"; why = "the entry does not exist" }
+                      else if (cnt[n] > 1) { outcome = "DUPLICATE"; why = "the entry occurs " cnt[n] " times" }
+                      else if (mac[n]) { outcome = "UNSUPPORTED"; why = "the value uses a macro or a directive" }
+                      else if (byt[n] > entrylimit) { outcome = "UNSUPPORTED"; why = "the entry has " byt[n] " bytes, above " entrylimit }
+                  }
+                  if (outcome != "FOUND") result = "NOT_VERIFIED"
+                  else if (qm[n] == "RAW" && val[n] ~ /[<>]/) { result = "FAIL"; why = "the value is an unresolved Setup placeholder" }
+                  else if (!ok) { result = "NOT_VERIFIED"; why = ewhy }
+                  else if (qm[n] == "FOAM" ? same(val[n], e) : val[n] == e) { result = "PASS"; why = "the value equals the Setup value"; eused = edep }
+                  else { result = "FAIL"; why = "the value differs from the Setup value"; eused = edep }
+                  if (outcome == "FOUND") {
+                      printf "%s", frag[n] > (fragdir "/fragment-" n); close(fragdir "/fragment-" n)
+                      printf "ENTRY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, f, field(qp[n]), outcome, off[n], byt[n], b64(frag[n]),
+                          field(val[n]), field(ok ? e : ""), result, field(why), eused
+                  } else {
+                      printf "ENTRY\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t%s\t-\n", n, f, field(qp[n]), outcome, field(ok ? e : ""), result, field(why)
+                  }
+              }
+          }'
+
+          # fr_entry_list - FR_ENTRY_LIST: one line for each of the 57 selected entries,
+          # in the order of setup-entry-values.tsv: the dictionary, the entry path, the
+          # comparison (RAW for sed text, WORD for an exact word, FOAM for the
+          # foamDictionary-written value), and the input of the expected value.
+          fr_entry_list() {
+              local name plant device side patch
+              FR_ENTRY_LIST=""
+              for name in xMin xMax yMin yMax zMin zMax nx ny nz; do
+                  fr_entry_add system/blockMeshDict "$name" RAW geometry
+              done
+              fr_entry_add system/snappyHexMeshDict snap WORD default
+              fr_entry_add system/snappyHexMeshDict addLayers WORD default
+              fr_entry_add system/snappyHexMeshDict geometry.refinementDomain.point1 FOAM geometry
+              fr_entry_add system/snappyHexMeshDict geometry.refinementDomain.point2 FOAM geometry
+              fr_entry_add system/snappyHexMeshDict geometry.refinementDomain.radius FOAM default
+              fr_entry_add system/snappyHexMeshDict geometry.refineGroundPlane.origin FOAM geometry
+              fr_entry_add system/snappyHexMeshDict geometry.refineGroundPlane.radius FOAM default
+              fr_entry_add system/snappyHexMeshDict castellatedMeshControls.locationInMesh FOAM geometry
+              fr_entry_add system/decomposeParDict numberOfSubdomains FOAM default
+              fr_entry_add 0/U boundaryField.inlet.Uref FOAM row
+              for plant in f18p1 f18p2 f18p3; do
+                  for device in seb aex sex voc; do
+                      for side in a b; do
+                          fr_entry_add 0/U "boundaryField.${plant}_${device}_${side}.value" FOAM row
+                      done
+                  done
+                  for patch in oai_a1 oai_a2 oai_b1 oai_b2; do
+                      fr_entry_add 0/U "boundaryField.${plant}_${patch}.value" FOAM row
+                  done
+              done
+              fr_entry_add 0/k boundaryField.inlet.Uref FOAM row
+              fr_entry_add 0/epsilon boundaryField.inlet.Uref FOAM row
+          }
+
+          # fr_entry_add <dictionary> <entry> <comparison> <input> - one FR_ENTRY_LIST line.
+          fr_entry_add() {
+              FR_ENTRY_LIST+="case_7/flow/$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\n'
+          }
+
+          # fr_path_check <base> <path> - FR_ST and FR_WHY for one source path below
+          # <base>: no directory of the path and not the file may be a link, each
+          # directory must exist, and the file must be a readable regular file. FR_ST
+          # stays empty for a usable source.
+          fr_path_check() {
+              local base="$1" rel="$2" path="$1" sub="" i
+              local -a parts=()
+              FR_ST="" FR_WHY=-
+              IFS=/ read -r -a parts <<< "$rel"
+              for (( i = 0; i < ${#parts[@]}; i++ )); do
+                  path="${path}/${parts[i]}" sub="${sub:+${sub}/}${parts[i]}"
+                  if [[ -L "$path" ]]; then
+                      FR_ST=LINK FR_WHY="${sub} is a link"
+                  elif (( i < ${#parts[@]} - 1 )); then
+                      [[ -d "$path" ]] || FR_ST=MISSING FR_WHY="${sub} is not a directory"
+                  elif [[ ! -e "$path" ]]; then
+                      FR_ST=MISSING FR_WHY="${sub} does not exist"
+                  elif [[ ! -f "$path" ]]; then
+                      FR_ST=NOT_REGULAR FR_WHY="${sub} is not a regular file"
+                  elif [[ ! -r "$path" ]]; then
+                      FR_ST=UNREADABLE FR_WHY="${sub} cannot be read"
+                  fi
+                  [[ -z "$FR_ST" ]] || return 0
+              done
+              return 0
+          }
+
+          # fr_record_work <top> <files> <work> <limit> <left> <ID=path>... - the record
+          # work, in one bounded process. One stat and one sha256sum give the sizes and
+          # hashes before. Then each record in turn is read once into the work directory
+          # (a shell read and write for a text record; head for a record with a NUL byte,
+          # where a shell read ends), and one sha256sum hashes the source and the copy
+          # after. Equal SHA-256 values mean equal bytes, so the byte counts after are the
+          # counts before; a changed source gets its byte count after from stat. The copy
+          # stays only when the source and the copy agree, and each row is printed when
+          # its record is done.
+          fr_record_work() {
+              local top="$1" files="$2" work="$3" limit="$4" left="$5" pair i id rel src part line b1 h1 b2 h2 kept kb kh outcome reason
+              local content
+              local -a ids=() rels=() first=() why=() paths=() got=()
+              local -A size=() sum=()
+              shift 5
+              for pair in "$@"; do
+                  ids+=("${pair%%=*}") rels+=("${pair#*=}")
+              done
+              for i in "${!ids[@]}"; do
+                  fr_path_check "$top" "src/batch_9/${rels[i]}"
+                  first[i]="$FR_ST" why[i]="$FR_WHY"
+                  [[ -n "$FR_ST" ]] || paths+=("${top}/src/batch_9/${rels[i]}")
+              done
+              if (( ${#paths[@]} > 0 )); then
+                  while IFS= read -r line; do
+                      [[ "$line" == *" "* ]] && size[${line#* }]="${line%% *}"
+                  done < <(stat -c '%s %n' -- "${paths[@]}" 2> /dev/null)
+                  while IFS= read -r line; do
+                      [[ "$line" == *"  "* ]] && sum[${line#*  }]="${line%%  *}"
+                  done < <(sha256sum -- "${paths[@]}" 2> /dev/null)
+              fi
+              for i in "${!ids[@]}"; do
+                  id="${ids[i]}" rel="${rels[i]}" src="${top}/src/batch_9/${rels[i]}" part="${work}/record.part"
+                  b1=- h1=- b2=- h2=- kept=- kb=- kh=- outcome="${first[i]}" reason="${why[i]}"
+                  if [[ -z "$outcome" ]]; then
+                      b1="${size[$src]:--}" h1="${sum[$src]:--}"
+                      if [[ ! "$b1" =~ ^[0-9]+$ || ! "$h1" =~ ^[0-9a-f]{64}$ ]]; then
+                          outcome=READ_FAILURE reason="the record size or SHA-256 cannot be read"
+                      elif (( b1 > limit )); then
+                          outcome=OVERSIZED reason="the record has ${b1} bytes, above the ${limit}-byte record limit"
+                      elif (( b1 > left )); then
+                          outcome=OUTPUT_LIMIT reason="the record of ${b1} bytes does not fit the ${left} receipt bytes that are left"
+                      else
+                          content=""
+                          IFS= read -r -d '' content < "$src" 2> /dev/null || true
+                          if (( ${#content} == b1 )); then
+                              printf '%s' "$content" > "$part" 2> /dev/null || rm -f -- "$part"
+                          else
+                              head -c "$(( limit + 1 ))" -- "$src" > "$part" 2> /dev/null || rm -f -- "$part"
+                          fi
+                          content=""
+                      fi
+                      if [[ -n "$outcome" ]]; then
+                          :
+                      elif [[ ! -f "$part" ]] || ! mapfile -t got < <(sha256sum -- "$src" "$part" 2> /dev/null) || (( ${#got[@]} != 2 )); then
+                          outcome=READ_FAILURE reason="the record cannot be read completely"
+                      else
+                          h2="${got[0]%%  *}" kh="${got[1]%%  *}"
+                          if [[ "$h2" != "$h1" || "$kh" != "$h1" ]]; then
+                              b2="$(stat -c %s -- "$src" 2> /dev/null)" || b2=-
+                              [[ "$h2" != "$h1" ]] && reason="the record changed during the capture" || reason="the copy differs from the record"
+                              outcome=CHANGED
+                          elif { [[ -d "${files}/${rel%/*}" ]] || mkdir -p -- "${files}/${rel%/*}"; } && mv -f -- "$part" "${files}/${rel}"; then
+                              b2="$b1" kb="$b1" kept="files/${rel}" outcome=RETAINED left=$(( left - b1 ))
+                          else
+                              outcome=READ_FAILURE reason="the record copy cannot be kept" kh=-
+                          fi
+                          [[ "$outcome" == RETAINED ]] || kh=-
+                      fi
+                      [[ ! -e "$part" ]] || rm -f -- "$part"
+                  fi
+                  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$rel" "$b1" "$h1" "$b2" "$h2" "$kept" "$kb" "$kh" \
+                      "$outcome" "$reason"
+              done
+              return 0
+          }
+
+          # fr_entry_work <top> <work> <doe> <doe-bytes> <meta> <meta-bytes> <csv-path>
+          # <label=path>... - the entry work, in one bounded process. It checks and
+          # hashes the sources, reads the geometry with the Setup programs, selects the
+          # entries, and hashes the sources again and each fragment. A source that
+          # changed gives CHANGED entries. A reference source (a DOE Batch CSV or a
+          # geometry log) that changed makes each PASS or FAIL that compares with it
+          # NOT_VERIFIED, with no expected value. Prints SOURCE rows (the status and
+          # the SHA-256 before and after), and CHECK and ENTRY rows.
+          fr_entry_work() {
+              local top="$1" work="$2" doe="$3" doebytes="$4" meta="$5" metabytes="$6" csvpath="$7"
+              local pair label path size line out kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 st sum sum2 fsum rot bbox geo=-
+              local cx="" cy="" cz="" lx="" ly="" lz="" ux="" uy="" uz="" deps dep changed record
+              local labels="" paths="" statuses="" reasons="" bytes=""
+              local -A status=() reason=() file=() before=() after=() frag=() sizes=() chg=()
+              local -a ok=() fragments=() checked=()
+              shift 7
+              for pair in "$@"; do
+                  label="${pair%%=*}" path="${pair#*=}"
+                  fr_path_check "$top" "$path"
+                  status[$label]="$FR_ST" reason[$label]="$FR_WHY" file[$label]="${top}/${path}"
+                  [[ -n "$FR_ST" ]] || checked+=("${top}/${path}")
+              done
+              if (( ${#checked[@]} > 0 )); then
+                  while IFS= read -r line; do
+                      [[ "$line" == *" "* ]] && sizes[${line#* }]="${line%% *}"
+                  done < <(stat -c '%s %n' -- "${checked[@]}" 2> /dev/null)
+              fi
+              for pair in "$@"; do
+                  label="${pair%%=*}" path="${top}/${pair#*=}" size="${sizes[${top}/${pair#*=}]:--}"
+                  if [[ -z "${status[$label]}" ]]; then
+                      if [[ ! "$size" =~ ^[0-9]+$ ]]; then
+                          status[$label]=READ_FAILURE reason[$label]="the source size cannot be read"
+                      elif (( size > FR_SCAN_LIMIT )); then
+                          status[$label]=OVERSIZED reason[$label]="the source has ${size} bytes, above the ${FR_SCAN_LIMIT}-byte scan limit"
+                      else
+                          status[$label]=OK
+                          ok+=("$path")
+                      fi
+                  fi
+                  labels+="${label}"$'\n' paths+="${path}"$'\n' bytes+="${size}"$'\n'
+              done
+              if (( ${#ok[@]} > 0 )); then
+                  while IFS= read -r line; do
+                      before[${line#*  }]="${line%%  *}"
+                  done < <(sha256sum -- "${ok[@]}" 2> /dev/null)
+              fi
+              for pair in "$@"; do
+                  label="${pair%%=*}"
+                  if [[ "${status[$label]}" == OK && -z "${before[${file[$label]}]:-}" ]]; then
+                      status[$label]=READ_FAILURE reason[$label]="the source cannot be hashed"
+                  fi
+                  statuses+="${status[$label]}"$'\n' reasons+="${reason[$label]}"$'\n'
+              done
+              if [[ "${status[st_log]:-}" == OK && "${status[sc_log]:-}" == OK ]]; then
+                  rot="$(awk "$FR_ROTATION_AWK" "${file[st_log]}" 2> /dev/null)" || rot=""
+                  bbox="$(awk "$FR_BOUNDS_AWK" "${file[sc_log]}" 2> /dev/null)" || bbox=""
+                  read -r cx cy cz <<< "$rot"
+                  read -r lx ly lz ux uy uz <<< "$bbox"
+                  if [[ -n "$rot" && -n "$bbox" ]]; then
+                      geo=OK
+                  else
+                      geo="the logs give no rotation centre or no bounds"
+                  fi
+              else
+                  geo="the logs are ${status[st_log]:-MISSING} and ${status[sc_log]:-MISSING}"
+              fi
+              out="$(FR_SOURCE_LABELS="$labels" FR_SOURCE_PATHS="$paths" FR_SOURCE_STATUS="$statuses" FR_SOURCE_REASONS="$reasons" \
+                  FR_SOURCE_BYTES="$bytes" FR_DOE="$doe" FR_DOE_BYTES="$doebytes" FR_META="$meta" FR_META_BYTES="$metabytes" \
+                  FR_CSV_PATH="$csvpath" awk -v fragdir="$work" -v entrylimit="$FR_ENTRY_LIMIT" -v scanlimit="$FR_SCAN_LIMIT" \
+                  -v geo="$geo" -v cx="$cx" -v cy="$cy" -v lz="$lz" -v uz="$uz" -v casewant=7 "$FR_ENTRY_AWK" \
+                  "${ok[@]}" ${doe:+"$doe"} ${meta:+"$meta"} /dev/null)" || return 4
+              if (( ${#ok[@]} > 0 )); then
+                  while IFS= read -r line; do
+                      after[${line#*  }]="${line%%  *}"
+                  done < <(sha256sum -- "${ok[@]}" 2> /dev/null)
+              fi
+              fragments=("${work}"/fragment-[0-9]*)
+              if [[ -e "${fragments[0]}" ]]; then
+                  while IFS= read -r line; do
+                      frag[${line##*/fragment-}]="${line%%  *}"
+                  done < <(sha256sum -- "${fragments[@]}" 2> /dev/null)
+              fi
+              for pair in "$@"; do
+                  label="${pair%%=*}" st="${status[$label]}" sum=- sum2=-
+                  if [[ "$st" == OK ]]; then
+                      sum="${before[${file[$label]}]}" sum2="${after[${file[$label]}]:--}"
+                      if [[ "$sum2" != "$sum" ]]; then
+                          st=CHANGED reason[$label]="the source changed during the capture"
+                          chg[$label]="${file[$label]#"${top}/"}"
+                      fi
+                  fi
+                  status[$label]="$st"
+                  printf 'SOURCE\t%s\t%s\t%s\t%s\t%s\n' "$label" "$st" "$sum" "$sum2" "${reason[$label]}"
+              done
+              while IFS=$'\t' read -r kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12; do
+                  # The changed reference sources of a compared result.
+                  deps="$f12"
+                  [[ "$kind" != CHECK ]] || deps="$f4"
+                  changed=""
+                  for dep in $deps; do
+                      [[ -z "${chg[$dep]:-}" ]] || changed+="${changed:+ and }${chg[$dep]}"
+                  done
+                  case "$kind" in
+                      CHECK)
+                          if [[ -n "$changed" && ( "$f2" == PASS || "$f2" == FAIL ) ]]; then
+                              record=setup_metadata.env
+                              [[ "$f1" != DOE_ROW ]] || record=doe_row.csv
+                              f3="${record}: the reference ${changed} changed during the capture, so the ${f2} result has no stable reference"
+                              f2=NOT_VERIFIED
+                          fi
+                          printf 'CHECK\t%s\t%s\t%s\n' "$f1" "$f2" "$f3" ;;
+                      ENTRY)
+                          st="${status[$f2]:-MISSING}" sum=- fsum=-
+                          if [[ "$st" == OK ]]; then
+                              sum="${before[${file[$f2]}]}"
+                          fi
+                          if [[ "$f4" == FOUND && "$st" != OK ]]; then
+                              f4="$st" f5=- f6=- f7=- f8=- f10=NOT_VERIFIED f11="${reason[$f2]}"
+                          elif [[ "$f4" == FOUND ]]; then
+                              fsum="${frag[$f1]:--}"
+                              if [[ "$fsum" == - ]]; then
+                                  f4=READ_FAILURE f5=- f6=- f7=- f8=- f10=NOT_VERIFIED f11="the fragment cannot be hashed"
+                              fi
+                          fi
+                          if [[ -n "$changed" && ( "$f10" == PASS || "$f10" == FAIL ) ]]; then
+                              f11="the reference ${changed} changed during the capture, so the ${f10} result has no stable expected value"
+                              f9=- f10=NOT_VERIFIED
+                          fi
+                          printf 'ENTRY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                              "$f2" "$sum" "$f3" "$f4" "$f5" "$f6" "$f7" "$fsum" "$f8" "$f9" "$f10" "$f11"
+                          ;;
+                  esac
+              done <<< "$out"
+              return 0
+          }
+
+          # fr_inventory_work <dir> - the inventory text: every receipt file except
+          # inventory.tsv and result.env, with its byte count and SHA-256, then the
+          # total. The last line is the SHA-256 of the inventory text itself.
+          fr_inventory_work() {
+              local dir="$1" name total=0 i text sum
+              local -a names=() sizes=() sums=()
+              cd -- "$dir" || return 1
+              shopt -s globstar dotglob nullglob
+              for name in **; do
+                  if [[ -f "$name" && ! -L "$name" && "$name" != inventory.tsv && "$name" != result.env ]]; then
+                      names+=("$name")
+                  fi
+              done
+              text=$'kind\tbytes\tsha256\tpath\n'
+              if (( ${#names[@]} > 0 )); then
+                  mapfile -t sizes < <(stat -c %s -- "${names[@]}" 2> /dev/null)
+                  mapfile -t sums < <(sha256sum -- "${names[@]}" 2> /dev/null)
+                  (( ${#sizes[@]} == ${#names[@]} && ${#sums[@]} == ${#names[@]} )) || return 3
+                  for (( i = 0; i < ${#names[@]}; i++ )); do
+                      [[ "${sizes[i]}" =~ ^[0-9]+$ ]] || return 4
+                      total=$(( total + sizes[i] ))
+                      text+="FILE"$'\t'"${sizes[i]}"$'\t'"${sums[i]%% *}"$'\t'"${names[i]}"$'\n'
+                  done
+              fi
+              text+="TOTAL"$'\t'"${total}"$'\n'
+              sum="$(printf '%s' "$text" | sha256sum)" || return 5
+              printf '%sSHA256\t%s\n' "$text" "${sum%% *}"
+          }
+
+          # fr_op <label> <command> [args...] - one receipt operation through the existing
+          # _bounded helper, with the receipt operation end in place of the capture work
+          # end. The operation and its 2-second kill grace end 1 second before the
+          # receipt end. A timeout gives the capture note of _bounded.
+          fr_op() {
+              local label="$1"
+              shift
+              CAPTURE_WORK_END=$(( FR_OP_END + 10 )) _bounded 0 "functional receipt ${label}" "$@"
+          }
+
+          # fr_run <label> <function> [args...] - one receipt work function as one
+          # bounded operation, in a new bash process with only that function and
+          # fr_path_check.
+          fr_run() {
+              local label="$1" name="$2"
+              shift 2
+              fr_op "$label" bash --noprofile --norc -c "$(declare -f "$name" fr_path_check)"$'\n'"${name} \"\$@\"" "$name" "$@"
+          }
+
+          # fr_incomplete <reason> - a construction gap of the receipt itself: the
+          # first one sets INCOMPLETE and the reason, and each one is a capture note.
+          fr_incomplete() {
+              if [[ "$FR_RESULT" == COMPLETE ]]; then
+                  FR_RESULT=INCOMPLETE FR_REASON="$1"
+              fi
+              capture_note "functional receipt: $1"
+          }
+
+          # fr_text <name> <value> - set <name> to the value on one line, for a TSV or
+          # env record.
+          fr_text() {
+              local fr_text_value="${2//[$'\t\r\n']/ }"
+              printf -v "$1" '%s' "${fr_text_value:--}"
+          }
+
+          # fr_write <name> <text> - write one receipt text record, with one shell
+          # write, when it fits the record limit and the receipt budget. Otherwise
+          # nothing is written, and the gap is INCOMPLETE.
+          fr_write() {
+              local name="$1" bytes="${#2}"
+              if (( bytes > FR_FILE_LIMIT )); then
+                  fr_incomplete "${name} has ${bytes} bytes, above the ${FR_FILE_LIMIT}-byte record limit, so it is not written"
+                  return 1
+              fi
+              if (( FR_USED + bytes > FR_AVAILABLE )); then
+                  fr_incomplete "${name} of ${bytes} bytes does not fit ${FR_LIMIT_TEXT}, so it is not written"
+                  return 1
+              fi
+              if ! printf '%s' "$2" > "${FR_DIR}/${name}" 2> /dev/null; then
+                  fr_incomplete "${name} cannot be written"
+                  return 1
+              fi
+              FR_USED=$(( FR_USED + bytes ))
+              return 0
+          }
+
+          # fr_identity - identity.env: the producer, the Case, and the checkpoint.
+          fr_identity() {
+              local text name value
+              text="RECEIPT_SCHEMA=functional-receipt/1"$'\n'
+              for name in GITHUB_SHA GITHUB_REPOSITORY GITHUB_WORKFLOW GITHUB_WORKFLOW_REF GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_JOB; do
+                  fr_text value "${!name:-UNAVAILABLE}"
+                  [[ "$name" != GITHUB_SHA ]] || name=EXECUTION_SHA
+                  text+="${name}=${value}"$'\n'
+              done
+              text+="CASE_ID=case_7"$'\n'"BATCH_ID=9"$'\n'"BATCH_WORKSPACE=src/batch_9"$'\n'
+              text+="BATCH_CSV=src/batch_9/output_batch_9.csv"$'\n'"APPROVED_ROW=src/output_batch_1.csv Case 7"$'\n'
+              text+="CHECKPOINT=POST_ORCHESTRATOR_CAPTURE"$'\n'
+              text+="CHECKPOINT_NOTE=the receipt reads the records at the capture, after every Stage; it is not a post-Setup snapshot"$'\n'
+              fr_write identity.env "$text" || true
+          }
+
+          # fr_records - the six source records and records.tsv.
+          fr_records() {
+              local out status=0 i id row text
+              local -a pairs=() fields=()
+              local usable=0
+              for i in "${!FR_RECORD_IDS[@]}"; do
+                  pairs+=("${FR_RECORD_IDS[i]}=${FR_RECORD_PATHS[i]}")
+                  fr_path_check "$GITHUB_WORKSPACE" "src/batch_9/${FR_RECORD_PATHS[i]}"
+                  [[ -n "$FR_ST" ]] || usable=1
+              done
+              # When no record path can be read, the record work runs no command, so it
+              # runs in this shell.
+              if (( usable )); then
+                  out="$(fr_run records fr_record_work "$GITHUB_WORKSPACE" "${FR_DIR}/files" "$FR_WORK" "$FR_FILE_LIMIT" \
+                      "$(( FR_AVAILABLE - FR_USED ))" "${pairs[@]}")" || status=$?
+              else
+                  out="$(fr_record_work "$GITHUB_WORKSPACE" "${FR_DIR}/files" "$FR_WORK" "$FR_FILE_LIMIT" \
+                      "$(( FR_AVAILABLE - FR_USED ))" "${pairs[@]}")" || status=$?
+              fi
+              while IFS=$'\t' read -r -a fields; do
+                  (( ${#fields[@]} == 11 )) || continue
+                  id="${fields[0]}"
+                  FR_REC_ROW[$id]="$(IFS=$'\t'; printf '%s' "${fields[*]}")"
+                  FR_REC_OUTCOME[$id]="${fields[9]}" FR_REC_REASON[$id]="${fields[10]}" FR_REC_BYTES[$id]="${fields[7]}"
+                  case "${fields[9]}" in
+                      RETAINED) FR_USED=$(( FR_USED + fields[7] )) ;;
+                      OUTPUT_LIMIT) fr_incomplete "the record ${fields[1]} of ${fields[2]} bytes does not fit ${FR_LIMIT_TEXT}" ;;
+                      READ_FAILURE) fr_incomplete "the record ${fields[1]}: ${fields[10]}" ;;
+                  esac
+              done <<< "$out"
+              if (( status == 124 || status == 137 )); then
+                  fr_incomplete "the receipt time limit stopped the record work"
+              elif (( status != 0 )); then
+                  fr_incomplete "the record work ended with status ${status}"
+              fi
+              text=$'record\tsource\tsource_bytes_before\tsource_sha256_before\tsource_bytes_after\tsource_sha256_after\tretained\tretained_bytes\tretained_sha256\toutcome\treason\n'
+              for i in "${!FR_RECORD_IDS[@]}"; do
+                  id="${FR_RECORD_IDS[i]}"
+                  if [[ -z "${FR_REC_ROW[$id]:-}" ]]; then
+                      FR_REC_OUTCOME[$id]=NOT_ATTEMPTED FR_REC_REASON[$id]="the record work stopped before this record"
+                      FR_REC_ROW[$id]="${id}"$'\t'"${FR_RECORD_PATHS[i]}"$'\t-\t-\t-\t-\t-\t-\t-\tNOT_ATTEMPTED\t'"${FR_REC_REASON[$id]}"
+                  fi
+                  text+="${FR_REC_ROW[$id]}"$'\n'
+              done
+              fr_write records.tsv "$text" || true
+          }
+
+          # fr_entries - the selected Setup entries and setup-entry-values.tsv, and in
+          # FR_E_REFERENCES the identity of the four reference sources for F1: each
+          # path with its SHA-256, with CHANGED and the SHA-256 before and after, with
+          # the status that stopped its read, or with UNAVAILABLE when the entry work
+          # gave no source row.
+          fr_entries() {
+              local out status=0 csvpath doe="" meta="" text line kind rest name result why pair usable sum sum2
+              local -a sources=()
+              local -A status_of=() reason_of=() ref_status=() ref_sum=() ref_sum2=()
+              csvpath="$(cd -P -- "${GITHUB_WORKSPACE}/src/batch_9" 2> /dev/null && pwd -P)/output_batch_9.csv" || csvpath=UNAVAILABLE
+              if [[ "${FR_REC_OUTCOME[DOE_ROW]:-}" == RETAINED ]]; then
+                  doe="${FR_DIR}/files/case_7/flow/doe_row.csv"
+              fi
+              if [[ "${FR_REC_OUTCOME[SETUP_METADATA]:-}" == RETAINED ]]; then
+                  meta="${FR_DIR}/files/case_7/flow/setup_metadata.env"
+              fi
+              sources=("src/output_batch_1.csv=src/output_batch_1.csv" "src/batch_9/output_batch_9.csv=src/batch_9/output_batch_9.csv"
+                       "st_log=src/batch_9/case_7/flow/log.surfaceTransformPoints" "sc_log=src/batch_9/case_7/flow/log.surfaceCheck")
+              for name in "${FR_DICTIONARIES[@]}"; do
+                  sources+=("case_7/flow/${name}=src/batch_9/case_7/flow/${name}")
+              done
+              usable=0
+              [[ -z "$doe" && -z "$meta" ]] || usable=1
+              for pair in "${sources[@]}"; do
+                  fr_path_check "$GITHUB_WORKSPACE" "${pair#*=}"
+                  status_of[${pair%%=*}]="${FR_ST:-OK}" reason_of[${pair%%=*}]="$FR_WHY"
+                  [[ -n "$FR_ST" ]] || usable=1
+              done
+              if (( usable )); then
+                  out="$(fr_run entries fr_entry_work "$GITHUB_WORKSPACE" "$FR_WORK" "$doe" "${FR_REC_BYTES[DOE_ROW]:--}" "$meta" \
+                      "${FR_REC_BYTES[SETUP_METADATA]:--}" "$csvpath" "${sources[@]}")" || status=$?
+              else
+                  # No source can be read: each entry takes the result of its dictionary
+                  # path, and no command runs.
+                  out=""
+                  while IFS=$'\t' read -r name pair _ _; do
+                      [[ -n "$name" ]] || continue
+                      out+="ENTRY"$'\t'"${name}"$'\t-\t'"${pair}"$'\t'"${status_of[$name]}"$'\t-\t-\t-\t-\t-\t-\tNOT_VERIFIED\t'
+                      out+="${reason_of[$name]}"$'\n'
+                  done <<< "$FR_ENTRY_LIST"
+              fi
+              text=$'source\tsource_sha256\tentry\toutcome\toffset\tbytes\tentry_base64\tfragment_sha256\tvalue\texpected\tresult\treason\n'
+              while IFS= read -r line; do
+                  kind="${line%%$'\t'*}" rest="${line#*$'\t'}"
+                  case "$kind" in
+                      SOURCE)
+                          IFS=$'\t' read -r name result sum sum2 _ <<< "$rest"
+                          ref_status[$name]="$result" ref_sum[$name]="$sum" ref_sum2[$name]="$sum2"
+                          ;;
+                      CHECK)
+                          IFS=$'\t' read -r name result why <<< "$rest"
+                          FR_E_CHECK[$name]="$result" FR_E_WHY[$name]="$why"
+                          ;;
+                      ENTRY)
+                          text+="${rest}"$'\n'
+                          FR_ENTRY_ROWS+=("$rest")
+                          ;;
+                  esac
+              done <<< "$out"
+              # The approved CSV, the DOE Batch CSV, and the two geometry logs.
+              FR_E_REFERENCES=""
+              for pair in "${sources[@]:0:4}"; do
+                  name="${pair%%=*}"
+                  case "${ref_status[$name]:-UNAVAILABLE}" in
+                      OK) FR_E_REFERENCES+=" ${pair#*=}:${ref_sum[$name]}" ;;
+                      CHANGED) FR_E_REFERENCES+=" ${pair#*=}:CHANGED:${ref_sum[$name]}:${ref_sum2[$name]}" ;;
+                      *) FR_E_REFERENCES+=" ${pair#*=}:${ref_status[$name]:-UNAVAILABLE}" ;;
+                  esac
+              done
+              if (( status == 124 || status == 137 )); then
+                  fr_incomplete "the receipt time limit stopped the entry work"
+              elif (( status != 0 )); then
+                  fr_incomplete "the entry work ended with status ${status}"
+              fi
+              fr_write setup-entry-values.tsv "$text" || true
+          }
+          # fr_put <check> <result> <evidence> <reason> - one check result, on one line.
+          fr_put() {
+              local evidence="${3//[$'\t\r\n']/ }" reason="${4//[$'\t\r\n']/ }"
+              FR_C_RESULT[$1]="$2" FR_C_EVIDENCE[$1]="${evidence:--}" FR_C_REASON[$1]="${reason:--}"
+          }
+
+          # fr_combine <result>... - FAIL when a part fails, PASS when each part passes,
+          # and NOT_VERIFIED otherwise. Sets FR_COMBINED.
+          fr_combine() {
+              local part
+              FR_COMBINED=PASS
+              for part in "$@"; do
+                  if [[ "$part" == FAIL ]]; then
+                      FR_COMBINED=FAIL
+                      return 0
+                  fi
+                  [[ "$part" == PASS ]] || FR_COMBINED=NOT_VERIFIED
+              done
+              return 0
+          }
+
+          # fr_ev <path>... - FR_EVS: the evidence paths, each with its SHA-256 when it
+          # is known.
+          fr_ev() {
+              local rel
+              FR_EVS=""
+              for rel in "$@"; do
+                  FR_EVS+="${FR_EVS:+ }${rel}"
+                  [[ -z "${ev[$rel]:-}" ]] || FR_EVS+=":${ev[$rel]}"
+              done
+          }
+
+          # fr_csv_fields <line> - the fields of one quoted Stage summary row in FR_CSV.
+          fr_csv_fields() {
+              local rest="$1" quoted='^"(([^"]|"")*)"(,|$)' plain='^([^,"]*)(,|$)' value
+              FR_CSV=()
+              while :; do
+                  if [[ "$rest" =~ $quoted ]]; then
+                      value="${BASH_REMATCH[1]}"
+                      FR_CSV+=("${value//\"\"/\"}")
+                      rest="${rest:${#BASH_REMATCH[0]}}"
+                      [[ "${BASH_REMATCH[3]}" == , ]] || return 0
+                  elif [[ "$rest" =~ $plain ]]; then
+                      FR_CSV+=("${BASH_REMATCH[1]}")
+                      rest="${rest:${#BASH_REMATCH[0]}}"
+                      [[ "${BASH_REMATCH[2]}" == , ]] || return 0
+                  else
+                      return 1
+                  fi
+              done
+          }
+
+          # fr_summary_status <file> - FR_STATUS: the status of the one case_7 row of a
+          # Stage summary, or empty when the summary has not exactly one case_7 row.
+          fr_summary_status() {
+              local line count=0 status=""
+              FR_STATUS=""
+              [[ -f "$1" && ! -L "$1" ]] || return 0
+              while IFS= read -r line || [[ -n "$line" ]]; do
+                  fr_csv_fields "$line" || continue
+                  if [[ "${FR_CSV[2]:-}" == case_7 ]]; then
+                      count=$(( count + 1 )) status="${FR_CSV[5]:-}"
+                  fi
+              done < "$1"
+              (( count != 1 )) || FR_STATUS="$status"
+              return 0
+          }
+
+          # fr_vtu_file <path> - FR_V (PASS, FAIL, or NOT_VERIFIED), FR_VW, and FR_VE for
+          # one required flow VTU file, from the VTU manifest and the original tags. A
+          # MATCH needs the size, the SHA-256, and the complete original PointData tags
+          # of the same file. A required file that is absent, or a missing required
+          # PointData name, fails.
+          fr_vtu_file() {
+              local path="$1" result
+              fr_ev vtu-point-data.txt vtu-tags.txt
+              FR_VE="${FR_EVS}"
+              if (( ! manifest_complete )); then
+                  FR_V=NOT_VERIFIED FR_VW="the VTU manifest is not complete"
+                  return 0
+              fi
+              case "${vsec[$path]:-0}" in
+                  0) FR_V=FAIL FR_VW="the VTU manifest has no ${path}, so the file does not exist"; return 0 ;;
+                  1) ;;
+                  *) FR_V=NOT_VERIFIED FR_VW="the VTU manifest has ${path} ${vsec[$path]} times"; return 0 ;;
+              esac
+              result="${vres[$path]:-UNAVAILABLE}"
+              FR_VE+=" ${path} sha256 ${vsha[$path]:-UNAVAILABLE} bytes ${vbytes[$path]:-UNAVAILABLE}"
+              case "$result" in
+                  MISSING_FILE|MISSING_REQUIRED_FIELDS|SOURCE_POINTDATA_ABSENT)
+                      FR_V=FAIL FR_VW="${path} is ${result}; observed PointData [${vobs[$path]:-}]" ;;
+                  MATCH)
+                      if [[ "${vbytes[$path]:-}" == 0 ]]; then
+                          FR_V=FAIL FR_VW="${path} has zero bytes"
+                      elif [[ ! "${vbytes[$path]:-}" =~ ^[1-9][0-9]*$ || ! "${vsha[$path]:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                          FR_V=NOT_VERIFIED FR_VW="${path} has no complete size and SHA-256"
+                      elif [[ "${vtag[$path]:-}" != COMPLETE || "${thead[$path]:-0}" != 1 || "${tsha[$path]:-}" != "${vsha[$path]}" ||
+                              "${tend[$path]:-}" != COMPLETE || -z "${tpd[$path]:-}" ]]; then
+                          FR_V=NOT_VERIFIED FR_VW="the original PointData tag record of ${path} is not complete"
+                      else
+                          FR_V=PASS FR_VW="${path} has the required PointData names and its complete original tags"
+                      fi ;;
+                  *) FR_V=NOT_VERIFIED FR_VW="${path} is ${result}" ;;
+              esac
+              return 0
+          }
+
+          # fr_record_text <record> <path> - FR_TEXT: all retained bytes of one text
+          # record below files/. A shell read ends at a NUL byte, so a NUL byte gives
+          # status 1, and a read that does not give the retained byte count gives
+          # status 2. FR_TEXT_WHY then names the gap, and FR_TEXT stays empty: no
+          # prefix is used.
+          fr_record_text() {
+              local fr_record_file="${FR_DIR}/files/${2}" fr_record_bytes="${FR_REC_BYTES[$1]:-}" fr_record_status=2
+              FR_TEXT="" FR_TEXT_WHY=-
+              if [[ -f "$fr_record_file" && ! -L "$fr_record_file" ]]; then
+                  fr_record_status=0
+                  IFS= read -r -d '' FR_TEXT 2> /dev/null < "$fr_record_file" || fr_record_status=$?
+              fi
+              if (( fr_record_status == 0 )); then
+                  FR_TEXT_WHY="${2##*/} has a NUL byte after ${#FR_TEXT} of its ${fr_record_bytes:-UNAVAILABLE} bytes"
+                  FR_TEXT=""
+                  return 1
+              fi
+              if (( fr_record_status != 1 )) || [[ ! "$fr_record_bytes" =~ ^(0|[1-9][0-9]*)$ ]] || (( ${#FR_TEXT} != fr_record_bytes )); then
+                  FR_TEXT_WHY="the retained ${2##*/} gives ${#FR_TEXT} of its ${fr_record_bytes:-UNAVAILABLE} bytes"
+                  FR_TEXT=""
+                  return 2
+              fi
+              return 0
+          }
+
+          # fr_signature - the post-processing signature: SIG_STATE (MISSING, UNREAD,
+          # FAIL, or OK), SIG_WHY, and SIG_TIME, the flow_latest value of one
+          # flow_latest line. UNREAD is a retained record that a read cannot give
+          # completely. A NUL byte fails, and no part of that record is parsed.
+          fr_signature() {
+              local content="" line key name expected order read_status=0
+              local -a lines=() keys=()
+              local -A count=() value=()
+              SIG_STATE=OK SIG_WHY=- SIG_TIME=""
+              if [[ "${FR_REC_OUTCOME[POST_SIGNATURE]:-}" != RETAINED ]]; then
+                  SIG_STATE=MISSING SIG_WHY="post_processing.complete is ${FR_REC_OUTCOME[POST_SIGNATURE]:-UNAVAILABLE}: ${FR_REC_REASON[POST_SIGNATURE]:--}"
+                  return 0
+              fi
+              fr_record_text POST_SIGNATURE case_7/vtk/post_processing.complete || read_status=$?
+              if (( read_status == 1 )); then
+                  SIG_STATE=FAIL SIG_WHY="$FR_TEXT_WHY"
+                  return 0
+              elif (( read_status != 0 )); then
+                  SIG_STATE=UNREAD SIG_WHY="$FR_TEXT_WHY"
+                  return 0
+              fi
+              content="$FR_TEXT"
+              mapfile -t lines <<< "${content%$'\n'}"
+              for line in "${lines[@]}"; do
+                  key="${line%%=*}"
+                  if [[ "$line" == flow_latest=* ]]; then
+                      count[flow_latest]=$(( ${count[flow_latest]:-0} + 1 ))
+                  fi
+                  [[ "$line" == *=* ]] || continue
+                  value[$key]="${line#*=}"
+              done
+              if [[ "${count[flow_latest]:-0}" == 1 ]]; then
+                  SIG_TIME="${value[flow_latest]:-}"
+              fi
+              count=()
+              if [[ "$content" != *$'\n' ]]; then
+                  SIG_STATE=FAIL SIG_WHY="the signature does not end with a line end"
+                  return 0
+              fi
+              for line in "${lines[@]}"; do
+                  if [[ "$line" != *=* ]]; then
+                      SIG_STATE=FAIL SIG_WHY="the signature line [${line}] has no key"
+                      return 0
+                  fi
+                  key="${line%%=*}"
+                  if [[ " ${FR_SIGNATURE_KEYS[*]} " != *" ${key} "* ]]; then
+                      SIG_STATE=FAIL SIG_WHY="the signature has the unknown key ${key}"
+                      return 0
+                  fi
+                  count[$key]=$(( ${count[$key]:-0} + 1 ))
+                  keys+=("$key")
+              done
+              for name in "${FR_SIGNATURE_KEYS[@]}"; do
+                  if (( ${count[$name]:-0} > 1 )); then
+                      SIG_STATE=FAIL SIG_WHY="the signature has the key ${name} ${count[$name]} times"
+                      return 0
+                  fi
+                  if (( ${count[$name]:-0} == 0 )); then
+                      SIG_STATE=FAIL SIG_WHY="the signature has no ${name} line"
+                      return 0
+                  fi
+              done
+              order="${FR_SIGNATURE_KEYS[*]}"
+              if [[ "${keys[*]}" != "$order" ]]; then
+                  SIG_STATE=FAIL SIG_WHY="the signature keys are not in the order ${order}"
+                  return 0
+              fi
+              for name in transport_ready transport_times scalar_field flow_zero_fields flow_result_fields vtu_point_data; do
+                  case "$name" in
+                      transport_ready) expected=0 ;;
+                      transport_times) expected="" ;;
+                      scalar_field) expected="${SCALAR_FIELD:-T}" ;;
+                      flow_zero_fields) expected="(U p wallDistance)" ;;
+                      flow_result_fields) expected="(U p)" ;;
+                      vtu_point_data) expected=included ;;
+                  esac
+                  if [[ "${value[$name]:-}" != "$expected" ]]; then
+                      SIG_STATE=FAIL SIG_WHY="the signature has ${name}=${value[$name]:-}, not ${name}=${expected}"
+                      return 0
+                  fi
+              done
+              return 0
+          }
+
+          # fr_checks - F1 to F10 and checks.tsv. Each check names its evidence; a check
+          # that has no sufficient proof stays NOT_VERIFIED.
+          fr_checks() {
+              local metric="${EVIDENCE_DIR}/m3-mean-speed" line key status=0 out rel cur="" text check content token
+              local m_avail=0 m_dup=0 m_same=0 m_foreign=0 m_known=0 tc="" tr="" tr_ok=0 tr_why="" t_known=0 manifest_complete=0
+              local tr_unread=0 read_status=0
+              local doe_r doe_w meta_r meta_w ent_r=PASS ent_w="" model_r model_w fs ms fails="" notpass="" missing="" n=0 differ text2 part
+              local re_head='^== VTU_TAGS path=(.*) sha256=([^ ]*)$' re_end='^== VTU_TAGS_END path=(.*) tag_evidence=([A-Z_]+)$'
+              local -A ev=() mr=() vsec=() vbytes=() vsha=() vres=() vtag=() vobs=() thead=() tsha=() tend=() tpd=() mc=()
+              local -a files=() controls=() fields=()
+              # The SHA-256 of each earlier evidence file that a check names.
+              for rel in vtu-point-data.txt vtu-tags.txt summaries/run_mesh_cases_summary.csv summaries/run_flow_cases_summary.csv \
+                         stage-logs/_mesh_logs/case_7_flow.log stage-logs/_flow_logs/case_7_flow.log m3-mean-speed/result.env \
+                         "${FR_METRIC_FILES[@]/#/m3-mean-speed/}"; do
+                  if [[ -f "${EVIDENCE_DIR}/${rel}" && ! -L "${EVIDENCE_DIR}/${rel}" ]]; then
+                      files+=("${EVIDENCE_DIR}/${rel}")
+                  fi
+              done
+              for rel in "${metric}"/logs/*-controls.out; do
+                  if [[ -f "$rel" && ! -L "$rel" ]]; then
+                      controls+=("$rel")
+                      files+=("$rel")
+                  fi
+              done
+              if (( ${#files[@]} > 0 )); then
+                  out="$(fr_op "evidence hashes" sha256sum -- "${files[@]}")" || status=$?
+                  if (( status != 0 )); then
+                      fr_incomplete "the evidence hashes did not complete (status ${status})"
+                  fi
+                  while IFS= read -r line; do
+                      [[ "$line" == *"  ${EVIDENCE_DIR}/"* ]] || continue
+                      ev[${line#*"  ${EVIDENCE_DIR}/"}]="${line%%  *}"
+                  done <<< "$out"
+              fi
+              # The collection record of this producer.
+              [[ -n "${GITHUB_SHA:-}" && -n "${GITHUB_RUN_ID:-}" ]] && m_known=1
+              if [[ -f "${metric}/result.env" && ! -L "${metric}/result.env" ]]; then
+                  m_avail=1
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      [[ "$line" == *=* ]] || continue
+                      key="${line%%=*}"
+                      [[ -z "${mr[$key]+x}" ]] || m_dup=1
+                      mr[$key]="${line#*=}"
+                  done < "${metric}/result.env"
+              fi
+              if (( m_avail && ! m_dup && m_known )); then
+                  if [[ "${mr[MAIN_SHA]:-}" == "$GITHUB_SHA" && "${mr[RUN_ID]:-}" == "$GITHUB_RUN_ID" ]]; then
+                      m_same=1
+                  else
+                      m_foreign=1
+                  fi
+              fi
+              if (( m_same )) && [[ "${mr[SELECTED_TIME]:-}" =~ $FR_TIME_RE ]]; then
+                  tc="${mr[SELECTED_TIME]}"
+              fi
+              # The latest-time record: all its retained bytes. A NUL byte fails; a
+              # read that does not give all retained bytes is a receipt gap.
+              if [[ "${FR_REC_OUTCOME[LATEST_TIME]:-}" == RETAINED ]]; then
+                  read_status=0
+                  fr_record_text LATEST_TIME case_7/vtk/flow_latest_time.txt || read_status=$?
+                  content="$FR_TEXT" token="${FR_TEXT%$'\n'}"
+                  if (( read_status == 2 )); then
+                      tr_unread=1 tr_why="$FR_TEXT_WHY"
+                      fr_incomplete "the latest-time record cannot be read completely: ${FR_TEXT_WHY}"
+                  elif (( read_status == 0 && ${#content} <= FR_TIME_LIMIT )) &&
+                          [[ "$content" == *$'\n' && "$token" != *$'\n'* && "$token" =~ $FR_TIME_RE ]]; then
+                      tr_ok=1 tr="$token"
+                  else
+                      tr_why="the latest-time record is not one numeric time and one line end in at most ${FR_TIME_LIMIT} bytes"
+                      (( read_status == 0 )) || tr_why+=": ${FR_TEXT_WHY}"
+                  fi
+              else
+                  tr_why="flow_latest_time.txt is ${FR_REC_OUTCOME[LATEST_TIME]:-UNAVAILABLE}: ${FR_REC_REASON[LATEST_TIME]:--}"
+              fi
+              fr_signature
+              if [[ "$SIG_STATE" == UNREAD ]]; then
+                  fr_incomplete "the signature cannot be read completely: ${SIG_WHY}"
+              fi
+              # The VTU manifest and the original tags of the earlier VTU item.
+              if [[ -f "${EVIDENCE_DIR}/vtu-point-data.txt" && ! -L "${EVIDENCE_DIR}/vtu-point-data.txt" ]]; then
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      case "$line" in
+                          VTU_PATH=*) cur="${line#VTU_PATH=}"; vsec[$cur]=$(( ${vsec[$cur]:-0} + 1 )) ;;
+                          VTU_BYTES=*) [[ -z "$cur" ]] || vbytes[$cur]="${line#*=}" ;;
+                          VTU_SHA256=*) [[ -z "$cur" ]] || vsha[$cur]="${line#*=}" ;;
+                          VTU_OBSERVED_FIELDS=*) [[ -z "$cur" ]] || vobs[$cur]="${line#*=}" ;;
+                          VTU_REQUIRED_FIELDS_RESULT=*) [[ -z "$cur" ]] || vres[$cur]="${line#*=}" ;;
+                          VTU_TAG_EVIDENCE=*) [[ -z "$cur" ]] || vtag[$cur]="${line#*=}" ;;
+                          VTU_EVIDENCE=*) manifest_complete=1 ;;
+                      esac
+                  done < "${EVIDENCE_DIR}/vtu-point-data.txt"
+              fi
+              cur=""
+              if [[ -f "${EVIDENCE_DIR}/vtu-tags.txt" && ! -L "${EVIDENCE_DIR}/vtu-tags.txt" ]]; then
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      if [[ "$line" =~ $re_head ]]; then
+                          cur="${BASH_REMATCH[1]}"
+                          thead[$cur]=$(( ${thead[$cur]:-0} + 1 )) tsha[$cur]="${BASH_REMATCH[2]}"
+                      elif [[ "$line" =~ $re_end ]]; then
+                          tend[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}" cur=""
+                      elif [[ -n "$cur" && "$line" == "TAG "*" element=PointData "* ]]; then
+                          tpd[$cur]=1
+                      fi
+                  done < "${EVIDENCE_DIR}/vtu-tags.txt"
+              fi
+              # The latest time is known when the record, the signature, and the
+              # collector of this producer give the same time.
+              if (( tr_ok )) && [[ -n "$SIG_TIME" && -n "$tc" && "$tr" == "$SIG_TIME" && "$tr" == "$tc" && "$tr" =~ ^[0-9A-Za-z._-]+$ ]]; then
+                  t_known=1
+              fi
+
+              # F1: the Setup records, the selected entries, and the model identity.
+              if [[ "${FR_REC_OUTCOME[DOE_ROW]:-}" != RETAINED ]]; then
+                  doe_r=NOT_VERIFIED doe_w="doe_row.csv is ${FR_REC_OUTCOME[DOE_ROW]:-UNAVAILABLE}: ${FR_REC_REASON[DOE_ROW]:--}"
+              else
+                  doe_r="${FR_E_CHECK[DOE_ROW]:-NOT_VERIFIED}" doe_w="${FR_E_WHY[DOE_ROW]:-the entry work gave no DOE row result}"
+              fi
+              if [[ "${FR_REC_OUTCOME[SETUP_METADATA]:-}" != RETAINED ]]; then
+                  meta_r=NOT_VERIFIED meta_w="setup_metadata.env is ${FR_REC_OUTCOME[SETUP_METADATA]:-UNAVAILABLE}: ${FR_REC_REASON[SETUP_METADATA]:--}"
+              else
+                  meta_r="${FR_E_CHECK[SETUP_METADATA]:-NOT_VERIFIED}" meta_w="${FR_E_WHY[SETUP_METADATA]:-the entry work gave no metadata result}"
+              fi
+              for line in "${FR_ENTRY_ROWS[@]}"; do
+                  IFS=$'\t' read -r -a fields <<< "$line"
+                  n=$(( n + 1 ))
+                  case "${fields[10]:-}" in
+                      PASS) ;;
+                      FAIL)
+                          if [[ "$ent_r" != FAIL ]]; then
+                              ent_r=FAIL ent_w="${fields[0]} ${fields[2]}: ${fields[11]:--}; value [${fields[8]:--}], expected [${fields[9]:--}]"
+                          fi ;;
+                      *)
+                          if [[ "$ent_r" == PASS ]]; then
+                              ent_r=NOT_VERIFIED ent_w="${fields[0]} ${fields[2]} is ${fields[3]:--}: ${fields[11]:--}"
+                          fi ;;
+                  esac
+              done
+              if [[ "$ent_r" == PASS ]] && (( n != FR_ENTRY_COUNT )); then
+                  ent_r=NOT_VERIFIED ent_w="the entry work gave ${n} of ${FR_ENTRY_COUNT} entries"
+              fi
+              if (( ! m_avail || m_dup || ! m_known )); then
+                  model_r=NOT_VERIFIED model_w="no collection record of this producer gives the model"
+              elif (( m_foreign )); then
+                  model_r=NOT_VERIFIED model_w="the collection record comes from another producer"
+              elif (( ${#controls[@]} != 1 )); then
+                  model_r=NOT_VERIFIED model_w="the collection record has ${#controls[@]} controls records, not one"
+              else
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      [[ "$line" == *=* ]] && mc[${line%%=*}]="${line#*=}"
+                  done < "${controls[0]}"
+                  if [[ "${mc[SIMULATION_TYPE]:-}" != RAS || "${mc[RAS_MODEL]:-}" != kEpsilon ]]; then
+                      model_r=FAIL model_w="the collector controls record gives [${mc[SIMULATION_TYPE]:-}] [${mc[RAS_MODEL]:-}], not RAS kEpsilon"
+                  elif ! grep -q $'^constant/turbulenceProperties\t' "${metric}/source-before.tsv" 2> /dev/null; then
+                      model_r=NOT_VERIFIED model_w="the collector source manifest has no constant/turbulenceProperties identity"
+                  else
+                      model_r=PASS model_w="the collector controls record gives RAS kEpsilon"
+                  fi
+              fi
+              fr_combine "$doe_r" "$meta_r" "$ent_r" "$model_r"
+              case "$FR_COMBINED" in
+                  PASS) text="doe_row.csv, setup_metadata.env, the ${FR_ENTRY_COUNT} selected entries, and the model identity match the approved row and the Setup defaults" ;;
+                  *)
+                      # Each part that does not pass: the parts with the combined
+                      # result first.
+                      text=""
+                      for part in "$FR_COMBINED" NOT_VERIFIED; do
+                          for check in "${doe_r}|${doe_w}" "${meta_r}|${meta_w}" "${ent_r}|${ent_w}" "${model_r}|${model_w}"; do
+                              if [[ "${check%%|*}" == "$part" ]]; then
+                                  text+="${text:+; }${check#*|}"
+                              fi
+                          done
+                          [[ "$FR_COMBINED" != NOT_VERIFIED ]] || break
+                      done ;;
+              esac
+              fr_ev m3-mean-speed/source-before.tsv
+              fr_put F1 "$FR_COMBINED" "functional-receipt/records.tsv functional-receipt/setup-entry-values.tsv ${FR_EVS} ${controls[0]:+${controls[0]#"${EVIDENCE_DIR}/"}}${FR_E_REFERENCES}" "$text"
+
+              # F2: the latest-time record and the collector-selected time.
+              if [[ "${FR_REC_OUTCOME[LATEST_TIME]:-}" != RETAINED ]]; then
+                  fr_put F2 NOT_VERIFIED "" "$tr_why"
+              elif (( tr_unread )); then
+                  fr_put F2 NOT_VERIFIED "functional-receipt/files/case_7/vtk/flow_latest_time.txt" "$tr_why"
+              elif (( ! tr_ok )); then
+                  fr_put F2 FAIL "functional-receipt/files/case_7/vtk/flow_latest_time.txt" "$tr_why"
+              elif [[ "$tr" =~ ^0+([.]0+)?$ ]]; then
+                  fr_put F2 FAIL "functional-receipt/files/case_7/vtk/flow_latest_time.txt" "the latest-time record is ${tr}, which is not a result time"
+              elif (( m_foreign )); then
+                  fr_put F2 NOT_VERIFIED "" "the collection record comes from another producer"
+              elif [[ -z "$tc" ]]; then
+                  fr_put F2 NOT_VERIFIED "" "no collector-selected time of this producer is available"
+              elif [[ "$tr" != "$tc" ]]; then
+                  fr_ev m3-mean-speed/result.env
+                  fr_put F2 FAIL "functional-receipt/files/case_7/vtk/flow_latest_time.txt ${FR_EVS}" \
+                      "the latest-time record ${tr} differs from the collector-selected time ${tc}"
+              else
+                  fr_ev m3-mean-speed/result.env
+                  fr_put F2 PASS "functional-receipt/files/case_7/vtk/flow_latest_time.txt ${FR_EVS}" \
+                      "the latest-time record is ${tr} and one line end, and it equals the collector-selected time"
+              fi
+
+              # F3: the seven signature lines.
+              if [[ "$SIG_STATE" == MISSING ]]; then
+                  fr_put F3 NOT_VERIFIED "" "$SIG_WHY"
+              elif [[ "$SIG_STATE" == UNREAD ]]; then
+                  fr_put F3 NOT_VERIFIED "functional-receipt/files/case_7/vtk/post_processing.complete" "$SIG_WHY"
+              elif [[ "$SIG_STATE" == FAIL ]]; then
+                  fr_put F3 FAIL "functional-receipt/files/case_7/vtk/post_processing.complete" "$SIG_WHY"
+              elif (( tr_ok )) && [[ "$tr" != "$SIG_TIME" ]]; then
+                  fr_put F3 FAIL "functional-receipt/files/case_7/vtk/post_processing.complete" \
+                      "the signature has flow_latest=${SIG_TIME}, but the latest-time record has ${tr}"
+              elif [[ -n "$tc" && "$tc" != "$SIG_TIME" ]]; then
+                  fr_put F3 FAIL "functional-receipt/files/case_7/vtk/post_processing.complete" \
+                      "the signature has flow_latest=${SIG_TIME}, but the collector selected ${tc}"
+              elif (( ! tr_ok )); then
+                  fr_put F3 NOT_VERIFIED "" "flow_latest is not verified: ${tr_why}"
+              elif [[ -z "$tc" ]]; then
+                  fr_put F3 NOT_VERIFIED "" "flow_latest is not verified: no collector-selected time of this producer is available"
+              else
+                  fr_put F3 PASS "functional-receipt/files/case_7/vtk/post_processing.complete" \
+                      "the seven signature lines are exact for flow_latest=${SIG_TIME}"
+              fi
+
+              # F4: no payload-readback witness exists, so F4 is never PASS here.
+              if (( ! manifest_complete )); then
+                  fr_put F4 NOT_VERIFIED "" "the VTU manifest is not complete"
+              else
+                  missing=""
+                  for rel in case_7/vtk/flow_0.vtu; do
+                      if [[ "${vsec[$rel]:-0}" == 0 || "${vres[$rel]:-}" == MISSING_FILE ]]; then missing+=" ${rel}"; fi
+                  done
+                  if (( t_known )); then
+                      rel="case_7/vtk/flow_latest_${tr}.vtu"
+                      if [[ "${vsec[$rel]:-0}" == 0 || "${vres[$rel]:-}" == MISSING_FILE ]]; then missing+=" ${rel}"; fi
+                  fi
+                  fr_ev vtu-point-data.txt
+                  text="${FR_EVS} case_7/vtk/flow_0.vtu sha256 ${vsha[case_7/vtk/flow_0.vtu]:-UNAVAILABLE}"
+                  if (( t_known )); then
+                      text+=" case_7/vtk/flow_latest_${tr}.vtu sha256 ${vsha[case_7/vtk/flow_latest_${tr}.vtu]:-UNAVAILABLE}"
+                  fi
+                  if [[ -n "$missing" ]]; then
+                      fr_put F4 FAIL "$text" "the required flow VTU files are missing:${missing}"
+                  elif (( t_known )); then
+                      fr_put F4 NOT_VERIFIED "$text" "no full-data VTU consumer or payload-readback witness exists; a PointData MATCH and a whole-file SHA-256 prove the metadata and the byte identity only"
+                  else
+                      fr_put F4 NOT_VERIFIED "$text" "no full-data VTU consumer or payload-readback witness exists, and the latest flow time is not verified"
+                  fi
+              fi
+
+              # F5: time-0 PointData U p wallDistance.
+              fr_vtu_file case_7/vtk/flow_0.vtu
+              fr_put F5 "$FR_V" "$FR_VE" "$FR_VW"
+
+              # F6: latest PointData U p, with one latest time in the file name, the
+              # signature, the record, and the collector.
+              differ=0
+              if (( tr_ok )) && [[ -n "$SIG_TIME" && "$tr" != "$SIG_TIME" ]]; then
+                  differ=1
+              fi
+              if (( tr_ok )) && [[ -n "$tc" && "$tr" != "$tc" ]]; then
+                  differ=1
+              fi
+              if [[ -n "$SIG_TIME" && -n "$tc" && "$SIG_TIME" != "$tc" ]]; then
+                  differ=1
+              fi
+              if (( differ )); then
+                  fr_put F6 FAIL "" "the latest times differ: record ${tr:--}, signature ${SIG_TIME:--}, collector ${tc:--}"
+              elif (( ! t_known )); then
+                  fr_put F6 NOT_VERIFIED "" "the latest time needs the record, the signature, and the collector time of this producer: record ${tr:--}, signature ${SIG_TIME:--}, collector ${tc:--}"
+              else
+                  fr_vtu_file "case_7/vtk/flow_latest_${tr}.vtu"
+                  fr_put F6 "$FR_V" "$FR_VE" "$FR_VW"
+              fi
+
+              # F7: the collection result of this producer.
+              if (( ! m_avail )); then
+                  fr_put F7 NOT_VERIFIED "" "the collection record m3-mean-speed/result.env is not available"
+              elif (( m_dup )); then
+                  fr_put F7 NOT_VERIFIED "" "the collection record has a duplicate key"
+              elif (( ! m_known )); then
+                  fr_put F7 NOT_VERIFIED "" "the producer identity of the receipt is not available"
+              elif (( m_foreign )); then
+                  fr_ev m3-mean-speed/result.env
+                  fr_put F7 FAIL "${FR_EVS}" \
+                      "the collection record names another producer: MAIN_SHA ${mr[MAIN_SHA]:-}, RUN_ID ${mr[RUN_ID]:-}"
+              elif [[ "${mr[MEAN_SPEED_VERDICT]:-}" != AVAILABLE ]]; then
+                  fr_ev m3-mean-speed/result.env
+                  fr_put F7 NOT_VERIFIED "${FR_EVS}" \
+                      "the collection is ${mr[MEAN_SPEED_VERDICT]:-UNAVAILABLE}: ${mr[MEAN_SPEED_REASON_CODE]:-UNAVAILABLE}"
+              else
+                  text=""
+                  [[ "${mr[MEAN_SPEED_REASON_CODE]:-}" == NONE ]] || text="MEAN_SPEED_REASON_CODE is not NONE"
+                  [[ -n "$text" || "${mr[MEAN_SPEED_UNIT]:-}" == m/s ]] || text="MEAN_SPEED_UNIT is not m/s"
+                  [[ -n "$text" || "${mr[SELECTED_TIME]:-}" =~ $FR_TIME_RE ]] || text="SELECTED_TIME is not a numeric time"
+                  [[ -n "$text" || "${mr[OUTPUT_TIME]:-}" == "${mr[SELECTED_TIME]:-}" ]] ||
+                      text="OUTPUT_TIME ${mr[OUTPUT_TIME]:-} differs from SELECTED_TIME ${mr[SELECTED_TIME]:-}"
+                  [[ -n "$text" || "${mr[OUTPUT_REGION]:-}" == "all region0" ]] || text="OUTPUT_REGION is not all region0"
+                  [[ -n "$text" || "${mr[OUTPUT_FIELD]:-}" == "volAverage(m3MagU)" ]] || text="OUTPUT_FIELD is not volAverage(m3MagU)"
+                  [[ -n "$text" || "${mr[OUTPUT_CELLS]:-}" =~ ^[1-9][0-9]*$ ]] || text="OUTPUT_CELLS is not a positive count"
+                  [[ -n "$text" || ( -n "${mr[OUTPUT_VOLUME]:-}" && "${mr[OUTPUT_VOLUME]}" != UNAVAILABLE ) ]] || text="OUTPUT_VOLUME is not available"
+                  [[ -n "$text" || ( -n "${mr[MEAN_SPEED_VALUE]:-}" && "${mr[MEAN_SPEED_VALUE]}" != UNAVAILABLE ) ]] || text="MEAN_SPEED_VALUE is not available"
+                  [[ -n "$text" || "${mr[CLEANUP_RESULT]:-}" == REMOVED ]] || text="CLEANUP_RESULT is not REMOVED"
+                  if [[ -n "$text" ]]; then
+                      fr_ev m3-mean-speed/result.env
+                      fr_put F7 FAIL "${FR_EVS}" "the available collection record is not consistent: ${text}"
+                  elif [[ -z "${ev[m3-mean-speed/output/volFieldValue.dat]:-}" ]]; then
+                      fr_ev m3-mean-speed/result.env
+                      fr_put F7 NOT_VERIFIED "${FR_EVS}" "the retained output copy has no SHA-256"
+                  elif [[ "${ev[m3-mean-speed/output/volFieldValue.dat]}" != "${mr[OUTPUT_SHA256]:-}" ]]; then
+                      fr_ev m3-mean-speed/result.env m3-mean-speed/output/volFieldValue.dat
+                      fr_put F7 FAIL "${FR_EVS}" \
+                          "the retained output copy differs from OUTPUT_SHA256"
+                  else
+                      fr_ev m3-mean-speed/result.env m3-mean-speed/output/volFieldValue.dat
+                      fr_put F7 PASS "${FR_EVS}" \
+                          "the collection of time ${mr[SELECTED_TIME]} is AVAILABLE: ${mr[MEAN_SPEED_VALUE]} m/s over ${mr[OUTPUT_CELLS]} cells"
+                  fi
+              fi
+
+              # F8: the two completion markers and their Stage summaries and logs.
+              fr_summary_status "${EVIDENCE_DIR}/summaries/run_flow_cases_summary.csv"
+              fs="$FR_STATUS"
+              fr_summary_status "${EVIDENCE_DIR}/summaries/run_mesh_cases_summary.csv"
+              ms="$FR_STATUS"
+              text="functional-receipt/files/case_7/flow/flow.marker functional-receipt/files/case_7/flow/restart.marker"
+              fr_ev summaries/run_flow_cases_summary.csv summaries/run_mesh_cases_summary.csv stage-logs/_flow_logs/case_7_flow.log stage-logs/_mesh_logs/case_7_flow.log
+              text+=" ${FR_EVS}"
+              if [[ "${FR_REC_OUTCOME[FLOW_MARKER]:-}" != RETAINED ]]; then
+                  fr_put F8 NOT_VERIFIED "" "flow.marker is ${FR_REC_OUTCOME[FLOW_MARKER]:-UNAVAILABLE}: ${FR_REC_REASON[FLOW_MARKER]:--}"
+              elif [[ "${FR_REC_OUTCOME[RESTART_MARKER]:-}" != RETAINED ]]; then
+                  fr_put F8 NOT_VERIFIED "" "restart.marker is ${FR_REC_OUTCOME[RESTART_MARKER]:-UNAVAILABLE}: ${FR_REC_REASON[RESTART_MARKER]:--}"
+              elif [[ -z "$fs" || -z "$ms" ]]; then
+                  fr_put F8 NOT_VERIFIED "$text" "the flow and the mesh Stage summaries need one case_7 row each"
+              elif [[ "$fs" != solved && "$fs" != continued ]]; then
+                  fr_put F8 FAIL "$text" "flow.marker exists, but the flow Stage summary reports [${fs}] for case_7"
+              elif [[ "$ms" != meshed && "$ms" != continued ]]; then
+                  fr_put F8 FAIL "$text" "restart.marker exists, but the mesh Stage summary reports [${ms}] for case_7"
+              elif [[ -z "${ev[stage-logs/_flow_logs/case_7_flow.log]:-}" || -z "${ev[stage-logs/_mesh_logs/case_7_flow.log]:-}" ]]; then
+                  fr_put F8 NOT_VERIFIED "$text" "the flow and the mesh Stage logs of case_7 are not in the evidence"
+              else
+                  fr_put F8 PASS "$text" "flow.marker (${FR_REC_BYTES[FLOW_MARKER]:-} bytes) and restart.marker (${FR_REC_BYTES[RESTART_MARKER]:-} bytes) are retained; the flow Stage reports ${fs} and the mesh Stage ${ms} for case_7"
+              fi
+
+              # F9: the collector configuration and the source and snapshot integrity.
+              missing=""
+              for rel in "${FR_METRIC_FILES[@]}"; do
+                  [[ -n "${ev[m3-mean-speed/${rel}]:-}" ]] || missing+=" ${rel}"
+              done
+              (( ${#controls[@]} == 1 )) || missing+=" logs/*-controls.out"
+              fr_ev m3-mean-speed/result.env "${FR_METRIC_FILES[@]/#/m3-mean-speed/}"
+              text="${FR_EVS}"
+              if (( ! m_avail )); then
+                  fr_put F9 NOT_VERIFIED "" "the collection record m3-mean-speed/result.env is not available"
+              elif (( m_dup || ! m_known )); then
+                  fr_put F9 NOT_VERIFIED "" "the collection record or the producer identity is not complete"
+              elif (( m_foreign )); then
+                  fr_ev m3-mean-speed/result.env
+                  fr_put F9 FAIL "${FR_EVS}" \
+                      "the collection record names another producer: MAIN_SHA ${mr[MAIN_SHA]:-}, RUN_ID ${mr[RUN_ID]:-}"
+              elif [[ -n "$missing" ]]; then
+                  fr_put F9 NOT_VERIFIED "$text" "the collection evidence has no hashed record for:${missing}"
+              elif [[ "${mr[MEAN_SPEED_VERDICT]:-}" != AVAILABLE ]]; then
+                  fr_put F9 NOT_VERIFIED "$text" "the collection is ${mr[MEAN_SPEED_VERDICT]:-UNAVAILABLE}: ${mr[MEAN_SPEED_REASON_CODE]:-UNAVAILABLE}"
+              else
+                  mc=()
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      [[ "$line" == *=* ]] && mc[${line%%=*}]="${line#*=}"
+                  done < "${controls[0]}"
+                  text2=""
+                  [[ "${mr[INPUTS_UNCHANGED]:-}" == YES ]] || text2="INPUTS_UNCHANGED is not YES"
+                  [[ -n "$text2" || "${ev[m3-mean-speed/source-before.tsv]}" == "${ev[m3-mean-speed/source-after.tsv]}" ]] ||
+                      text2="the source manifests before and after differ"
+                  [[ -n "$text2" || "${ev[m3-mean-speed/snapshot-before.tsv]}" == "${ev[m3-mean-speed/snapshot-after.tsv]}" ]] ||
+                      text2="the snapshot manifests before and after differ"
+                  [[ -n "$text2" || ( "${mr[DICTIONARY_BYTES]:-}" == 636 && "${mr[DICTIONARY_SHA256]:-}" == "$FR_METRIC_DICTIONARY_SHA256" &&
+                      "${ev[m3-mean-speed/metric-functions]}" == "$FR_METRIC_DICTIONARY_SHA256" ) ]] ||
+                      text2="the dictionary is not the approved 636-byte dictionary"
+                  [[ -n "$text2" || "${mr[PROCESS_CHECK_RESULT]:-}" == COMPLETE ]] || text2="PROCESS_CHECK_RESULT is not COMPLETE"
+                  [[ -n "$text2" || "${mr[CLEANUP_RESULT]:-}" == REMOVED ]] || text2="CLEANUP_RESULT is not REMOVED"
+                  [[ -n "$text2" || "${mr[LOGS_RETAINED]:-}" == YES ]] || text2="LOGS_RETAINED is not YES"
+                  [[ -n "$text2" || "${mr[INVENTORY]:-}" == COMPLETE ]] || text2="INVENTORY is not COMPLETE"
+                  [[ -n "$text2" || ( "${mc[APPLICATION]:-}" == simpleFoam && "${mc[START_FROM]:-}" == latestTime &&
+                      "${mc[SIMULATION_TYPE]:-}" == RAS && "${mc[RAS_MODEL]:-}" == kEpsilon ) ]] ||
+                      text2="the controls record is not simpleFoam latestTime RAS kEpsilon"
+                  if [[ -n "$text2" ]]; then
+                      fr_put F9 FAIL "$text" "$text2"
+                  else
+                      fr_put F9 PASS "$text" "the collector inputs are unchanged before and after, with the approved dictionary, controls, a complete process check, and a verified cleanup"
+                  fi
+              fi
+
+              # F10: the complete package needs each check and the GitHub artifact
+              # receipt, which exists only after the upload.
+              for check in F1 F2 F3 F4 F5 F6 F7 F8 F9; do
+                  [[ "${FR_C_RESULT[$check]}" != FAIL ]] || fails+=" ${check}"
+                  [[ "${FR_C_RESULT[$check]}" == PASS ]] || notpass+=" ${check}"
+              done
+              if [[ -n "$fails" ]]; then
+                  fr_put F10 FAIL "functional-receipt/checks.tsv" "the checks${fails} fail"
+              else
+                  fr_put F10 NOT_VERIFIED "functional-receipt/checks.tsv" "a complete package needs F1 to F9 PASS and the GitHub artifact receipt, which exists only after the upload; not PASS:${notpass}"
+              fi
+
+              text=$'check\trequirement\tresult\tevidence\treason\tlimitation\n'
+              FR_CHECKS=""
+              for check in F1 F2 F3 F4 F5 F6 F7 F8 F9 F10; do
+                  text+="${check}"$'\t'"${FR_REQUIREMENT[$check]}"$'\t'"${FR_C_RESULT[$check]}"$'\t'"${FR_C_EVIDENCE[$check]}"$'\t'
+                  text+="${FR_C_REASON[$check]}"$'\t'"${FR_LIMITATION[$check]}"$'\n'
+                  FR_CHECKS+="${FR_CHECKS:+;}${check}=${FR_C_RESULT[$check]}"
+              done
+              fr_write checks.tsv "$text" || true
+          }
+
+          # fr_metric_bytes - FR_METRIC_BYTES: the bytes of the regular files of the
+          # collection evidence subtree, measured once before the receipt writes a file.
+          fr_metric_bytes() {
+              local out line status=0 total=0
+              if [[ ! -e "${EVIDENCE_DIR}/m3-mean-speed" ]]; then
+                  FR_METRIC_BYTES=0
+                  return 0
+              fi
+              out="$(fr_op "collection evidence size" find "${EVIDENCE_DIR}/m3-mean-speed" -type f -printf '%s\n')" || status=$?
+              if (( status != 0 )); then
+                  fr_incomplete "the collection evidence size cannot be measured (status ${status}), so no receipt file is written"
+                  return 1
+              fi
+              if [[ -n "$out" ]]; then
+                  while IFS= read -r line; do
+                      if [[ ! "$line" =~ ^[0-9]+$ ]]; then
+                          fr_incomplete "the collection evidence size is not a byte count, so no receipt file is written"
+                          return 1
+                      fi
+                      total=$(( total + line ))
+                  done <<< "$out"
+              fi
+              FR_METRIC_BYTES="$total"
+              return 0
+          }
+
+          # fr_inventory - inventory.tsv, and its SHA-256 for result.env.
+          fr_inventory() {
+              local out status=0 text sum
+              out="$(fr_run inventory fr_inventory_work "$FR_DIR")" || status=$?
+              text="${out%$'\n'SHA256$'\t'*}"$'\n' sum="${out##*$'\n'SHA256$'\t'}"
+              if (( status != 0 )) || [[ "$text" != *$'\nTOTAL\t'* || ! "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+                  fr_incomplete "the receipt inventory did not complete (status ${status})"
+                  return 0
+              fi
+              fr_write inventory.tsv "$text" || return 0
+              FR_INVENTORY_BYTES="${#text}" FR_INVENTORY_SHA="$sum"
+              return 0
+          }
+
+          # fr_result_text - FR_RESULT_TEXT: the result.env text of the current
+          # result. Its last line is WORK_FINISH, so a partial write has no last line.
+          fr_result_text() {
+              local text reason id line now retained=0 found=0
+              local -a fields=()
+              for id in "${FR_RECORD_IDS[@]}"; do
+                  [[ "${FR_REC_OUTCOME[$id]:-}" != RETAINED ]] || retained=$(( retained + 1 ))
+              done
+              for line in "${FR_ENTRY_ROWS[@]}"; do
+                  IFS=$'\t' read -r -a fields <<< "$line"
+                  [[ "${fields[3]:-}" != FOUND ]] || found=$(( found + 1 ))
+              done
+              reason="${FR_REASON:-every receipt record and check is written within the limits}"
+              reason="${reason//[$'\t\r\n']/ }"
+              text="FUNCTIONAL_RECEIPT_RESULT=${FR_RESULT}"$'\n'"FUNCTIONAL_RECEIPT_REASON=${reason:0:512}"$'\n'
+              text+="FUNCTIONAL_RECEIPT_SCOPE=evidence construction only; COMPLETE is not M3 acceptance; an unresolved check prevents a complete acceptance recommendation; F4 stays NOT_VERIFIED without a payload-readback witness"$'\n'
+              text+="FUNCTIONAL_RECEIPT_CHECKPOINT=POST_ORCHESTRATOR_CAPTURE"$'\n'
+              text+="FUNCTIONAL_RECEIPT_CHECKS=${FR_CHECKS:-UNAVAILABLE}"$'\n'
+              text+="RECORDS_RETAINED=${retained} of ${#FR_RECORD_IDS[@]}"$'\n'"ENTRIES_FOUND=${found} of ${FR_ENTRY_COUNT}"$'\n'
+              text+="RECEIPT_BYTES_WITHOUT_RESULT=${FR_USED}"$'\n'"METRIC_EVIDENCE_BYTES=${FR_METRIC_BYTES}"$'\n'
+              text+="INVENTORY_SHA256=${FR_INVENTORY_SHA}"$'\n'"INVENTORY_BYTES=${FR_INVENTORY_BYTES}"$'\n'
+              text+="LIMITS=${FR_WORK_SECONDS} seconds inside the capture work limit; ${FR_FILE_LIMIT} bytes for each record; ${FR_TREE_LIMIT} bytes for the receipt; ${FR_SCAN_LIMIT} source bytes for each Setup scan; ${FR_COMBINED_LIMIT} bytes for the collection evidence and the receipt together"$'\n'
+              text+="WORK_START=${FR_START}"$'\n'"WORK_END=${FR_END}"$'\n'"WORK_END_SOURCE=${FR_END_SOURCE}"$'\n'
+              printf -v now "%(%s)T" -1
+              text+="WORK_FINISH=${now}"$'\n'
+              FR_RESULT_TEXT="$text"
+          }
+
+          # fr_result_write <path> - write FR_RESULT_TEXT with one shell write and
+          # read it back. Status 0 only when the file holds exactly that text.
+          fr_result_write() {
+              local fr_result_back=""
+              printf '%s' "$FR_RESULT_TEXT" 2> /dev/null > "$1" || return 1
+              IFS= read -r -d '' fr_result_back 2> /dev/null < "$1" || true
+              [[ "$fr_result_back" == "$FR_RESULT_TEXT" ]]
+          }
+
+          # fr_finish - result.env. The receipt directory gets it only when the receipt
+          # could check its limits. A result.env that is not written completely gives
+          # INCOMPLETE, and no incomplete result.env stays. Then the capture step gets
+          # the final result in the copy outside the evidence directory.
+          fr_finish() {
+              fr_result_text
+              if (( FR_WRITE )); then
+                  if (( ${#FR_RESULT_TEXT} > FR_RESULT_RESERVE )); then
+                      fr_incomplete "result.env has ${#FR_RESULT_TEXT} bytes, above its ${FR_RESULT_RESERVE}-byte reserve, so it is not written"
+                      fr_result_text
+                  elif ! fr_result_write "${FR_DIR}/result.env"; then
+                      fr_incomplete "result.env cannot be written completely"
+                      rm -f -- "${FR_DIR}/result.env" 2> /dev/null || true
+                      fr_result_text
+                  fi
+              fi
+              fr_result_write "$FR_SIDE_RESULT" || true
+              return 0
+          }
+
+          # fr_collect - the receipt work.
+          fr_collect() {
+              local -x LC_ALL=C
+              local now cap
+              local -A FR_REC_ROW=() FR_REC_OUTCOME=() FR_REC_REASON=() FR_REC_BYTES=()
+              local -A FR_E_CHECK=() FR_E_WHY=() FR_C_RESULT=() FR_C_EVIDENCE=() FR_C_REASON=()
+              local FR_E_REFERENCES=""
+              local -A FR_REQUIREMENT=() FR_LIMITATION=()
+              local -a FR_ENTRY_ROWS=()
+              fr_entry_list
+              export FR_ENTRY_AWK FR_ROTATION_AWK FR_BOUNDS_AWK FR_ENTRY_LIMIT FR_SCAN_LIMIT FR_ENTRY_LIST
+              FR_REQUIREMENT=([F1]="Setup records and applicable Case input updates" [F2]="Latest-time record"
+                              [F3]="Post-processing source-result signature" [F4]="Readable actual flow VTUs"
+                              [F5]="Time-0 PointData U p wallDistance" [F6]="Latest PointData U p"
+                              [F7]="Actual Case 7 mean speed and provenance" [F8]="Required completion-marker contents"
+                              [F9]="Actual collector configuration and source/snapshot integrity"
+                              [F10]="Complete provenance-bound functional package")
+              FR_LIMITATION=([F1]="configuration traceability at POST_ORCHESTRATOR_CAPTURE, not a scientific criterion; only the named entries of the current ASCII layout"
+                             [F2]="-" [F3]="-" [F4]="header metadata and whole-file hashes only; no payload is decoded"
+                             [F5]="PointData names and original tags only; no payload is decoded"
+                             [F6]="PointData names and original tags only; no payload is decoded"
+                             [F7]="collection only; not convergence, mesh, PointData, or M3 acceptance; no scientific range"
+                             [F8]="a marker is Stage evidence, not solver convergence; empty marker bytes are valid"
+                             [F9]="the source and snapshot checks are snapshots at the collection, not a race-free exclusion"
+                             [F10]="evidence construction only; not M3 acceptance")
+              FR_DIR="${EVIDENCE_DIR}/functional-receipt"
+              FR_SIDE_RESULT="${EVIDENCE_DIR%/*}/functional-receipt-result.env"
+              FR_RESULT=COMPLETE FR_REASON="" FR_USED=0 FR_AVAILABLE=0 FR_WRITE=0 FR_CHECKS="" FR_METRIC_BYTES=UNAVAILABLE FR_RESULT_TEXT=""
+              FR_INVENTORY_SHA=UNAVAILABLE FR_INVENTORY_BYTES=UNAVAILABLE FR_LIMIT_TEXT="" FR_WORK=""
+              : > "$FR_SIDE_RESULT" 2> /dev/null || true
+              printf -v FR_START "%(%s)T" -1
+              FR_END=$(( FR_START + FR_WORK_SECONDS )) FR_END_SOURCE=FUNCTIONAL_RECEIPT_CAP
+              if (( CAPTURE_WORK_END - 10 < FR_END )); then
+                  FR_END=$(( CAPTURE_WORK_END - 10 )) FR_END_SOURCE=CAPTURE_WORK_LIMIT
+              fi
+              FR_OP_END=$(( FR_END - 3 ))
+              printf -v now "%(%s)T" -1
+              if (( FR_OP_END <= now )); then
+                  FR_RESULT=NOT_ATTEMPTED
+                  FR_REASON="no functional-record time was left: the receipt end ${FR_END} (${FR_END_SOURCE}) is at most 3 seconds after ${now}"
+                  capture_note "functional receipt: ${FR_REASON}"
+                  fr_finish
+                  return 0
+              fi
+              if ! FR_WORK="$(mktemp -d "${EVIDENCE_DIR%/*}/functional-receipt-work.XXXXXXXX" 2> /dev/null)"; then
+                  FR_RESULT=NOT_ATTEMPTED FR_REASON="the receipt work directory cannot be created"
+                  capture_note "functional receipt: ${FR_REASON}"
+                  fr_finish
+                  return 0
+              fi
+              if ! fr_metric_bytes; then
+                  fr_finish
+                  return 0
+              fi
+              cap=$(( FR_COMBINED_LIMIT - FR_METRIC_BYTES ))
+              FR_LIMIT_TEXT="the ${FR_COMBINED_LIMIT}-byte ceiling of the collection evidence (${FR_METRIC_BYTES} bytes) and the receipt, less the ${FR_RESULT_RESERVE} bytes kept for result.env"
+              if (( cap > FR_TREE_LIMIT )); then
+                  cap="$FR_TREE_LIMIT"
+                  FR_LIMIT_TEXT="the ${FR_TREE_LIMIT}-byte receipt, less the ${FR_RESULT_RESERVE} bytes kept for result.env"
+              fi
+              if (( cap < FR_RESULT_RESERVE )); then
+                  fr_incomplete "the collection evidence uses ${FR_METRIC_BYTES} bytes of the ${FR_COMBINED_LIMIT}-byte ceiling, so no receipt file fits"
+                  fr_finish
+                  return 0
+              fi
+              FR_AVAILABLE=$(( cap - FR_RESULT_RESERVE ))
+              if ! mkdir -p -- "${FR_DIR}/files" 2> /dev/null; then
+                  fr_incomplete "the receipt directory cannot be created"
+                  fr_finish
+                  return 0
+              fi
+              FR_WRITE=1
+              fr_identity
+              fr_records
+              fr_entries
+              fr_checks
+              fr_inventory
+              fr_finish
+              return 0
+          }
+
+          # fr_capture - the receipt work of the capture. The receipt never stops the
+          # capture work: an unexpected end of the receipt work is one capture note.
+          fr_capture() {
+              local status=0
+              fr_collect || status=$?
+              if (( status != 0 )); then
+                  capture_note "functional receipt: the receipt work ended with status ${status}"
+              fi
+              return 0
+          }
+          # ---- Functional receipt: end ----
+
           for name in orchestrator.log orchestrator-timeout.log install.log prepare.log; do
               [[ -f "${EVIDENCE_DIR}/${name}" ]] || echo "UNAVAILABLE" > "${EVIDENCE_DIR}/${name}"
           done
@@ -3550,9 +5273,14 @@ jobs:
           }
           # ---- M3 mean speed: end ----
 
-          # The metric work comes after all other capture items, so it cannot
+          # The metric work comes after all earlier capture items, so it cannot
           # delay them, and it ends 10 seconds before the capture work limit.
           metric_collect
+
+          # The functional-record receipt comes after the collection, because its
+          # checks read the collection record. It ends by the earlier of 30 seconds
+          # after its start and 10 seconds before the capture work limit.
+          fr_capture
 
           # An incomplete item gives status 4, so the step never reports a
           # complete capture after a skipped or stopped operation.
@@ -3670,6 +5398,53 @@ jobs:
               } >> "$metric_result"
           fi
 
+          # The functional-record receipt result. A capture that stops before or in
+          # the receipt work keeps an explicit result. A result is complete only
+          # in a regular file that starts with one known result line and ends with
+          # the WORK_FINISH line and its line end: a partial first line is no
+          # result. With no complete result, a receipt that started (its result
+          # copy exists) or made its directory is INCOMPLETE. When the receipt
+          # directory exists, the explicit result then replaces its result.env, in
+          # the 2048 bytes that the receipt keeps free for result.env. A copy that
+          # is not exact is removed, and a directory at that path stays as it is.
+          receipt_dir="${EVIDENCE_DIR}/functional-receipt"
+          receipt_result="${receipt_dir}/result.env"
+          receipt_side="${EVIDENCE_DIR%/*}/functional-receipt-result.env"
+          receipt_complete() {
+              local text="" first last
+              first='^FUNCTIONAL_RECEIPT_RESULT=(COMPLETE|INCOMPLETE|NOT_ATTEMPTED)'$'\n'
+              last=$'\n''WORK_FINISH=[0-9]+'$'\n''$'
+              [[ -f "$1" && ! -L "$1" ]] || return 1
+              IFS= read -r -d '' text 2>/dev/null < "$1" && return 1
+              [[ "$text" =~ $first && "$text" =~ $last && $'\n'"${text#*$'\n'}" != *$'\n'FUNCTIONAL_RECEIPT_RESULT=* ]]
+          }
+          if ! receipt_complete "$receipt_result"; then
+              if ! receipt_complete "$receipt_side"; then
+                  receipt_state=NOT_ATTEMPTED
+                  receipt_reason="the capture did not reach the functional-record work"
+                  if [[ -d "$receipt_dir" || -e "$receipt_side" ]]; then
+                      receipt_state=INCOMPLETE
+                      receipt_reason="the capture stopped the functional-record work"
+                  fi
+                  {
+                    echo "FUNCTIONAL_RECEIPT_RESULT=${receipt_state}"
+                    echo "FUNCTIONAL_RECEIPT_REASON=${receipt_reason}: ${capture_result}: ${capture_reason:0:400}"
+                    echo "FUNCTIONAL_RECEIPT_CHECKS=UNAVAILABLE"
+                  } > "$receipt_side"
+              fi
+              receipt_result="$receipt_side"
+              receipt_target="${receipt_dir}/result.env"
+              if [[ -d "$receipt_dir" ]] && [[ -L "$receipt_target" || ! -d "$receipt_target" ]]; then
+                  rm -f -- "$receipt_target" 2>/dev/null || true
+                  if (( $(wc -c < "$receipt_side") <= 2048 )) && cp -- "$receipt_side" "$receipt_target" 2>/dev/null &&
+                          cmp -s -- "$receipt_side" "$receipt_target"; then
+                      receipt_result="$receipt_target"
+                  else
+                      rm -f -- "$receipt_target" 2>/dev/null || true
+                  fi
+              fi
+          fi
+
           # The evidence verdicts, for the job summary. Each is separate from the
           # capture result and from the product result.
           evidence_verdict() {
@@ -3685,6 +5460,8 @@ jobs:
             echo "MEAN_SPEED_REASON_CODE=$(evidence_verdict "$metric_result" MEAN_SPEED_REASON_CODE)"
             echo "MEAN_SPEED_REASON=$(evidence_verdict "$metric_result" MEAN_SPEED_REASON)"
             echo "MEAN_SPEED_VALUE=$(evidence_verdict "$metric_result" MEAN_SPEED_VALUE)"
+            echo "FUNCTIONAL_RECEIPT_RESULT=$(evidence_verdict "$receipt_result" FUNCTIONAL_RECEIPT_RESULT)"
+            echo "FUNCTIONAL_RECEIPT_CHECKS=$(evidence_verdict "$receipt_result" FUNCTIONAL_RECEIPT_CHECKS)"
           } | tee -a "$GITHUB_ENV"
           if [[ -f "${EVIDENCE_DIR}/vtu-point-data.txt" ]]; then
               cat "${EVIDENCE_DIR}/vtu-point-data.txt"
@@ -3719,6 +5496,7 @@ jobs:
             echo "| Mean speed | \`${MEAN_SPEED_VERDICT:-UNAVAILABLE}\` |"
             echo "| Mean speed reason | \`${MEAN_SPEED_REASON_CODE:-UNAVAILABLE}\` ${MEAN_SPEED_REASON:-UNAVAILABLE} |"
             echo "| Mean speed (m/s) | ${MEAN_SPEED_VALUE:-UNAVAILABLE} |"
+            echo "| Functional receipt | \`${FUNCTIONAL_RECEIPT_RESULT:-UNAVAILABLE}\` ${FUNCTIONAL_RECEIPT_CHECKS:-UNAVAILABLE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the evidence artifacts
