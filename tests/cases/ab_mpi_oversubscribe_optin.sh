@@ -8595,10 +8595,14 @@ s96_receipt_source_records_stay_distinct() {
         "$(ab_fr_record "$workspace" LATEST_TIME source_sha256_after)" "S96: the changed hashes are both recorded"
     assert_file_missing "$(ab_fr_dir "$workspace")/files/case_7/vtk/flow_latest_time.txt" "S96: no stale copy of a changed record stays"
     # No record or entry text runs: a command in a record or a dictionary
-    # directive leaves no marker file.
+    # directive leaves no marker file. A record with a NUL byte stays a
+    # complete record with its exact bytes.
     ab_fr_case "S96 no execution" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_command_text
     assert_file_missing "${AB_FR_LAST}/executed" "S96: no record or entry text runs"
+    assert_eq "RETAINED" "$(ab_fr_record "$AB_FR_LAST" DOE_ROW)" "S96: a record with a NUL byte is retained"
+    cmp -s -- "${AB_FR_LAST}/checkout/src/batch_9/case_7/flow/doe_row.csv" "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/flow/doe_row.csv" ||
+        _fail "S96: the retained record keeps the NUL byte and every other byte"
     assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
         "S96: a directive at a keyword position makes the entries of its dictionary AMBIGUOUS"
 }
@@ -8620,6 +8624,7 @@ ab_fr_link_flow() {
 }
 ab_fr_command_text() {
     local flow="${1}/checkout/src/batch_9/case_7/flow"
+    printf 'x\0y\n' >> "${flow}/doe_row.csv"
     sed -i -e "s#^ws=5.0\$#ws=\$(touch ${1}/executed)#" "${flow}/setup_metadata.env"
     sed -i -e "s#^boundaryField\$#\#codeStream { code \#{ system(\"touch ${1}/executed\"); \#}; }\nboundaryField#" "${flow}/0/k"
 }
