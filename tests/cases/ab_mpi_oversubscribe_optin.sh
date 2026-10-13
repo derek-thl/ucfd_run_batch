@@ -8566,6 +8566,8 @@ FAIL||post_processing.complete has a NUL byte after 149 of its 164 bytes" "$resu
         "S95 short read: F3 names the incomplete signature read"
     assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "functional receipt" \
         "S95 short read: the incomplete read is a capture note"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" \
+        "functional receipt: the signature cannot be read completely" "S95 short read: the incomplete signature read is a capture note"
     ab_fr_case "S95 collector time" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=FAIL;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_metric_time
     ab_fr_case "S95 no collection" "F1=NOT_VERIFIED;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=NOT_VERIFIED;F8=PASS;F9=NOT_VERIFIED;F10=NOT_VERIFIED" \
@@ -8664,6 +8666,8 @@ s96_receipt_source_records_stay_distinct() {
         ab_fr_record "$AB_FR_LAST" "$id"; done | paste -sd ' ' -)" "S96: a linked Case directory gives LINK for each of its records"
     assert_eq "LINK" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" \
         "S96: no entry is read through a linked Case directory"
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 evidence)" "src/batch_9/case_7/flow/log.surfaceTransformPoints:LINK" \
+        "S96: F1 names the linked geometry log with its status"
     # A record that changes during the capture is CHANGED, and no copy stays.
     workspace="$(new_workspace s96_changed)"
     ab_fr_fixture "$workspace"
@@ -9022,6 +9026,46 @@ s98_receipt_limits_fail_closed() {
     assert_eq "1" "$(grep -c '^FUNCTIONAL_RECEIPT_RESULT=' "${dir}/result.env")" "S98 partial: result.env has one result line"
     assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`INCOMPLETE\`" \
         "S98 partial: the summary shows INCOMPLETE"
+    # R3: a receipt that started (its empty result copy exists) and gave no
+    # result is INCOMPLETE, not NOT_ATTEMPTED.
+    workspace="$(new_workspace s98_started)"
+    ab_capture_fixture "$workspace"
+    : > "${workspace}/runner_temp/functional-receipt-result.env"
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100 ))")"
+    assert_contains "$run" "status=0" "S98 started: the capture step ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 started: GITHUB_ENV has the INCOMPLETE result"
+    assert_dir_missing "$(ab_fr_dir "$workspace")" "S98 started: no receipt directory is made"
+    # R3: a result write that keeps only the first 34 bytes (as a full disk
+    # would) is not a written result: the construction is INCOMPLETE, and no
+    # partial result.env stays.
+    workspace="$(new_workspace s98_partial_write)"
+    ab_fr_fixture "$workspace"
+    ab_fr_partial_result_write "$workspace"
+    run="$(ab_fr_unit "$workspace" BASH_ENV="${workspace}/partial_write.sh")"
+    assert_contains "$run" "status=0" "S98 partial write: the receipt work ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_file_value "${workspace}/runner_temp/functional-receipt-result.env" FUNCTIONAL_RECEIPT_RESULT)" \
+        "S98 partial write: the result outside the evidence directory is INCOMPLETE"
+    assert_contains "$(ab_file_value "${workspace}/runner_temp/functional-receipt-result.env" FUNCTIONAL_RECEIPT_REASON)" \
+        "result.env cannot be written completely" "S98 partial write: the reason names the result write"
+    assert_file_missing "$(ab_fr_dir "$workspace")/result.env" "S98 partial write: no partial result.env stays"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "functional receipt: result.env" \
+        "S98 partial write: the partial write is a capture note"
+}
+
+# ab_fr_partial_result_write <workspace> - partial_write.sh, a BASH_ENV file
+# for ab_fr_unit: each printf whose output goes to functional-receipt/result.env
+# writes only the first 34 bytes and ends with status 0. Every other printf is
+# the builtin.
+ab_fr_partial_result_write() {
+    cat > "${1}/partial_write.sh" <<'PARTIAL_WRITE'
+printf() {
+    if [[ "${1:-}" != -v && "$(readlink "/proc/$$/fd/1")" == */functional-receipt/result.env ]]; then
+        builtin printf "$@" | head -c 34
+    else
+        builtin printf "$@"
+    fi
+}
+PARTIAL_WRITE
 }
 ab_fr_big_records() {
     local flow="${1}/checkout/src/batch_9/case_7/flow" name
