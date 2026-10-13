@@ -154,6 +154,16 @@
 # failed read that sets a valid first field (review 5478239999). Each keeps the
 # task directory with REFUSED_PROCESS_CHECK.
 #
+# Checks S94 to S99 cover the Case 7 functional-record capture in the evidence
+# workflow (Issue #80, admission 6136000731 of approved contract 6127203837).
+# S94 runs the extracted capture step with the completed collection of S72 and
+# a complete set of controlled Case 7 records. S95 to S98 run the extracted
+# receipt functions alone, each run with one controlled fault: the time,
+# signature, VTU, and producer checks (S95), the distinct source-record results
+# (S96), the selected Setup entries (S97), and the time and byte limits (S98).
+# S99 checks the frozen blocks and the unchanged interface. A controlled record
+# is capability evidence only, never an actual Case receipt or M3 acceptance.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -7902,6 +7912,908 @@ s93_collect_root_check_terminal_clock_records() {
         "S93 final clock: the guard records the failed clock read in its terminal record"
 }
 
+# ---- S94 to S99: the Case 7 functional-record capture (Issue #80) ------------
+#
+# The evidence workflow keeps the Case 7 functional records in the evidence
+# subtree functional-receipt/ (admission 6136000731 of the approved contract
+# 6127203837, Sections 4, 5, and 8 to 10). S94 runs the extracted capture step
+# as GitHub runs it, with the completed two-cell collection of S72 and a
+# complete set of controlled Case 7 records. S95 to S98 run the extracted
+# receipt functions alone on the same controlled records, with one controlled
+# fault in each run, so each run takes less than one second. S99 reads the
+# workflow as text. No check installs OpenFOAM, runs a Stage, reads a VTU
+# payload, or dispatches a workflow. A controlled record is capability evidence
+# only. It is not an actual Case 7 receipt, and it is not M3 acceptance.
+#
+# Map to the ten controlled checks of contract Section 10: 1 S94 and S97; 2 S94;
+# 3 S95; 4 S96 and S97; 5 S94; 6 S98; 7 S99 and the unchanged S72 to S93; 8 S94
+# and S95; 9 S94; 10 S99 and the unchanged Scenarios.
+
+# The six source records, relative to the Batch Workspace, in their order.
+AB_FR_RECORDS=(case_7/flow/doe_row.csv case_7/flow/setup_metadata.env case_7/flow/flow.marker
+               case_7/flow/restart.marker case_7/vtk/flow_latest_time.txt case_7/vtk/post_processing.complete)
+AB_FR_RECORD_IDS=(DOE_ROW SETUP_METADATA FLOW_MARKER RESTART_MARKER LATEST_TIME POST_SIGNATURE)
+AB_FR_EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+AB_FR_ALL_PASS="F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED"
+
+# The post-processing signature of a flow-only Case with latest time 2.
+AB_FR_SIGNATURE=$'flow_latest=2\ntransport_ready=0\ntransport_times=\nscalar_field=T\nflow_zero_fields=(U p wallDistance)\nflow_result_fields=(U p)\nvtu_point_data=included'
+
+# The 57 selected Setup entries and the values that Setup writes for the
+# committed Case 7 row (WS 5.0, WD 180.0), the default Setup arguments, and the
+# controlled geometry logs: rotation centre (1.5 2.5 0), bounds (-10 -20 0) to
+# (10 20 40). Setup substitutes the blockMeshDict text with sed. Setup changes
+# the other files with foamDictionary -set, which writes the complete file with
+# the default precision of 6 significant digits. These literal values come from
+# the Setup formulas, checked once with gawk and mawk; they are the oracle.
+ab_fr_expected_entries() {
+    local plant device side a b
+    printf '%s\t%s\t%s\n' \
+        case_7/flow/system/blockMeshDict xMin -698.500 \
+        case_7/flow/system/blockMeshDict xMax 1101.500 \
+        case_7/flow/system/blockMeshDict yMin -497.500 \
+        case_7/flow/system/blockMeshDict yMax 502.500 \
+        case_7/flow/system/blockMeshDict zMin 0 \
+        case_7/flow/system/blockMeshDict zMax 360.000 \
+        case_7/flow/system/blockMeshDict nx 45 \
+        case_7/flow/system/blockMeshDict ny 25 \
+        case_7/flow/system/blockMeshDict nz 9 \
+        case_7/flow/system/snappyHexMeshDict snap off \
+        case_7/flow/system/snappyHexMeshDict addLayers off \
+        case_7/flow/system/snappyHexMeshDict geometry.refinementDomain.point1 "( 1.5 2.5 0 )" \
+        case_7/flow/system/snappyHexMeshDict geometry.refinementDomain.point2 "( 1.5 2.5 80 )" \
+        case_7/flow/system/snappyHexMeshDict geometry.refinementDomain.radius 300 \
+        case_7/flow/system/snappyHexMeshDict geometry.refineGroundPlane.origin "( 1.5 2.5 0 )" \
+        case_7/flow/system/snappyHexMeshDict geometry.refineGroundPlane.radius 300000 \
+        case_7/flow/system/snappyHexMeshDict castellatedMeshControls.locationInMesh "( 1.5 2.5 80 )" \
+        case_7/flow/system/decomposeParDict numberOfSubdomains 8 \
+        case_7/flow/0/U boundaryField.inlet.Uref 5
+    for plant in f18p1 f18p2 f18p3; do
+        for device in seb aex sex voc; do
+            for side in a b; do
+                printf '%s\t%s\t%s\n' case_7/flow/0/U "boundaryField.${plant}_${device}_${side}.value" "uniform ( 0 0 10 )"
+            done
+        done
+        if [[ "$plant" == f18p1 ]]; then
+            a="-2.11309 4.53154" b="2.11309 -4.53154"
+        else
+            a="-4.53154 -2.11309" b="4.53154 2.11309"
+        fi
+        printf '%s\t%s\t%s\n' \
+            case_7/flow/0/U "boundaryField.${plant}_oai_a1.value" "uniform ( ${a} 0 )" \
+            case_7/flow/0/U "boundaryField.${plant}_oai_a2.value" "uniform ( ${a} 0 )" \
+            case_7/flow/0/U "boundaryField.${plant}_oai_b1.value" "uniform ( ${b} 0 )" \
+            case_7/flow/0/U "boundaryField.${plant}_oai_b2.value" "uniform ( ${b} 0 )"
+    done
+    printf '%s\t%s\t%s\n' \
+        case_7/flow/0/k boundaryField.inlet.Uref 5 \
+        case_7/flow/0/epsilon boundaryField.inlet.Uref 5
+}
+
+# ab_fr_foam_file <class> <object> - the banner and the header that
+# foamDictionary writes before the dictionary entries. The body follows.
+ab_fr_foam_file() {
+    printf '/*--------------------------------*- C++ -*----------------------------------*\\\n'
+    printf '| =========                 |                                                 |\n'
+    printf '| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |\n'
+    printf '\\*---------------------------------------------------------------------------*/\n'
+    printf 'FoamFile\n{\n    version         2;\n    format          ascii;\n'
+    printf '    class           %s;\n    object          %s;\n}\n\n' "$1" "$2"
+    printf '// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n'
+}
+
+# ab_fr_inlet <type> <value> - the inlet patch of 0/U, 0/k, or 0/epsilon with
+# Uref 5, as foamDictionary writes it.
+ab_fr_inlet() {
+    printf '    inlet\n    {\n        type            %s;\n        flowDir         ( 1 0 0 );\n' "$1"
+    printf '        zDir            ( 0 0 1 );\n        Uref            5;\n        Zref            10;\n'
+    printf '        z0              uniform 0.1;\n        value           %s;\n    }\n' "$2"
+}
+
+# ab_fr_records <checkout> - a complete, consistent set of controlled Case 7
+# records in <checkout>/src/batch_9, as the four Stages write them for the
+# committed Case 7 row: the one-row DOE Batch CSV, the six source records, the
+# two geometry logs, the six Setup dictionaries, the Stage summaries and logs,
+# and the two flow VTU files of time 2.
+ab_fr_records() {
+    local checkout="$1" batch flow vtk csv plant patch device side a b value
+    batch="${checkout}/src/batch_9"
+    flow="${batch}/case_7/flow"
+    vtk="${batch}/case_7/vtk"
+    mkdir -p "${flow}/system" "${flow}/0" "$vtk" "${batch}/_mesh_logs" "${batch}/_flow_logs"
+    cp -- "${REPO_ROOT}/src/output_batch_1.csv" "${checkout}/src/output_batch_1.csv"
+    csv="${batch}/output_batch_9.csv"
+    head -n 1 -- "${REPO_ROOT}/src/output_batch_1.csv" > "$csv"
+    awk -F, '$1 == "7" { print; exit }' "${REPO_ROOT}/src/output_batch_1.csv" >> "$csv"
+    tr -d '\r' < "$csv" > "${flow}/doe_row.csv"
+    {
+        printf 'case_type=flow\ncsv_file=%s/output_batch_9.csv\nrow_number=2\n' "$(cd -P -- "$batch" && pwd -P)"
+        printf 'case_id=case_7\ncase_name=case_7/flow\nwd=180.000\nws=5.0\nws_for_setup=5.0\n'
+        printf 'sim_type=RAS\nras_model=kEpsilon\n'
+    } > "${flow}/setup_metadata.env"
+    : > "${flow}/flow.marker"
+    : > "${flow}/restart.marker"
+    printf '2\n' > "${vtk}/flow_latest_time.txt"
+    printf '%s\n' "$AB_FR_SIGNATURE" > "${vtk}/post_processing.complete"
+    printf 'Transforming points\nSet centre of rotation to (1.5 2.5 0)\nEnd\n' > "${flow}/log.surfaceTransformPoints"
+    printf 'Reading surface\nOverall bounds (-10 -20 0) (10 20 40)\nEnd\n' > "${flow}/log.surfaceCheck"
+    sed -e 's#<xMin>#-698.500#g' -e 's#<xMax>#1101.500#g' -e 's#<yMin>#-497.500#g' \
+        -e 's#<yMax>#502.500#g' -e 's#<zMin>#0#g' -e 's#<zMax>#360.000#g' \
+        -e 's#<nx>#45#g' -e 's#<ny>#25#g' -e 's#<nz>#9#g' \
+        "${MASTER_SRC_DIR}/simpleFoam_files/system/blockMeshDict" > "${flow}/system/blockMeshDict"
+    {
+        ab_fr_foam_file dictionary snappyHexMeshDict
+        printf 'castellatedMesh true;\n\nsnap            off;\n\naddLayers       off;\n\ngeometry\n{\n'
+        printf '    f18p1_main.stl\n    {\n        type            triSurfaceMesh;\n        name            f18p1_main;\n    }\n'
+        printf '    refinementDomain\n    {\n        type            searchableCylinder;\n'
+        printf '        point1          ( 1.5 2.5 0 );\n        point2          ( 1.5 2.5 80 );\n        radius          300;\n    }\n'
+        printf '    refineGroundPlane\n    {\n        type            searchableDisk;\n'
+        printf '        origin          ( 1.5 2.5 0 );\n        normal          ( 0 0 1 );\n        radius          300000;\n    }\n}\n\n'
+        printf 'castellatedMeshControls\n{\n    maxGlobalCells  2000000;\n    features\n    (\n'
+        printf '        {\n            file            "f18p1_main.eMesh";\n            level           3;\n        }\n    );\n\n'
+        printf '    refinementRegions\n    {\n        refinementDomain\n        {\n'
+        printf '            mode            inside;\n            levels          ( ( 1e+15 2 ) );\n        }\n    }\n\n'
+        printf '    locationInMesh  ( 1.5 2.5 80 );\n}\n\nsnapControls\n{\n    nSmoothPatch    3;\n}\n\n'
+        printf 'mergeTolerance  1e-06;\n\n'
+        printf '// ************************************************************************* //\n'
+    } > "${flow}/system/snappyHexMeshDict"
+    {
+        ab_fr_foam_file dictionary decomposeParDict
+        printf 'numberOfSubdomains 8;\n\nmethod          scotch;\n\ndistributed     no;\n\nroots           ( );\n\n'
+    } > "${flow}/system/decomposeParDict"
+    {
+        ab_fr_foam_file volVectorField U
+        printf 'dimensions      [ 0 1 -1 0 0 0 0 ];\n\ninternalField   uniform ( 0 0 0 );\n\nboundaryField\n{\n'
+        ab_fr_inlet atmBoundaryLayerInletVelocity "uniform ( 0 0 0 )"
+        printf '    outlet\n    {\n        type            inletOutlet;\n        inletValue      uniform ( 0 0 0 );\n'
+        printf '        value           uniform ( 0 0 0 );\n    }\n    ground\n    {\n        type            noSlip;\n    }\n'
+        for plant in f18p1 f18p2 f18p3; do
+            if [[ "$plant" == f18p1 ]]; then
+                a="-2.11309 4.53154" b="2.11309 -4.53154"
+            else
+                a="-4.53154 -2.11309" b="4.53154 2.11309"
+            fi
+            printf '    %s_main\n    {\n        type            noSlip;\n    }\n' "$plant"
+            for patch in oai_a1 oai_a2 oai_b1 oai_b2; do
+                value="$a"
+                if [[ "$patch" == oai_b* ]]; then
+                    value="$b"
+                fi
+                printf '    %s_%s\n    {\n        type            fixedValue;\n        value           uniform ( %s 0 );\n    }\n' \
+                    "$plant" "$patch" "$value"
+            done
+            for device in seb aex sex voc; do
+                for side in a b; do
+                    printf '    %s_%s_%s\n    {\n        type            fixedValue;\n        value           uniform ( 0 0 10 );\n    }\n' \
+                        "$plant" "$device" "$side"
+                done
+            done
+        done
+        printf '}\n\n'
+    } > "${flow}/0/U"
+    {
+        ab_fr_foam_file volScalarField k
+        printf 'kInlet          1.5;\n\ndimensions      [ 0 2 -2 0 0 0 0 ];\n\ninternalField   uniform 1.5;\n\nboundaryField\n{\n'
+        ab_fr_inlet atmBoundaryLayerInletK "uniform 1.5"
+        printf '    outlet\n    {\n        type            inletOutlet;\n        inletValue      uniform 1.5;\n    }\n}\n\n'
+    } > "${flow}/0/k"
+    {
+        ab_fr_foam_file volScalarField epsilon
+        printf 'dimensions      [ 0 2 -3 0 0 0 0 ];\n\ninternalField   uniform 0.01;\n\nboundaryField\n{\n'
+        ab_fr_inlet atmBoundaryLayerInletEpsilon "uniform 0.01"
+        printf '    outlet\n    {\n        type            inletOutlet;\n        inletValue      uniform 0.01;\n    }\n}\n\n'
+    } > "${flow}/0/epsilon"
+    {
+        printf 'csv_file,row_number,case_id,case_name,case_dir,status,message\n'
+        printf '"%s","2","case_7","case_7/flow","%s","meshed","OK"\n' "$csv" "$flow"
+    } > "${batch}/run_mesh_cases_summary.csv"
+    {
+        printf 'csv_file,row_number,case_id,case_name,case_dir,status,message\n'
+        printf '"%s","2","case_7","case_7/flow","%s","solved","OK"\n' "$csv" "$flow"
+    } > "${batch}/run_flow_cases_summary.csv"
+    printf 'mesh log\n' > "${batch}/_mesh_logs/case_7_flow.log"
+    printf 'flow log\n' > "${batch}/_flow_logs/case_7_flow.log"
+    rm -f -- "${batch}/.run_flow_cases_failed" "${vtk}/flow_latest_100.vtu"
+    ab_fr_vtu "${vtk}/flow_0.vtu" U p wallDistance
+    ab_fr_vtu "${vtk}/flow_latest_2.vtu" U p
+}
+
+# ab_fr_vtu <file> <point-field>... - a foamToVTK-style VTU file with appended
+# raw data and the named PointData arrays.
+ab_fr_vtu() {
+    local file="$1" name
+    shift
+    {
+        printf '<?xml version="1.0"?>\n<VTKFile type="UnstructuredGrid" version="1.0">\n<UnstructuredGrid>\n'
+        printf '<Piece NumberOfPoints="8" NumberOfCells="1">\n<PointData>\n'
+        for name in "$@"; do
+            printf '<DataArray type="Float32" Name="%s" format="appended" offset="0"/>\n' "$name"
+        done
+        printf '</PointData>\n</Piece>\n</UnstructuredGrid>\n<AppendedData encoding="raw">\n_payload\n'
+        printf '</AppendedData>\n</VTKFile>\n'
+    } > "$file"
+}
+
+# ab_fr_scanner_evidence <workspace> - the capture evidence that the receipt
+# reads, as the earlier capture items write it for the controlled records: the
+# Stage summaries and logs, and the VTU manifest and tags of the two flow VTU
+# files.
+ab_fr_scanner_evidence() {
+    local workspace="$1" batch evidence vtu path sha bytes fields
+    batch="${workspace}/checkout/src/batch_9"
+    evidence="${workspace}/runner_temp/evidence"
+    mkdir -p "${evidence}/summaries" "${evidence}/stage-logs/_mesh_logs" "${evidence}/stage-logs/_flow_logs"
+    cp -- "${batch}/run_mesh_cases_summary.csv" "${batch}/run_flow_cases_summary.csv" "${evidence}/summaries/"
+    cp -- "${batch}/_mesh_logs/case_7_flow.log" "${evidence}/stage-logs/_mesh_logs/"
+    cp -- "${batch}/_flow_logs/case_7_flow.log" "${evidence}/stage-logs/_flow_logs/"
+    {
+        printf '== VTU point-data manifest ==\nSCALAR_FIELD=T\nVTK_DIRECTORY_COUNT=1\nVTU_TAG_EVIDENCE_FILE=vtu-tags.txt\n'
+    } > "${evidence}/vtu-point-data.txt"
+    : > "${evidence}/vtu-tags.txt"
+    for vtu in flow_0 flow_latest_2; do
+        path="case_7/vtk/${vtu}.vtu"
+        sha="$(sha256sum < "${batch}/${path}" | cut -d ' ' -f 1)"
+        bytes="$(wc -c < "${batch}/${path}" | tr -d ' ')"
+        fields="U p"
+        if [[ "$vtu" == flow_0 ]]; then
+            fields="U p wallDistance"
+        fi
+        printf '\nVTU_PATH=%s\nVTU_BYTES=%s\nVTU_SHA256=%s\nVTU_EXPECTED_FIELDS=%s\nVTU_OBSERVED_FIELDS=%s\n' \
+            "$path" "$bytes" "$sha" "$fields" "$fields" >> "${evidence}/vtu-point-data.txt"
+        printf 'VTU_OBSERVED_CELL_FIELDS=\nVTU_MISSING_REQUIRED_FIELDS=\nVTU_REQUIRED_FIELDS_RESULT=MATCH\nVTU_TAG_EVIDENCE=COMPLETE\n' \
+            >> "${evidence}/vtu-point-data.txt"
+        {
+            printf '== VTU_TAGS path=%s sha256=%s\n' "$path" "$sha"
+            printf 'TAG offset=150 bytes=11 element=PointData context=Piece\n<PointData>\n'
+            printf 'TAG offset=162 bytes=60 element=DataArray context=PointData\n<DataArray Name="U"/>\n'
+            printf '== VTU_TAGS_END path=%s tag_evidence=COMPLETE\n' "$path"
+        } >> "${evidence}/vtu-tags.txt"
+    done
+    printf '\nVTU_FILE_COUNT=2\nVTU_EVIDENCE=PRESENT\nVTU_REQUIRED_FIELDS_VERDICT=COMPLETE\n' >> "${evidence}/vtu-point-data.txt"
+}
+
+# ab_fr_metric_evidence <workspace> - the m3-mean-speed record of an available
+# collection of time 2 by the same producer (the format of S72).
+ab_fr_metric_evidence() {
+    local workspace="$1" metric manifest turbulence
+    metric="${workspace}/runner_temp/evidence/m3-mean-speed"
+    mkdir -p "${metric}/logs" "${metric}/output"
+    turbulence="$(printf 'simulationType RAS;\n' | sha256sum | cut -d ' ' -f 1)"
+    manifest="$(printf 'path\tbytes\tsha256\n2/U\t307\t%s\nconstant/turbulenceProperties\t264\t%s\n' "$AB_FR_EMPTY_SHA" "$turbulence")"
+    printf '%s\n' "$manifest" > "${metric}/source-before.tsv"
+    printf '%s\n' "$manifest" > "${metric}/source-after.tsv"
+    printf '%s\n' "$manifest" > "${metric}/snapshot-before.tsv"
+    printf '%s\n' "$manifest" > "${metric}/snapshot-after.tsv"
+    printf 'PACKAGE=openfoam2512-default\n' > "${metric}/identity.txt"
+    printf 'seq\tlabel\n' > "${metric}/commands.tsv"
+    printf 'kind\tbytes\tsha256\tpath\n' > "${metric}/inventory.txt"
+    printf 'label\tbytes\ttime_ms\n' > "${metric}/task-bytes.tsv"
+    printf 'LAUNCH 1\n' > "${metric}/process-check.txt"
+    printf 'APPLICATION=simpleFoam\nSTART_FROM=latestTime\nSIMULATION_TYPE=RAS\nRAS_MODEL=kEpsilon\n' > "${metric}/logs/12-controls.out"
+    printf '# Region : all region0\n' > "${metric}/output/volFieldValue.dat"
+    # The approved 636-byte dictionary, from the extracted collection block.
+    bash --noprofile --norc -c "$(ab_collect_block "$workspace")"'
+printf "%s" "$METRIC_DICTIONARY"' > "${metric}/metric-functions"
+    {
+        printf 'MEAN_SPEED_VERDICT=AVAILABLE\nMEAN_SPEED_REASON_CODE=NONE\nMEAN_SPEED_VALUE=3.66666666666666652e+00\n'
+        printf 'MEAN_SPEED_UNIT=m/s\nMAIN_SHA=%s\nRUN_ID=4545\nSOURCE_FLOW_CASE=src/batch_9/case_7/flow\n' "$AB_COLLECT_SHA"
+        printf 'POST_PROCESSING_TIME=2\nSELECTED_TIME=2\nDICTIONARY_BYTES=636\nDICTIONARY_SHA256=%s\n' "$AB_COLLECT_DICTIONARY_SHA"
+        printf 'INPUTS_UNCHANGED=YES\nOUTPUT_PATH=postProcessing/m3MeanSpeed/2/volFieldValue.dat\n'
+        printf 'OUTPUT_SHA256=%s\nOUTPUT_TIME=2\nOUTPUT_REGION=all region0\n' \
+            "$(sha256sum < "${metric}/output/volFieldValue.dat" | cut -d ' ' -f 1)"
+        printf 'OUTPUT_FIELD=volAverage(m3MagU)\nOUTPUT_CELLS=2\nOUTPUT_VOLUME=3.00000000000000000e+00\n'
+        printf 'OUTPUT_VALUE=3.66666666666666652e+00\nCLEANUP_RESULT=REMOVED\nPROCESS_CHECK_RESULT=COMPLETE\n'
+        printf 'LOGS_RETAINED=YES\nINVENTORY=COMPLETE\n'
+    } > "${metric}/result.env"
+}
+
+# ab_fr_library <workspace> - the capture work helpers before the VTU reader
+# (notes_file, capture_note, bounded, and _bounded) and the functional-receipt
+# block, from the extracted capture step.
+ab_fr_library() {
+    local step="${1}/capture_step.sh"
+    awk '/<<.CAPTURE_WORK.$/ { inside = 1; next } inside && /^# Change 7\./ { exit } inside { print }' "$step"
+    awk '/^# ---- Functional receipt: begin ----$/ { inside = 1 } inside && !done { print }
+         /^# ---- Functional receipt: end ----$/ { done = 1 }' "$step"
+}
+
+# ab_fr_fixture <workspace> - the extracted capture step, the controlled
+# records, the capture evidence of the earlier items, and an available
+# collection record, for ab_fr_unit.
+ab_fr_fixture() {
+    ab_capture_fixture "$1"
+    ab_fr_records "${1}/checkout"
+    ab_fr_scanner_evidence "$1"
+    ab_fr_metric_evidence "$1"
+}
+
+# ab_fr_unit <workspace> [NAME=value ...] - run the extracted receipt functions
+# alone, as the capture work calls them after the collection, with a far
+# capture work end. The arguments override the environment. Prints status=.
+ab_fr_unit() {
+    local workspace="$1" library status
+    shift
+    library="$(ab_fr_library "$workspace")"
+    [[ "$library" == *"# ---- Functional receipt: end ----"* ]] ||
+        { _fail "the functional-receipt block of the capture work must be extracted"; return 1; }
+    : > "${workspace}/runner_temp/evidence/capture-work-notes.txt"
+    env PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_WORKSPACE="${workspace}/checkout" CAPTURE_WORK_END="$(( $(date +%s) + 1000 ))" \
+        GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 GITHUB_RUN_ATTEMPT=1 \
+        GITHUB_REPOSITORY=derek-thl/ucfd_run_batch GITHUB_WORKFLOW=openfoam-evidence GITHUB_JOB=evidence \
+        "$@" "${AB_STEP_BASH[@]}" -c "${library}"'
+fr_capture' > "${workspace}/unit.out" 2>&1 && status=0 || status=$?
+    printf 'status=%s\n' "$status"
+}
+
+# ab_fr_dir <workspace> - the functional-receipt subtree.
+ab_fr_dir() {
+    printf '%s\n' "${1}/runner_temp/evidence/functional-receipt"
+}
+
+# ab_fr_value <workspace> <key> - one value of functional-receipt/result.env.
+ab_fr_value() {
+    ab_file_value "$(ab_fr_dir "$1")/result.env" "$2"
+}
+
+# ab_fr_cell <file> <key-column> <key> <column> - one cell of a receipt TSV
+# file: the named column of the first row whose key column holds the key.
+ab_fr_cell() {
+    awk -F '\t' -v kc="$2" -v key="$3" -v col="$4" '
+        NR == 1 { for (i = 1; i <= NF; i++) index_of[$i] = i; next }
+        $(index_of[kc]) == key { print $(index_of[col]); exit }' "$1" 2>/dev/null || true
+}
+
+# ab_fr_check <workspace> <check> [column] - one cell of the F1 to F10 row.
+ab_fr_check() {
+    ab_fr_cell "$(ab_fr_dir "$1")/checks.tsv" check "$2" "${3:-result}"
+}
+
+# ab_fr_record <workspace> <record> [column] - one cell of a records.tsv row.
+ab_fr_record() {
+    ab_fr_cell "$(ab_fr_dir "$1")/records.tsv" record "$2" "${3:-outcome}"
+}
+
+# ab_fr_entry <workspace> <entry> [column] [source] - one cell of the
+# setup-entry-values row of one entry. The source, relative to the Batch
+# Workspace, defaults to the first row of the entry.
+ab_fr_entry() {
+    awk -F '\t' -v entry="$2" -v col="${3:-result}" -v source="${4:-}" '
+        NR == 1 { for (i = 1; i <= NF; i++) index_of[$i] = i; next }
+        $3 == entry && (source == "" || $1 == source) { print $(index_of[col]); exit }' \
+        "$(ab_fr_dir "$1")/setup-entry-values.tsv" 2>/dev/null || true
+}
+
+# ab_fr_tree_sha <directory> - one checksum line for each readable regular
+# file, sorted. An unreadable file has no line before and after the run.
+ab_fr_tree_sha() {
+    (cd "$1" && find . -type f -readable -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) || true
+}
+
+# ab_fr_summary <workspace> - run the extracted summary step with the receipt
+# values that the capture step published. Prints the job summary.
+ab_fr_summary() {
+    local workspace="$1"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" \
+        FUNCTIONAL_RECEIPT_RESULT="$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" \
+        FUNCTIONAL_RECEIPT_CHECKS="$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" \
+        "${AB_STEP_BASH[@]}" "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
+        _fail "the extracted summary step must succeed"
+    cat "${workspace}/step_summary"
+}
+
+# ab_fr_expect_unit <label> <workspace> <checks> - a unit run that ends with
+# status 0 and gives the F1 to F10 results <checks>.
+ab_fr_expect_unit() {
+    local label="$1" workspace="$2" checks="$3" run
+    shift 3
+    run="$(ab_fr_unit "$workspace" "$@")"
+    assert_contains "$run" "status=0" "${label}: the receipt work ends with status 0"
+    [[ "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" == "$checks" ]] ||
+        _fail "${label}: the check results must be ${checks}" \
+              "actual: $(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" \
+              "$(cut -f 1,3,5 "$(ab_fr_dir "$workspace")/checks.tsv" 2>/dev/null)" "$(tail -n 5 "${workspace}/unit.out")"
+}
+
+# ab_fr_case <label> <checks> <setup> [NAME=value ...] - one unit run in a new
+# workspace after <setup> changes the controlled fixture. The construction must
+# be COMPLETE, the source tree must stay unchanged, and no capture note is
+# written. Sets AB_FR_LAST to the workspace.
+ab_fr_case() {
+    local label="$1" checks="$2" setup="$3" workspace before after
+    shift 3
+    workspace="$(new_workspace "${label//[^A-Za-z0-9_.-]/_}")"
+    ab_fr_fixture "$workspace"
+    "$setup" "$workspace"
+    before="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    ab_fr_expect_unit "$label" "$workspace" "$checks" "$@"
+    after="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    assert_eq "$before" "$after" "${label}: the receipt writes no source file"
+    assert_eq "COMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "${label}: the construction is complete"
+    assert_eq "" "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" \
+        "${label}: a source-content gap gives no capture note"
+    AB_FR_LAST="$workspace"
+}
+
+# ab_fr_assert_inventory <workspace> <label> - inventory.tsv lists each receipt
+# file except itself and result.env with its exact byte count and SHA-256, and
+# result.env binds the inventory by its SHA-256.
+ab_fr_assert_inventory() {
+    local workspace="$1" label="$2" dir expected
+    dir="$(ab_fr_dir "$workspace")"
+    expected="$(cd "$dir" && find . -type f ! -path ./inventory.tsv ! -path ./result.env -print0 | LC_ALL=C sort -z |
+        while IFS= read -r -d '' file; do
+            printf 'FILE\t%s\t%s\t%s\n' "$(stat -c %s -- "$file")" "$(sha256sum < "$file" | cut -d ' ' -f 1)" "${file#./}"
+        done)"
+    assert_eq "$expected" "$(grep '^FILE' "${dir}/inventory.tsv")" "${label}: the inventory lists each receipt file exactly"
+    assert_eq "$(sha256sum < "${dir}/inventory.tsv" | cut -d ' ' -f 1)" "$(ab_fr_value "$workspace" INVENTORY_SHA256)" \
+        "${label}: result.env binds the inventory by its SHA-256"
+}
+
+s94_receipt_complete_controlled_fixture() {
+    local workspace run dir flow batch before after record id index row source expected file entry value line
+    local listing decoded offset bytes count
+    workspace="$(new_workspace s94_receipt)"
+    ab_collect_fixture "$workspace"
+    ab_fr_records "${workspace}/checkout"
+    batch="${workspace}/checkout/src/batch_9"
+    flow="$(ab_collect_flow "$workspace")"
+    dir="$(ab_fr_dir "$workspace")"
+    before="$(ab_collect_tree_sha "$batch")"
+    run="$(ab_collect_run "$workspace")"
+    after="$(ab_collect_tree_sha "$batch")"
+    assert_contains "$run" "status=0" "S94: the capture step ends with status 0"
+    assert_eq "$before" "$after" "S94: the receipt and the collection write no source file"
+    # The unchanged collection, product, and capture results.
+    assert_eq "AVAILABLE" "$(ab_collect_value "$workspace" MEAN_SPEED_VERDICT)" "S94: the collection stays available"
+    assert_eq "3.66666666666666652e+00" "$(ab_collect_value "$workspace" MEAN_SPEED_VALUE)" "S94: the mean speed stays 11/3 m/s"
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S94: the capture is complete"
+    [[ "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" == COMPLETE ]] ||
+        _fail "S94: the receipt construction must be COMPLETE" \
+              "reason: $(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_REASON)" "$(tail -n 8 "${workspace}/capture_step.out")"
+    assert_eq "$AB_FR_ALL_PASS" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" \
+        "S94: every supported check passes, and F4 and F10 stay NOT_VERIFIED"
+    assert_eq "POST_ORCHESTRATOR_CAPTURE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_CHECKPOINT)" "S94: the checkpoint"
+    # Check 9: a complete controlled receipt is evidence construction only.
+    assert_contains "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_SCOPE)" "not M3 acceptance" \
+        "S94: COMPLETE is construction only, not M3 acceptance"
+    assert_eq "0" "$(grep -rhoE 'ACCEPTED|ACCEPTANCE=|CONVERGED|solution converged' "$dir" | grep -c . || true)" \
+        "S94: the receipt states no acceptance and no solver convergence"
+    # The producer identity.
+    assert_eq "$AB_COLLECT_SHA" "$(ab_file_value "${dir}/identity.env" EXECUTION_SHA)" "S94: the execution SHA"
+    assert_eq "4545" "$(ab_file_value "${dir}/identity.env" GITHUB_RUN_ID)" "S94: the run ID"
+    assert_eq "case_7" "$(ab_file_value "${dir}/identity.env" CASE_ID)" "S94: the Case"
+    assert_eq "9" "$(ab_file_value "${dir}/identity.env" BATCH_ID)" "S94: the Batch ID"
+    assert_eq "src/batch_9" "$(ab_file_value "${dir}/identity.env" BATCH_WORKSPACE)" "S94: the Batch Workspace"
+    assert_eq "src/output_batch_1.csv Case 7" "$(ab_file_value "${dir}/identity.env" APPROVED_ROW)" "S94: the approved row"
+    # Checks 1 and 2: the six exact source records, with the raw bytes and
+    # correct source and retained hashes; the empty markers stay zero-byte
+    # records.
+    assert_eq $'record\tsource\tsource_bytes_before\tsource_sha256_before\tsource_bytes_after\tsource_sha256_after\tretained\tretained_bytes\tretained_sha256\toutcome\treason' \
+        "$(head -n 1 "${dir}/records.tsv")" "S94: the record columns"
+    assert_eq "7" "$(grep -c '' "${dir}/records.tsv")" "S94: one row for each of the six records"
+    for index in "${!AB_FR_RECORDS[@]}"; do
+        record="${AB_FR_RECORDS[$index]}" id="${AB_FR_RECORD_IDS[$index]}"
+        source="${batch}/${record}"
+        expected="$(sha256sum < "$source" | cut -d ' ' -f 1)"
+        bytes="$(stat -c %s -- "$source")"
+        row="$(awk -F '\t' -v id="$id" '$1 == id' "${dir}/records.tsv")"
+        assert_eq "${id}"$'\t'"${record}"$'\t'"${bytes}"$'\t'"${expected}"$'\t'"${bytes}"$'\t'"${expected}"$'\t'"files/${record}"$'\t'"${bytes}"$'\t'"${expected}"$'\tRETAINED' \
+            "$(cut -f 1-10 <<< "$row")" "S94: ${id} is retained with its exact bytes and hashes"
+        cmp -s -- "$source" "${dir}/files/${record}" || _fail "S94: ${id} keeps the raw source bytes"
+    done
+    for id in FLOW_MARKER RESTART_MARKER; do
+        assert_eq "0" "$(ab_fr_record "$workspace" "$id" retained_bytes)" "S94: ${id} is a complete zero-byte record"
+        assert_eq "$AB_FR_EMPTY_SHA" "$(ab_fr_record "$workspace" "$id" retained_sha256)" "S94: ${id} has the empty-file SHA-256"
+    done
+    # Check 1: every selected Setup entry, with its exact source bytes and value.
+    assert_eq $'source\tsource_sha256\tentry\toutcome\toffset\tbytes\tentry_base64\tfragment_sha256\tvalue\texpected\tresult\treason' \
+        "$(head -n 1 "${dir}/setup-entry-values.tsv")" "S94: the entry columns"
+    assert_eq "$(ab_fr_expected_entries)" "$(awk -F '\t' 'NR > 1 { print $1 "\t" $3 "\t" $9 }' "${dir}/setup-entry-values.tsv")" \
+        "S94: the 57 selected entries with the values that Setup writes"
+    assert_eq "57" "$(awk -F '\t' 'NR > 1 && $4 == "FOUND" && $9 == $10 && $11 == "PASS"' "${dir}/setup-entry-values.tsv" | wc -l)" \
+        "S94: each entry is found once, equals its expected value, and passes"
+    while IFS=$'\t' read -r source sha entry _ offset count line fragment _; do
+        [[ "$source" == source ]] && continue
+        file="${batch}/${source}"
+        assert_eq "$(sha256sum < "$file" | cut -d ' ' -f 1)" "$sha" "S94: ${entry} names its source SHA-256"
+        decoded="$(base64 -d <<< "$line" | od -An -tx1 | tr -d ' \n')"
+        assert_eq "$(tail -c "+$(( offset + 1 ))" -- "$file" | head -c "$count" | od -An -tx1 | tr -d ' \n')" "$decoded" \
+            "S94: ${entry} keeps the exact source bytes at its offset"
+        assert_eq "$(base64 -d <<< "$line" | sha256sum | cut -d ' ' -f 1)" "$fragment" "S94: ${entry} has its fragment SHA-256"
+    done < "${dir}/setup-entry-values.tsv"
+    # Check 5: only the selected fragments; no field payload, mesh, VTU, or
+    # transport content enters the receipt.
+    assert_eq "0" "$(awk -F '\t' 'NR > 1 { print $7 }' "${dir}/setup-entry-values.tsv" | while IFS= read -r line; do
+        base64 -d <<< "$line"; printf '\n'; done | grep -cE 'internalField|nonuniform|dimensions|FoamFile' || true)" \
+        "S94: no fragment holds an internal field, dimensions, or a file header"
+    listing="$(cd "$dir" && find . -mindepth 1 | LC_ALL=C sort)"
+    assert_eq $'./checks.tsv\n./files\n./files/case_7\n./files/case_7/flow\n./files/case_7/flow/doe_row.csv\n./files/case_7/flow/flow.marker\n./files/case_7/flow/restart.marker\n./files/case_7/flow/setup_metadata.env\n./files/case_7/vtk\n./files/case_7/vtk/flow_latest_time.txt\n./files/case_7/vtk/post_processing.complete\n./identity.env\n./inventory.tsv\n./records.tsv\n./result.env\n./setup-entry-values.tsv' \
+        "$listing" "S94: the receipt holds only its text records and the six source records"
+    if find "${workspace}/runner_temp/evidence" -name '*.vtu' -o -name polyMesh -o -name 'trd*' | grep -q .; then
+        _fail "S94: no VTU, mesh, or transport content enters the evidence"
+    fi
+    (( $(du -sb --apparent-size "$dir" | cut -f 1) <= 262144 )) || _fail "S94: the receipt holds at most 262144 bytes"
+    # The checks, with exact limits for F4, F8, and F10.
+    assert_eq $'check\trequirement\tresult\tevidence\treason\tlimitation' "$(head -n 1 "${dir}/checks.tsv")" "S94: the check columns"
+    assert_eq "F1 F2 F3 F4 F5 F6 F7 F8 F9 F10" "$(awk -F '\t' 'NR > 1 { print $1 }' "${dir}/checks.tsv" | paste -sd ' ' -)" \
+        "S94: one row for each check, in order"
+    # Check 8: a PointData MATCH and a whole-file hash are no payload readback.
+    assert_contains "$(ab_fr_check "$workspace" F4 reason)" "payload-readback witness" \
+        "S94: F4 names the absent payload-readback witness"
+    assert_contains "$(ab_fr_check "$workspace" F4 evidence)" "case_7/vtk/flow_latest_2.vtu" "S94: F4 names the latest VTU file"
+    assert_contains "$(ab_fr_check "$workspace" F8 limitation)" "not solver convergence" \
+        "S94: a marker is Stage evidence, not solver convergence"
+    assert_contains "$(ab_fr_check "$workspace" F10 reason)" "F4" "S94: F10 names the unresolved F4"
+    assert_contains "$(ab_fr_check "$workspace" F7 evidence)" "m3-mean-speed/result.env" "S94: F7 names the collection record"
+    ab_fr_assert_inventory "$workspace" "S94"
+    # The published result and the summary row.
+    assert_eq "COMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S94: GITHUB_ENV has the receipt result"
+    assert_eq "$AB_FR_ALL_PASS" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" "S94: GITHUB_ENV has the check results"
+    assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`COMPLETE\` ${AB_FR_ALL_PASS} |" \
+        "S94: the summary shows the receipt result"
+}
+
+# ---- S95: the time, signature, VTU, and producer checks ---------------------
+
+s95_receipt_time_signature_and_producer_checks() {
+    local workspace
+    # The unit baseline equals the integrated result of S94.
+    workspace="$(new_workspace s95_baseline)"
+    ab_fr_fixture "$workspace"
+    ab_fr_expect_unit "S95 baseline" "$workspace" "$AB_FR_ALL_PASS"
+    ab_fr_assert_inventory "$workspace" "S95 baseline"
+    ab_fr_case "S95 post time" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_post_time
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "flow_latest=3" "S95: a wrong post time is named"
+    ab_fr_case "S95 duplicate key" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_post_duplicate
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "scalar_field" "S95: a duplicate key is named"
+    ab_fr_case "S95 missing key" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_post_missing
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "vtu_point_data" "S95: a missing key is named"
+    ab_fr_case "S95 transport ready" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_post_ready
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "transport_ready=1" "S95: a transport-ready mismatch is named"
+    ab_fr_case "S95 key order" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_post_order
+    ab_fr_case "S95 zero time" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_time_zero
+    ab_fr_case "S95 time without line end" "F1=PASS;F2=FAIL;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_time_no_end
+    ab_fr_case "S95 collector time" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=FAIL;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_metric_time
+    ab_fr_case "S95 no collection" "F1=NOT_VERIFIED;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=NOT_VERIFIED;F8=PASS;F9=NOT_VERIFIED;F10=NOT_VERIFIED" \
+        ab_fr_no_metric
+    # A mixed producer identity cannot pass.
+    ab_fr_case "S95 other producer" "F1=NOT_VERIFIED;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=FAIL;F8=PASS;F9=FAIL;F10=FAIL" \
+        ab_fr_metric_producer
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F7 reason)" "producer" "S95: the mixed producer is named"
+    # Check 8: a missing latest VTU file fails F4 and F6; a CellData-only field
+    # fails F5; an incomplete tag record stays NOT_VERIFIED.
+    ab_fr_case "S95 missing VTU" "F1=PASS;F2=PASS;F3=PASS;F4=FAIL;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_vtu_missing
+    ab_fr_case "S95 CellData only" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=FAIL;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_vtu_cell_only
+    ab_fr_case "S95 tag limit" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=NOT_VERIFIED;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_vtu_tag_limit
+}
+ab_fr_post() {
+    printf '%s\n' "$2" > "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
+}
+ab_fr_post_time() { ab_fr_post "$1" "${AB_FR_SIGNATURE/flow_latest=2/flow_latest=3}"; }
+ab_fr_post_duplicate() { ab_fr_post "$1" "${AB_FR_SIGNATURE}"$'\nscalar_field=T'; }
+ab_fr_post_missing() { ab_fr_post "$1" "${AB_FR_SIGNATURE%$'\n'vtu_point_data=included}"; }
+ab_fr_post_ready() { ab_fr_post "$1" "${AB_FR_SIGNATURE/transport_ready=0/transport_ready=1}"; }
+ab_fr_post_order() {
+    ab_fr_post "$1" $'flow_latest=2\ntransport_times=\ntransport_ready=0\nscalar_field=T\nflow_zero_fields=(U p wallDistance)\nflow_result_fields=(U p)\nvtu_point_data=included'
+}
+ab_fr_time_zero() { printf '0\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_fr_time_no_end() { printf '2' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_fr_metric_time() {
+    sed -i -e 's/^SELECTED_TIME=2$/SELECTED_TIME=3/' "${1}/runner_temp/evidence/m3-mean-speed/result.env"
+}
+ab_fr_no_metric() { rm -rf -- "${1:?}/runner_temp/evidence/m3-mean-speed"; }
+ab_fr_metric_producer() {
+    sed -i -e 's/^MAIN_SHA=.*/MAIN_SHA=0000000000000000000000000000000000000000/' \
+        "${1}/runner_temp/evidence/m3-mean-speed/result.env"
+}
+ab_fr_vtu_missing() {
+    local manifest="${1}/runner_temp/evidence/vtu-point-data.txt"
+    sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_latest_2.vtu$/,/^VTU_TAG_EVIDENCE=/{
+        s/^VTU_REQUIRED_FIELDS_RESULT=MATCH$/VTU_REQUIRED_FIELDS_RESULT=MISSING_FILE/
+        s/^VTU_TAG_EVIDENCE=COMPLETE$/VTU_TAG_EVIDENCE=UNAVAILABLE/
+    }' "$manifest"
+}
+ab_fr_vtu_cell_only() {
+    sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_0.vtu$/,/^VTU_TAG_EVIDENCE=/{
+        s/^VTU_REQUIRED_FIELDS_RESULT=MATCH$/VTU_REQUIRED_FIELDS_RESULT=SOURCE_POINTDATA_ABSENT/
+    }' "${1}/runner_temp/evidence/vtu-point-data.txt"
+}
+ab_fr_vtu_tag_limit() {
+    sed -i -e 's#^== VTU_TAGS_END path=case_7/vtk/flow_0.vtu tag_evidence=COMPLETE$#== VTU_TAGS_END path=case_7/vtk/flow_0.vtu tag_evidence=OUTPUT_LIMIT#' \
+        "${1}/runner_temp/evidence/vtu-tags.txt"
+}
+
+# ---- S96: the source records stay distinct ----------------------------------
+
+s96_receipt_source_records_stay_distinct() {
+    local workspace
+    ab_fr_case "S96 missing" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_missing_row
+    assert_eq "MISSING" "$(ab_fr_record "$AB_FR_LAST" DOE_ROW)" "S96: a missing record is MISSING"
+    assert_file_missing "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/flow/doe_row.csv" "S96: no record replaces a missing one"
+    ab_fr_case "S96 link" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_link_marker
+    assert_eq "LINK" "$(ab_fr_record "$AB_FR_LAST" FLOW_MARKER)" "S96: a linked record is LINK"
+    ab_fr_case "S96 FIFO" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_fifo_marker
+    assert_eq "NOT_REGULAR" "$(ab_fr_record "$AB_FR_LAST" RESTART_MARKER)" "S96: a FIFO is NOT_REGULAR"
+    ab_fr_case "S96 oversized" "F1=PASS;F2=PASS;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_big_post
+    assert_eq "OVERSIZED" "$(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE)" "S96: a record above 65536 bytes is OVERSIZED"
+    assert_eq "65537" "$(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE source_bytes_before)" "S96: the oversized size is recorded"
+    assert_file_missing "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/vtk/post_processing.complete" "S96: no part of an oversized record is kept"
+    ab_fr_case "S96 linked Case" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_link_flow
+    assert_eq "LINK LINK LINK LINK" "$(for id in DOE_ROW SETUP_METADATA FLOW_MARKER RESTART_MARKER; do
+        ab_fr_record "$AB_FR_LAST" "$id"; done | paste -sd ' ' -)" "S96: a linked Case directory gives LINK for each of its records"
+    assert_eq "LINK" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" \
+        "S96: no entry is read through a linked Case directory"
+    if [[ "$(id -u)" != 0 ]]; then
+        ab_fr_case "S96 unreadable" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+            ab_fr_unreadable_metadata
+        assert_eq "UNREADABLE" "$(ab_fr_record "$AB_FR_LAST" SETUP_METADATA)" "S96: an unreadable record is UNREADABLE"
+        chmod 644 "${AB_FR_LAST}/checkout/src/batch_9/case_7/flow/setup_metadata.env"
+    fi
+    # A record that changes during the capture is CHANGED, and no copy stays.
+    workspace="$(new_workspace s96_changed)"
+    ab_fr_fixture "$workspace"
+    ab_fr_fake_changing_head "$workspace"
+    ab_fr_expect_unit "S96 changed" "$workspace" \
+        "F1=PASS;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED"
+    assert_eq "CHANGED" "$(ab_fr_record "$workspace" LATEST_TIME)" "S96: a changed record is CHANGED"
+    assert_ne "$(ab_fr_record "$workspace" LATEST_TIME source_sha256_before)" \
+        "$(ab_fr_record "$workspace" LATEST_TIME source_sha256_after)" "S96: the changed hashes are both recorded"
+    assert_file_missing "$(ab_fr_dir "$workspace")/files/case_7/vtk/flow_latest_time.txt" "S96: no stale copy of a changed record stays"
+    # No record or entry text runs: a command in a record or a dictionary
+    # directive leaves no marker file.
+    ab_fr_case "S96 no execution" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_command_text
+    assert_file_missing "${AB_FR_LAST}/executed" "S96: no record or entry text runs"
+    assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
+        "S96: a directive at a keyword position makes the entries of its dictionary AMBIGUOUS"
+}
+ab_fr_missing_row() { rm -f -- "${1}/checkout/src/batch_9/case_7/flow/doe_row.csv"; }
+ab_fr_link_marker() {
+    local flow="${1}/checkout/src/batch_9/case_7/flow"
+    printf 'other\n' > "${1}/checkout/src/other.marker"
+    rm -f -- "${flow}/flow.marker"
+    ln -s ../../../other.marker "${flow}/flow.marker"
+}
+ab_fr_fifo_marker() {
+    local flow="${1}/checkout/src/batch_9/case_7/flow"
+    rm -f -- "${flow}/restart.marker"
+    mkfifo "${flow}/restart.marker"
+}
+ab_fr_big_post() {
+    head -c 65537 /dev/zero | tr '\0' 'x' > "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
+}
+ab_fr_link_flow() {
+    local case_dir="${1}/checkout/src/batch_9/case_7"
+    mv -- "${case_dir}/flow" "${1}/checkout/src/flow_elsewhere"
+    ln -s ../../flow_elsewhere "${case_dir}/flow"
+}
+ab_fr_unreadable_metadata() { chmod 000 "${1}/checkout/src/batch_9/case_7/flow/setup_metadata.env"; }
+ab_fr_command_text() {
+    local flow="${1}/checkout/src/batch_9/case_7/flow"
+    sed -i -e "s#^ws=5.0\$#ws=\$(touch ${1}/executed)#" "${flow}/setup_metadata.env"
+    sed -i -e "s#^boundaryField\$#\#codeStream { code \#{ system(\"touch ${1}/executed\"); \#}; }\nboundaryField#" "${flow}/0/k"
+}
+
+# ab_fr_fake_changing_head <workspace> - a head that appends one byte to the
+# post-processing time record after it reads it, as another writer would.
+ab_fr_fake_changing_head() {
+    local real
+    real="$(command -v head)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\n' "$real"
+        cat <<'FAKE_HEAD'
+"$real" "$@"
+status=$?
+for argument in "$@"; do
+    case "$argument" in
+        */case_7/vtk/flow_latest_time.txt) printf '0' >> "$argument" ;;
+    esac
+done
+exit "$status"
+FAKE_HEAD
+    } > "${1}/fakebin/head"
+    chmod +x "${1}/fakebin/head"
+}
+
+# ---- S97: the selected Setup entries fail closed ----------------------------
+
+s97_receipt_setup_entries_fail_closed() {
+    ab_fr_case "S97 duplicate" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_duplicate_entry
+    assert_eq "DUPLICATE" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" "S97: a duplicate entry is DUPLICATE"
+    ab_fr_case "S97 pattern" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_pattern_entry
+    assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.f18p1_oai_a1.value outcome)" \
+        "S97: a pattern keyword makes the entries of its dictionary AMBIGUOUS"
+    ab_fr_case "S97 macro" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_macro_entry
+    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
+        "S97: a macro value is UNSUPPORTED"
+    ab_fr_case "S97 truncated" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_truncated_entry
+    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/epsilon)" \
+        "S97: an entry of a truncated dictionary is UNSUPPORTED"
+    ab_fr_case "S97 oversized" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_big_dictionary
+    assert_eq "OVERSIZED" "$(ab_fr_entry "$AB_FR_LAST" snap outcome)" "S97: a dictionary above 1048576 bytes is OVERSIZED"
+    ab_fr_case "S97 byte" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_binary_dictionary
+    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" "S97: a non-ASCII byte is UNSUPPORTED"
+    ab_fr_case "S97 wrong value" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_wrong_ranks
+    assert_eq "FAIL" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains)" "S97: a wrong required value fails"
+    assert_eq "4" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains value)" "S97: the actual value is kept"
+    ab_fr_case "S97 placeholder" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_placeholder
+    assert_eq "FAIL" "$(ab_fr_entry "$AB_FR_LAST" nx)" "S97: an unresolved placeholder fails"
+    ab_fr_case "S97 no geometry log" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_no_geometry_log
+    assert_eq "NOT_VERIFIED PASS" "$(ab_fr_entry "$AB_FR_LAST" xMin) $(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains)" \
+        "S97: only the geometry entries lose their expected value"
+    ab_fr_case "S97 metadata" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_wrong_model
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 reason)" "ras_model" "S97: the wrong metadata value is named"
+    ab_fr_case "S97 row" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_other_row
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 reason)" "doe_row.csv" "S97: a row that differs from the DOE Batch CSV is named"
+}
+ab_fr_dictionary() { printf '%s\n' "${1}/checkout/src/batch_9/case_7/flow/${2}"; }
+ab_fr_duplicate_entry() { printf 'numberOfSubdomains 8;\n' >> "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
+ab_fr_pattern_entry() {
+    sed -i -e 's#^boundaryField$#boundaryField\n{\n    ".*_oai_.*"\n    {\n        type            fixedValue;\n    }\n}\nboundaryField#' \
+        "$(ab_fr_dictionary "$1" 0/U)"
+}
+ab_fr_macro_entry() { sed -i -e 's#^        Uref            5;$#        Uref            $UrefValue;#' "$(ab_fr_dictionary "$1" 0/k)"; }
+ab_fr_truncated_entry() { sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"; sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"; }
+ab_fr_big_dictionary() {
+    head -c 1048600 /dev/zero | tr '\0' ' ' >> "$(ab_fr_dictionary "$1" system/snappyHexMeshDict)"
+}
+ab_fr_binary_dictionary() { printf '// \351\n' >> "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
+ab_fr_wrong_ranks() { sed -i -e 's/^numberOfSubdomains 8;$/numberOfSubdomains 4;/' "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
+ab_fr_placeholder() { sed -i -e 's/^nx    45;/nx    <nx>;/' "$(ab_fr_dictionary "$1" system/blockMeshDict)"; }
+ab_fr_no_geometry_log() { rm -f -- "$(ab_fr_dictionary "$1" log.surfaceCheck)"; }
+ab_fr_wrong_model() { sed -i -e 's/^ras_model=kEpsilon$/ras_model=kOmega/' "$(ab_fr_dictionary "$1" setup_metadata.env)"; }
+ab_fr_other_row() { sed -i -e '2s/^7,/8,/' "$(ab_fr_dictionary "$1" doe_row.csv)"; }
+
+# ---- S98: the time and byte limits fail closed -------------------------------
+
+s98_receipt_limits_fail_closed() {
+    local workspace run start elapsed dir
+    # The time limit: a read that blocks stops before the receipt end. The
+    # records before it stay, no partial copy stays, and the stop is a capture
+    # note.
+    workspace="$(new_workspace s98_time)"
+    ab_fr_fixture "$workspace"
+    ab_fake_hang "$workspace" head '*/case_7/vtk/flow_latest_time.txt'
+    dir="$(ab_fr_dir "$workspace")"
+    start="$(date +%s)"
+    run="$(ab_fr_unit "$workspace" CAPTURE_WORK_END="$(( start + 15 ))")"
+    elapsed=$(( $(date +%s) - start ))
+    assert_contains "$run" "status=0" "S98 time: the receipt work ends with status 0"
+    (( elapsed <= 5 )) || _fail "S98 time: the receipt work ends by its end, 10 seconds before the capture work end" "elapsed: ${elapsed}"
+    ab_assert_fakes_stopped "$workspace" "S98 time"
+    assert_eq "INCOMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 time: the construction is incomplete"
+    assert_contains "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_REASON)" "time" "S98 time: the reason names the time limit"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "functional receipt" \
+        "S98 time: the stop is a capture note"
+    assert_eq "RETAINED RETAINED RETAINED RETAINED" "$(for id in DOE_ROW SETUP_METADATA FLOW_MARKER RESTART_MARKER; do
+        ab_fr_record "$workspace" "$id"; done | paste -sd ' ' -)" "S98 time: the records before the stop stay"
+    assert_file_missing "${dir}/files/case_7/vtk/flow_latest_time.txt" "S98 time: no partial record stays"
+    assert_eq "" "$(find "$dir" -name '*.part' -print)" "S98 time: no part file stays in the receipt"
+    # The receipt subtree limit: four records of 65000 bytes do not fit with
+    # the text records and the result reserve.
+    workspace="$(new_workspace s98_tree)"
+    ab_fr_fixture "$workspace"
+    ab_fr_big_records "$workspace"
+    run="$(ab_fr_unit "$workspace")"
+    assert_contains "$run" "status=0" "S98 tree: the receipt work ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 tree: the construction is incomplete"
+    assert_eq "OUTPUT_LIMIT" "$(ab_fr_record "$workspace" RESTART_MARKER)" "S98 tree: the record above the subtree limit is OUTPUT_LIMIT"
+    assert_file_missing "$(ab_fr_dir "$workspace")/files/case_7/flow/restart.marker" "S98 tree: no part of it is kept"
+    (( $(du -sb --apparent-size "$(ab_fr_dir "$workspace")" | cut -f 1) <= 262144 )) ||
+        _fail "S98 tree: the receipt holds at most 262144 bytes"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "functional receipt" \
+        "S98 tree: the limit is a capture note"
+    # The combined limit, in the capture step: the collection evidence and the
+    # receipt share the 10485760-byte ceiling. The earlier failed Stage copy
+    # stays the first note, and the summary and the upload stay eligible.
+    workspace="$(new_workspace s98_combined)"
+    ab_capture_fixture "$workspace"
+    ab_fr_records "${workspace}/checkout"
+    ab_fake_fail "$workspace" cp '*_flow_logs/case_7_flow.log'
+    mkdir -p "${workspace}/runner_temp/evidence/m3-mean-speed"
+    truncate -s 10470000 "${workspace}/runner_temp/evidence/m3-mean-speed/large-record"
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+    assert_contains "$run" "status=0" "S98 combined: the capture step ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 combined: the construction is incomplete"
+    assert_contains "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_REASON)" "10485760" "S98 combined: the reason names the ceiling"
+    assert_eq "RETAINED" "$(ab_fr_record "$workspace" DOE_ROW)" "S98 combined: the small records fit the rest of the ceiling"
+    assert_file_missing "$(ab_fr_dir "$workspace")/setup-entry-values.tsv" "S98 combined: the entry record above the rest is not written"
+    (( $(find "${workspace}/runner_temp/evidence/m3-mean-speed" "$(ab_fr_dir "$workspace")" -type f -printf '%s\n' |
+        awk '{ s += $1 } END { printf "%d", s }') <= 10485760 )) || _fail "S98 combined: the shared ceiling holds"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S98 combined: the capture is incomplete"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" "_flow_logs/case_7_flow.log" \
+        "S98 combined: the earlier failure stays the capture reason"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 combined: GITHUB_ENV has the receipt result"
+    assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`INCOMPLETE\`" \
+        "S98 combined: the summary shows the receipt result"
+}
+ab_fr_big_records() {
+    local flow="${1}/checkout/src/batch_9/case_7/flow" name
+    for name in doe_row.csv setup_metadata.env flow.marker restart.marker; do
+        head -c 65000 /dev/zero | tr '\0' 'y' > "${flow}/${name}"
+    done
+}
+
+# ---- S99: the frozen blocks and the unchanged interface ----------------------
+
+# ab_fr_frozen_block <name> - the byte count and the SHA-256 of one frozen block
+# of the workflow file, from its begin marker line through its end marker line
+# and the line ending.
+ab_fr_frozen_block() {
+    local block
+    block="$(awk -v begin="          # ---- ${1}: begin ----" -v end="          # ---- ${1}: end ----" '
+        $0 == begin { inside = 1 } inside { print } $0 == end { exit }' "$WORKFLOW")"$'\n'
+    printf '%s %s' "$(printf '%s' "$block" | wc -c | tr -d ' ')" "$(printf '%s' "$block" | sha256sum | cut -d ' ' -f 1)"
+}
+
+s99_receipt_keeps_the_frozen_blocks_and_interface() {
+    local text block body
+    text="$(cat "$WORKFLOW")"
+    # The two frozen blocks, from the begin marker line through the end marker
+    # line and its line ending.
+    assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
+        "S99: the VTU header reader block is unchanged"
+    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+        "S99: the M3 mean-speed block is unchanged"
+    # The receipt runs once, after the collection, as the last capture item.
+    body="$(ab_step_run_body "Capture the evidence")"
+    assert_eq $'metric_collect\nfr_capture' \
+        "$(grep -xE '[[:space:]]*(metric_collect|fr_capture)' <<< "$body" | tr -d ' ')" \
+        "S99: the receipt work runs once, after the collection"
+    block="$(awk '/^# ---- Functional receipt: begin ----$/ { inside = 1 } inside { print } /^# ---- Functional receipt: end ----$/ { exit }' <<< "$body")"
+    [[ -n "$block" ]] || _fail "S99: the capture work holds the functional-receipt block"
+    # The receipt adds no OpenFOAM command, privilege, package, network, Case
+    # template, or reader.
+    if grep -v '^[[:space:]]*#' <<< "$block" |
+            grep -nE 'foamDictionary|foamListTimes|simpleFoam|sudo|apt-get|curl|wget|foamToVTK|vtk[A-Z]|python|eval '; then
+        _fail "S99: the receipt runs no OpenFOAM command, privilege, package, network, template, or reader"
+    fi
+    for constant in 'FR_WORK_SECONDS=30' 'FR_FILE_LIMIT=65536' 'FR_TREE_LIMIT=262144' 'FR_SCAN_LIMIT=1048576' \
+                    'FR_COMBINED_LIMIT=10485760'; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$block")" "S99: the receipt sets ${constant}"
+    done
+    # The unchanged interface and CI limits.
+    assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
+        "S99: the Orchestrator vector stays"
+    assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
+        "S99: the capture step guard stays 10 minutes"
+    assert_eq "10 15" "$(awk '/^    timeout-minutes:/ { print $2 }' "${REPO_ROOT}/.github/workflows/batch-contract.yml" | sort -n | paste -sd ' ' -)" \
+        "S99: the ShellCheck and contract jobs keep their 10-minute and 15-minute limits"
+    assert_contains "$text" "include-hidden-files: true" "S99: the upload keeps the hidden files"
+    assert_contains "$text" 'path: ${{ runner.temp }}/evidence' "S99: the upload keeps the evidence directory"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -8013,6 +8925,12 @@ AB_OBSERVATIONS=(
     s91_collect_root_check_stops_itself
     s92_collect_root_check_keeps_one_cleanup_clock
     s93_collect_root_check_terminal_clock_records
+    s94_receipt_complete_controlled_fixture
+    s95_receipt_time_signature_and_producer_checks
+    s96_receipt_source_records_stay_distinct
+    s97_receipt_setup_entries_fail_closed
+    s98_receipt_limits_fail_closed
+    s99_receipt_keeps_the_frozen_blocks_and_interface
 )
 
 # One observation runs in this process when the caller names it. The scenario
