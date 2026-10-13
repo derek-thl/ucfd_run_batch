@@ -8587,7 +8587,7 @@ s96_receipt_source_records_stay_distinct() {
     # A record that changes during the capture is CHANGED, and no copy stays.
     workspace="$(new_workspace s96_changed)"
     ab_fr_fixture "$workspace"
-    ab_fr_fake_changing_head "$workspace"
+    ab_fr_fake_changing_hash "$workspace"
     ab_fr_expect_unit "S96 changed" "$workspace" \
         "F1=PASS;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED"
     assert_eq "CHANGED" "$(ab_fr_record "$workspace" LATEST_TIME)" "S96: a changed record is CHANGED"
@@ -8624,26 +8624,59 @@ ab_fr_command_text() {
     sed -i -e "s#^boundaryField\$#\#codeStream { code \#{ system(\"touch ${1}/executed\"); \#}; }\nboundaryField#" "${flow}/0/k"
 }
 
-# ab_fr_fake_changing_head <workspace> - a head that appends one byte to the
-# post-processing time record after it reads it, as another writer would.
-ab_fr_fake_changing_head() {
+# ab_fr_fake_changing_hash <workspace> - a sha256sum that, after its first
+# hash of the post-processing time record, appends one byte to that record, as
+# another writer would between the hash before and the copy.
+ab_fr_fake_changing_hash() {
     local real
-    real="$(command -v head)"
+    real="$(command -v sha256sum)"
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'real=%q\n' "$real"
-        cat <<'FAKE_HEAD'
+        printf 'real=%q\nonce=%q\n' "$real" "${1}/changed_once"
+        cat <<'FAKE_HASH'
 "$real" "$@"
 status=$?
 for argument in "$@"; do
     case "$argument" in
-        */case_7/vtk/flow_latest_time.txt) printf '0' >> "$argument" ;;
+        */checkout/src/batch_9/case_7/vtk/flow_latest_time.txt)
+            if [[ ! -e "$once" ]]; then
+                : > "$once"
+                printf '0' >> "$argument"
+            fi ;;
     esac
 done
 exit "$status"
-FAKE_HEAD
-    } > "${1}/fakebin/head"
-    chmod +x "${1}/fakebin/head"
+FAKE_HASH
+    } > "${1}/fakebin/sha256sum"
+    chmod +x "${1}/fakebin/sha256sum"
+}
+
+# ab_fr_fake_hanging_copy_hash <workspace> - a sha256sum that records its
+# process ID and blocks when it hashes the post-processing time record together
+# with a copy in the work directory (the hash after the copy), and that runs
+# the real command otherwise.
+ab_fr_fake_hanging_copy_hash() {
+    local real
+    real="$(command -v sha256sum)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\npids=%q\n' "$real" "${1}/fake_pids"
+        cat <<'FAKE_HASH'
+record=0 copy=0
+for argument in "$@"; do
+    case "$argument" in
+        */checkout/src/batch_9/case_7/vtk/flow_latest_time.txt) record=1 ;;
+        */functional-receipt-work.*) copy=1 ;;
+    esac
+done
+if (( record && copy )); then
+    printf '%s\n' "$$" >> "$pids"
+    exec sleep 300
+fi
+exec "$real" "$@"
+FAKE_HASH
+    } > "${1}/fakebin/sha256sum"
+    chmod +x "${1}/fakebin/sha256sum"
 }
 
 # ---- S97: the selected Setup entries fail closed ----------------------------
@@ -8698,12 +8731,12 @@ ab_fr_other_row() { sed -i -e '2s/^7,/8,/' "$(ab_fr_dictionary "$1" doe_row.csv)
 
 s98_receipt_limits_fail_closed() {
     local workspace run start elapsed dir
-    # The time limit: a read that blocks stops before the receipt end. The
-    # records before it stay, no partial copy stays, and the stop is a capture
-    # note.
+    # The time limit: an operation that blocks (the hash of the time record
+    # after its copy) stops before the receipt end. The records before it stay,
+    # no partial copy stays, and the stop is a capture note.
     workspace="$(new_workspace s98_time)"
     ab_fr_fixture "$workspace"
-    ab_fake_hang "$workspace" head '*/case_7/vtk/flow_latest_time.txt'
+    ab_fr_fake_hanging_copy_hash "$workspace"
     dir="$(ab_fr_dir "$workspace")"
     start="$(date +%s)"
     run="$(ab_fr_unit "$workspace" CAPTURE_WORK_END="$(( start + 15 ))")"
