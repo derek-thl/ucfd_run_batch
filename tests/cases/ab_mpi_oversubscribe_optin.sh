@@ -8689,6 +8689,8 @@ s96_receipt_source_records_stay_distinct() {
         _fail "S96: the retained record keeps the NUL byte and every other byte"
     assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
         "S96: a directive at a keyword position makes the entries of its dictionary AMBIGUOUS"
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 reason)" "is AMBIGUOUS" \
+        "S96: F1 names the NOT_VERIFIED entries after its FAIL parts"
 }
 ab_fr_record_faults() {
     local flow="${1}/checkout/src/batch_9/case_7/flow"
