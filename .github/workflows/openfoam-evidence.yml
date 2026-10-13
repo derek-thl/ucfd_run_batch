@@ -966,12 +966,16 @@ jobs:
           # the capture, after every Stage, not just after Setup. A missing, linked,
           # unreadable, oversized, or changed record, a record that is not a regular file,
           # and an ambiguous, unsupported, or duplicate entry are source gaps: the check
-          # is NOT_VERIFIED, and no capture note is written. An observed wrong value is
-          # FAIL. A failed or stopped operation, or a limit of the receipt itself, gives
-          # INCOMPLETE and a capture note. COMPLETE is evidence construction only, never
-          # M3 acceptance. F4 stays NOT_VERIFIED, because no payload-readback witness
-          # exists, and F10 needs the GitHub artifact receipt, which exists only after
-          # the upload.
+          # is NOT_VERIFIED, and no capture note is written. A reference source (a DOE
+          # Batch CSV or a geometry log) that changes during the read is a source gap of
+          # each result that compares with it. An observed wrong value is FAIL. A NUL
+          # byte in the time record or the signature is FAIL, because a shell read ends
+          # at it: no prefix is used. A failed or stopped operation, a limit of the
+          # receipt itself, a retained record that a read cannot give completely, and a
+          # result.env that cannot be written completely give INCOMPLETE and a capture
+          # note. COMPLETE is evidence construction only, never M3 acceptance. F4 stays
+          # NOT_VERIFIED, because no payload-readback witness exists, and F10 needs the
+          # GitHub artifact receipt, which exists only after the upload.
           #
           # Limits: the receipt work ends by the earlier of 30 seconds after its start and
           # 10 seconds before the capture work limit, with the stop and the verification.
@@ -1219,19 +1223,22 @@ jobs:
                   if (nrows != 1) rowwhy = BATCH " has " nrows " data rows, not one"
                   else rowok = 1
               }
+              # Each CHECK and ENTRY row ends with the reference sources that its
+              # PASS or FAIL compares with, or "-".
+              doedep = "-"
               if (status_of[APPROVED] != "OK") { doer = "NOT_VERIFIED"; doewhy = APPROVED " is " status_of[APPROVED] ": " reason_of[APPROVED] }
-              else if (!afound) { doer = "FAIL"; doewhy = APPROVED " has no Case 7 row" }
+              else if (!afound) { doer = "FAIL"; doewhy = APPROVED " has no Case 7 row"; doedep = APPROVED }
               else if (status_of[BATCH] != "OK") { doer = "NOT_VERIFIED"; doewhy = rowwhy }
               else if (bn != 2 || bl[1] != ahead || bl[2] != arow || bytes_of[BATCH] + 0 != length(ahead) + length(arow) + 2) {
-                  doer = "FAIL"; doewhy = BATCH " is not the approved header and Case 7 row of " APPROVED
+                  doer = "FAIL"; doewhy = BATCH " is not the approved header and Case 7 row of " APPROVED; doedep = APPROVED " " BATCH
               } else if (ENVIRON["FR_DOE"] == "") { doer = "NOT_VERIFIED"; doewhy = "doe_row.csv is not retained" }
               else {
                   h = bl[1]; gsub(/\r/, "", h); r = bl[2]; gsub(/\r/, "", r)
                   if (dn == 2 && dl[1] == h && dl[2] == r && ENVIRON["FR_DOE_BYTES"] + 0 == length(h) + length(r) + 2) {
-                      doer = "PASS"; doewhy = "doe_row.csv is the header and the Case 7 row of " BATCH
-                  } else { doer = "FAIL"; doewhy = "doe_row.csv differs from the header and the Case 7 row of " BATCH }
+                      doer = "PASS"; doewhy = "doe_row.csv is the header and the Case 7 row of " BATCH; doedep = APPROVED " " BATCH
+                  } else { doer = "FAIL"; doewhy = "doe_row.csv differs from the header and the Case 7 row of " BATCH; doedep = BATCH }
               }
-              print "CHECK\tDOE_ROW\t" doer "\t" field(doewhy)
+              print "CHECK\tDOE_ROW\t" doer "\t" field(doewhy) "\t" doedep
               # The values that Setup derives from the row.
               if (rowok) {
                   nh = cells(hdr, hc); for (i = 1; i <= nh; i++) col[tolower(trim(hc[i]))] = i - 1
@@ -1248,9 +1255,11 @@ jobs:
                   }
               }
               # setup_metadata.env: the ten Setup keys, each once.
+              metadep = "-"
               if (ENVIRON["FR_META"] == "") { metar = "NOT_VERIFIED"; metawhy = "setup_metadata.env is not retained" }
               else if (!rowok) { metar = "NOT_VERIFIED"; metawhy = "the expected values need the DOE row: " rowwhy }
               else {
+                  metadep = BATCH
                   split("case_type csv_file row_number case_id case_name wd ws ws_for_setup sim_type ras_model", mk, " ")
                   mv["case_type"] = "flow"; mv["csv_file"] = ENVIRON["FR_CSV_PATH"]; mv["row_number"] = rowno ""
                   mv["case_id"] = cid; mv["case_name"] = cid "/flow"; mv["wd"] = wdn; mv["ws"] = ws; mv["ws_for_setup"] = ws
@@ -1272,7 +1281,7 @@ jobs:
                   if (metar == "PASS" && mbytes != ENVIRON["FR_META_BYTES"] + 0) { metar = "FAIL"; metawhy = "setup_metadata.env does not end with a line end" }
                   if (metar == "PASS") metawhy = "the ten Setup keys match the DOE row and the Setup defaults"
               }
-              print "CHECK\tSETUP_METADATA\t" metar "\t" field(metawhy)
+              print "CHECK\tSETUP_METADATA\t" metar "\t" field(metawhy) "\t" metadep
               # The expected entry values.
               geook = (geo == "OK")
               if (geook) {
@@ -1314,7 +1323,8 @@ jobs:
                       else if (isfloat(rawv)) e = written(sprintf("uniform (0 0 %.9g)", rawv))
                       else { ok = 0; ewhy = "the DOE value " rawv " is not valid, so Setup skips the patch" }
                   }
-                  f = qf[n]; outcome = "FOUND"; result = ""; why = ""
+                  f = qf[n]; outcome = "FOUND"; result = ""; why = ""; eused = "-"
+                  edep = (qk[n] == "geometry") ? "st_log sc_log" : ((qk[n] == "row") ? BATCH : "-")
                   if (status_of[f] != "OK") { outcome = status_of[f]; why = reason_of[f] }
                   else if (bad[f] != "") { outcome = "UNSUPPORTED"; why = bad[f] }
                   else if (dirt[f]) { outcome = "AMBIGUOUS"; why = "the dictionary has a directive or macro at a keyword position, which can change the entry" }
@@ -1333,14 +1343,14 @@ jobs:
                   if (outcome != "FOUND") result = "NOT_VERIFIED"
                   else if (qm[n] == "RAW" && val[n] ~ /[<>]/) { result = "FAIL"; why = "the value is an unresolved Setup placeholder" }
                   else if (!ok) { result = "NOT_VERIFIED"; why = ewhy }
-                  else if (qm[n] == "FOAM" ? same(val[n], e) : val[n] == e) { result = "PASS"; why = "the value equals the Setup value" }
-                  else { result = "FAIL"; why = "the value differs from the Setup value" }
+                  else if (qm[n] == "FOAM" ? same(val[n], e) : val[n] == e) { result = "PASS"; why = "the value equals the Setup value"; eused = edep }
+                  else { result = "FAIL"; why = "the value differs from the Setup value"; eused = edep }
                   if (outcome == "FOUND") {
                       printf "%s", frag[n] > (fragdir "/fragment-" n); close(fragdir "/fragment-" n)
-                      printf "ENTRY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, f, field(qp[n]), outcome, off[n], byt[n], b64(frag[n]),
-                          field(val[n]), field(ok ? e : ""), result, field(why)
+                      printf "ENTRY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, f, field(qp[n]), outcome, off[n], byt[n], b64(frag[n]),
+                          field(val[n]), field(ok ? e : ""), result, field(why), eused
                   } else {
-                      printf "ENTRY\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t%s\n", n, f, field(qp[n]), outcome, field(ok ? e : ""), result, field(why)
+                      printf "ENTRY\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t%s\t-\n", n, f, field(qp[n]), outcome, field(ok ? e : ""), result, field(why)
                   }
               }
           }'
@@ -1492,13 +1502,16 @@ jobs:
           # <label=path>... - the entry work, in one bounded process. It checks and
           # hashes the sources, reads the geometry with the Setup programs, selects the
           # entries, and hashes the sources again and each fragment. A source that
-          # changed gives CHANGED entries. Prints SOURCE, CHECK, and ENTRY rows.
+          # changed gives CHANGED entries. A reference source (a DOE Batch CSV or a
+          # geometry log) that changed makes each PASS or FAIL that compares with it
+          # NOT_VERIFIED, with no expected value. Prints SOURCE rows (the status and
+          # the SHA-256 before and after), and CHECK and ENTRY rows.
           fr_entry_work() {
               local top="$1" work="$2" doe="$3" doebytes="$4" meta="$5" metabytes="$6" csvpath="$7"
-              local pair label path size line out kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 st sum fsum rot bbox geo=-
-              local cx="" cy="" cz="" lx="" ly="" lz="" ux="" uy="" uz=""
+              local pair label path size line out kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 st sum sum2 fsum rot bbox geo=-
+              local cx="" cy="" cz="" lx="" ly="" lz="" ux="" uy="" uz="" deps dep changed record
               local labels="" paths="" statuses="" reasons="" bytes=""
-              local -A status=() reason=() file=() before=() after=() frag=() sizes=()
+              local -A status=() reason=() file=() before=() after=() frag=() sizes=() chg=()
               local -a ok=() fragments=() checked=()
               shift 7
               for pair in "$@"; do
@@ -1568,19 +1581,34 @@ jobs:
                   done < <(sha256sum -- "${fragments[@]}" 2> /dev/null)
               fi
               for pair in "$@"; do
-                  label="${pair%%=*}" st="${status[$label]}" sum=-
+                  label="${pair%%=*}" st="${status[$label]}" sum=- sum2=-
                   if [[ "$st" == OK ]]; then
-                      sum="${before[${file[$label]}]}"
-                      if [[ "${after[${file[$label]}]:-}" != "$sum" ]]; then
-                          st=CHANGED sum=- reason[$label]="the source changed during the capture"
+                      sum="${before[${file[$label]}]}" sum2="${after[${file[$label]}]:--}"
+                      if [[ "$sum2" != "$sum" ]]; then
+                          st=CHANGED reason[$label]="the source changed during the capture"
+                          chg[$label]="${file[$label]#"${top}/"}"
                       fi
                   fi
                   status[$label]="$st"
-                  printf 'SOURCE\t%s\t%s\t%s\t%s\n' "$label" "$st" "$sum" "${reason[$label]}"
+                  printf 'SOURCE\t%s\t%s\t%s\t%s\t%s\n' "$label" "$st" "$sum" "$sum2" "${reason[$label]}"
               done
-              while IFS=$'\t' read -r kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11; do
+              while IFS=$'\t' read -r kind f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12; do
+                  # The changed reference sources of a compared result.
+                  deps="$f12"
+                  [[ "$kind" != CHECK ]] || deps="$f4"
+                  changed=""
+                  for dep in $deps; do
+                      [[ -z "${chg[$dep]:-}" ]] || changed+="${changed:+ and }${chg[$dep]}"
+                  done
                   case "$kind" in
-                      CHECK) printf 'CHECK\t%s\t%s\t%s\n' "$f1" "$f2" "$f3" ;;
+                      CHECK)
+                          if [[ -n "$changed" && ( "$f2" == PASS || "$f2" == FAIL ) ]]; then
+                              record=setup_metadata.env
+                              [[ "$f1" != DOE_ROW ]] || record=doe_row.csv
+                              f3="${record}: the reference ${changed} changed during the capture, so the ${f2} result has no stable reference"
+                              f2=NOT_VERIFIED
+                          fi
+                          printf 'CHECK\t%s\t%s\t%s\n' "$f1" "$f2" "$f3" ;;
                       ENTRY)
                           st="${status[$f2]:-MISSING}" sum=- fsum=-
                           if [[ "$st" == OK ]]; then
@@ -1593,6 +1621,10 @@ jobs:
                               if [[ "$fsum" == - ]]; then
                                   f4=READ_FAILURE f5=- f6=- f7=- f8=- f10=NOT_VERIFIED f11="the fragment cannot be hashed"
                               fi
+                          fi
+                          if [[ -n "$changed" && ( "$f10" == PASS || "$f10" == FAIL ) ]]; then
+                              f11="the reference ${changed} changed during the capture, so the ${f10} result has no stable expected value"
+                              f9=- f10=NOT_VERIFIED
                           fi
                           printf 'ENTRY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                               "$f2" "$sum" "$f3" "$f4" "$f5" "$f6" "$f7" "$fsum" "$f8" "$f9" "$f10" "$f11"
@@ -1750,11 +1782,15 @@ jobs:
               fr_write records.tsv "$text" || true
           }
 
-          # fr_entries - the selected Setup entries and setup-entry-values.tsv.
+          # fr_entries - the selected Setup entries and setup-entry-values.tsv, and in
+          # FR_E_REFERENCES the identity of the four reference sources for F1: each
+          # path with its SHA-256, with CHANGED and the SHA-256 before and after, with
+          # the status that stopped its read, or with UNAVAILABLE when the entry work
+          # gave no source row.
           fr_entries() {
-              local out status=0 csvpath doe="" meta="" text line kind rest name result why pair usable
+              local out status=0 csvpath doe="" meta="" text line kind rest name result why pair usable sum sum2
               local -a sources=()
-              local -A status_of=() reason_of=()
+              local -A status_of=() reason_of=() ref_status=() ref_sum=() ref_sum2=()
               csvpath="$(cd -P -- "${GITHUB_WORKSPACE}/src/batch_9" 2> /dev/null && pwd -P)/output_batch_9.csv" || csvpath=UNAVAILABLE
               if [[ "${FR_REC_OUTCOME[DOE_ROW]:-}" == RETAINED ]]; then
                   doe="${FR_DIR}/files/case_7/flow/doe_row.csv"
@@ -1791,6 +1827,10 @@ jobs:
               while IFS= read -r line; do
                   kind="${line%%$'\t'*}" rest="${line#*$'\t'}"
                   case "$kind" in
+                      SOURCE)
+                          IFS=$'\t' read -r name result sum sum2 _ <<< "$rest"
+                          ref_status[$name]="$result" ref_sum[$name]="$sum" ref_sum2[$name]="$sum2"
+                          ;;
                       CHECK)
                           IFS=$'\t' read -r name result why <<< "$rest"
                           FR_E_CHECK[$name]="$result" FR_E_WHY[$name]="$why"
@@ -1801,6 +1841,16 @@ jobs:
                           ;;
                   esac
               done <<< "$out"
+              # The approved CSV, the DOE Batch CSV, and the two geometry logs.
+              FR_E_REFERENCES=""
+              for pair in "${sources[@]:0:4}"; do
+                  name="${pair%%=*}"
+                  case "${ref_status[$name]:-UNAVAILABLE}" in
+                      OK) FR_E_REFERENCES+=" ${pair#*=}:${ref_sum[$name]}" ;;
+                      CHANGED) FR_E_REFERENCES+=" ${pair#*=}:CHANGED:${ref_sum[$name]}:${ref_sum2[$name]}" ;;
+                      *) FR_E_REFERENCES+=" ${pair#*=}:${ref_status[$name]:-UNAVAILABLE}" ;;
+                  esac
+              done
               if (( status == 124 || status == 137 )); then
                   fr_incomplete "the receipt time limit stopped the entry work"
               elif (( status != 0 )); then
@@ -1915,10 +1965,37 @@ jobs:
               return 0
           }
 
-          # fr_signature - the post-processing signature: SIG_STATE (MISSING, FAIL, or
-          # OK), SIG_WHY, and SIG_TIME, the flow_latest value of one flow_latest line.
+          # fr_record_text <record> <path> - FR_TEXT: all retained bytes of one text
+          # record below files/. A shell read ends at a NUL byte, so a NUL byte gives
+          # status 1, and a read that does not give the retained byte count gives
+          # status 2. FR_TEXT_WHY then names the gap, and FR_TEXT stays empty: no
+          # prefix is used.
+          fr_record_text() {
+              local fr_record_file="${FR_DIR}/files/${2}" fr_record_bytes="${FR_REC_BYTES[$1]:-}" fr_record_status=2
+              FR_TEXT="" FR_TEXT_WHY=-
+              if [[ -f "$fr_record_file" && ! -L "$fr_record_file" ]]; then
+                  fr_record_status=0
+                  IFS= read -r -d '' FR_TEXT 2> /dev/null < "$fr_record_file" || fr_record_status=$?
+              fi
+              if (( fr_record_status == 0 )); then
+                  FR_TEXT_WHY="${2##*/} has a NUL byte after ${#FR_TEXT} of its ${fr_record_bytes:-UNAVAILABLE} bytes"
+                  FR_TEXT=""
+                  return 1
+              fi
+              if (( fr_record_status != 1 )) || [[ ! "$fr_record_bytes" =~ ^(0|[1-9][0-9]*)$ ]] || (( ${#FR_TEXT} != fr_record_bytes )); then
+                  FR_TEXT_WHY="the retained ${2##*/} gives ${#FR_TEXT} of its ${fr_record_bytes:-UNAVAILABLE} bytes"
+                  FR_TEXT=""
+                  return 2
+              fi
+              return 0
+          }
+
+          # fr_signature - the post-processing signature: SIG_STATE (MISSING, UNREAD,
+          # FAIL, or OK), SIG_WHY, and SIG_TIME, the flow_latest value of one
+          # flow_latest line. UNREAD is a retained record that a read cannot give
+          # completely. A NUL byte fails, and no part of that record is parsed.
           fr_signature() {
-              local content="" line key name expected order
+              local content="" line key name expected order read_status=0
               local -a lines=() keys=()
               local -A count=() value=()
               SIG_STATE=OK SIG_WHY=- SIG_TIME=""
@@ -1926,7 +2003,15 @@ jobs:
                   SIG_STATE=MISSING SIG_WHY="post_processing.complete is ${FR_REC_OUTCOME[POST_SIGNATURE]:-UNAVAILABLE}: ${FR_REC_REASON[POST_SIGNATURE]:--}"
                   return 0
               fi
-              IFS= read -r -d '' content < "${FR_DIR}/files/case_7/vtk/post_processing.complete" || true
+              fr_record_text POST_SIGNATURE case_7/vtk/post_processing.complete || read_status=$?
+              if (( read_status == 1 )); then
+                  SIG_STATE=FAIL SIG_WHY="$FR_TEXT_WHY"
+                  return 0
+              elif (( read_status != 0 )); then
+                  SIG_STATE=UNREAD SIG_WHY="$FR_TEXT_WHY"
+                  return 0
+              fi
+              content="$FR_TEXT"
               mapfile -t lines <<< "${content%$'\n'}"
               for line in "${lines[@]}"; do
                   key="${line%%=*}"
@@ -1994,7 +2079,8 @@ jobs:
           fr_checks() {
               local metric="${EVIDENCE_DIR}/m3-mean-speed" line key status=0 out rel cur="" text check content token
               local m_avail=0 m_dup=0 m_same=0 m_foreign=0 m_known=0 tc="" tr="" tr_ok=0 tr_why="" t_known=0 manifest_complete=0
-              local doe_r doe_w meta_r meta_w ent_r=PASS ent_w="" model_r model_w fs ms fails="" notpass="" missing="" n=0 differ text2
+              local tr_unread=0 read_status=0
+              local doe_r doe_w meta_r meta_w ent_r=PASS ent_w="" model_r model_w fs ms fails="" notpass="" missing="" n=0 differ text2 part
               local re_head='^== VTU_TAGS path=(.*) sha256=([^ ]*)$' re_end='^== VTU_TAGS_END path=(.*) tag_evidence=([A-Z_]+)$'
               local -A ev=() mr=() vsec=() vbytes=() vsha=() vres=() vtag=() vobs=() thead=() tsha=() tend=() tpd=() mc=()
               local -a files=() controls=() fields=()
@@ -2043,19 +2129,29 @@ jobs:
               if (( m_same )) && [[ "${mr[SELECTED_TIME]:-}" =~ $FR_TIME_RE ]]; then
                   tc="${mr[SELECTED_TIME]}"
               fi
-              # The latest-time record.
+              # The latest-time record: all its retained bytes. A NUL byte fails; a
+              # read that does not give all retained bytes is a receipt gap.
               if [[ "${FR_REC_OUTCOME[LATEST_TIME]:-}" == RETAINED ]]; then
-                  IFS= read -r -d '' content < "${FR_DIR}/files/case_7/vtk/flow_latest_time.txt" || true
-                  token="${content%$'\n'}"
-                  if (( ${#content} <= FR_TIME_LIMIT )) && [[ "$content" == *$'\n' && "$token" != *$'\n'* && "$token" =~ $FR_TIME_RE ]]; then
+                  read_status=0
+                  fr_record_text LATEST_TIME case_7/vtk/flow_latest_time.txt || read_status=$?
+                  content="$FR_TEXT" token="${FR_TEXT%$'\n'}"
+                  if (( read_status == 2 )); then
+                      tr_unread=1 tr_why="$FR_TEXT_WHY"
+                      fr_incomplete "the latest-time record cannot be read completely: ${FR_TEXT_WHY}"
+                  elif (( read_status == 0 && ${#content} <= FR_TIME_LIMIT )) &&
+                          [[ "$content" == *$'\n' && "$token" != *$'\n'* && "$token" =~ $FR_TIME_RE ]]; then
                       tr_ok=1 tr="$token"
                   else
                       tr_why="the latest-time record is not one numeric time and one line end in at most ${FR_TIME_LIMIT} bytes"
+                      (( read_status == 0 )) || tr_why+=": ${FR_TEXT_WHY}"
                   fi
               else
                   tr_why="flow_latest_time.txt is ${FR_REC_OUTCOME[LATEST_TIME]:-UNAVAILABLE}: ${FR_REC_REASON[LATEST_TIME]:--}"
               fi
               fr_signature
+              if [[ "$SIG_STATE" == UNREAD ]]; then
+                  fr_incomplete "the signature cannot be read completely: ${SIG_WHY}"
+              fi
               # The VTU manifest and the original tags of the earlier VTU item.
               if [[ -f "${EVIDENCE_DIR}/vtu-point-data.txt" && ! -L "${EVIDENCE_DIR}/vtu-point-data.txt" ]]; then
                   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2140,19 +2236,26 @@ jobs:
               case "$FR_COMBINED" in
                   PASS) text="doe_row.csv, setup_metadata.env, the ${FR_ENTRY_COUNT} selected entries, and the model identity match the approved row and the Setup defaults" ;;
                   *)
+                      # Each part that does not pass: the parts with the combined
+                      # result first.
                       text=""
-                      for check in "${doe_r}|${doe_w}" "${meta_r}|${meta_w}" "${ent_r}|${ent_w}" "${model_r}|${model_w}"; do
-                          if [[ -z "$text" && "${check%%|*}" == "$FR_COMBINED" ]]; then
-                              text="${check#*|}"
-                          fi
+                      for part in "$FR_COMBINED" NOT_VERIFIED; do
+                          for check in "${doe_r}|${doe_w}" "${meta_r}|${meta_w}" "${ent_r}|${ent_w}" "${model_r}|${model_w}"; do
+                              if [[ "${check%%|*}" == "$part" ]]; then
+                                  text+="${text:+; }${check#*|}"
+                              fi
+                          done
+                          [[ "$FR_COMBINED" != NOT_VERIFIED ]] || break
                       done ;;
               esac
               fr_ev m3-mean-speed/source-before.tsv
-              fr_put F1 "$FR_COMBINED" "functional-receipt/records.tsv functional-receipt/setup-entry-values.tsv ${FR_EVS} ${controls[0]:+${controls[0]#"${EVIDENCE_DIR}/"}}" "$text"
+              fr_put F1 "$FR_COMBINED" "functional-receipt/records.tsv functional-receipt/setup-entry-values.tsv ${FR_EVS} ${controls[0]:+${controls[0]#"${EVIDENCE_DIR}/"}}${FR_E_REFERENCES}" "$text"
 
               # F2: the latest-time record and the collector-selected time.
               if [[ "${FR_REC_OUTCOME[LATEST_TIME]:-}" != RETAINED ]]; then
                   fr_put F2 NOT_VERIFIED "" "$tr_why"
+              elif (( tr_unread )); then
+                  fr_put F2 NOT_VERIFIED "functional-receipt/files/case_7/vtk/flow_latest_time.txt" "$tr_why"
               elif (( ! tr_ok )); then
                   fr_put F2 FAIL "functional-receipt/files/case_7/vtk/flow_latest_time.txt" "$tr_why"
               elif [[ "$tr" =~ ^0+([.]0+)?$ ]]; then
@@ -2174,6 +2277,8 @@ jobs:
               # F3: the seven signature lines.
               if [[ "$SIG_STATE" == MISSING ]]; then
                   fr_put F3 NOT_VERIFIED "" "$SIG_WHY"
+              elif [[ "$SIG_STATE" == UNREAD ]]; then
+                  fr_put F3 NOT_VERIFIED "functional-receipt/files/case_7/vtk/post_processing.complete" "$SIG_WHY"
               elif [[ "$SIG_STATE" == FAIL ]]; then
                   fr_put F3 FAIL "functional-receipt/files/case_7/vtk/post_processing.complete" "$SIG_WHY"
               elif (( tr_ok )) && [[ "$tr" != "$SIG_TIME" ]]; then
@@ -2421,10 +2526,9 @@ jobs:
               return 0
           }
 
-          # fr_finish - result.env. The receipt directory gets it only when the receipt
-          # could check its limits; the capture step always gets the copy outside the
-          # evidence directory.
-          fr_finish() {
+          # fr_result_text - FR_RESULT_TEXT: the result.env text of the current
+          # result. Its last line is WORK_FINISH, so a partial write has no last line.
+          fr_result_text() {
               local text reason id line now retained=0 found=0
               local -a fields=()
               for id in "${FR_RECORD_IDS[@]}"; do
@@ -2447,14 +2551,35 @@ jobs:
               text+="WORK_START=${FR_START}"$'\n'"WORK_END=${FR_END}"$'\n'"WORK_END_SOURCE=${FR_END_SOURCE}"$'\n'
               printf -v now "%(%s)T" -1
               text+="WORK_FINISH=${now}"$'\n'
-              printf '%s' "$text" > "$FR_SIDE_RESULT" 2> /dev/null || true
+              FR_RESULT_TEXT="$text"
+          }
+
+          # fr_result_write <path> - write FR_RESULT_TEXT with one shell write and
+          # read it back. Status 0 only when the file holds exactly that text.
+          fr_result_write() {
+              local fr_result_back=""
+              printf '%s' "$FR_RESULT_TEXT" 2> /dev/null > "$1" || return 1
+              IFS= read -r -d '' fr_result_back 2> /dev/null < "$1" || true
+              [[ "$fr_result_back" == "$FR_RESULT_TEXT" ]]
+          }
+
+          # fr_finish - result.env. The receipt directory gets it only when the receipt
+          # could check its limits. A result.env that is not written completely gives
+          # INCOMPLETE, and no incomplete result.env stays. Then the capture step gets
+          # the final result in the copy outside the evidence directory.
+          fr_finish() {
+              fr_result_text
               if (( FR_WRITE )); then
-                  if (( ${#text} > FR_RESULT_RESERVE )); then
-                      capture_note "functional receipt: result.env has ${#text} bytes, above its ${FR_RESULT_RESERVE}-byte reserve, so it is not written"
-                  elif ! printf '%s' "$text" > "${FR_DIR}/result.env" 2> /dev/null; then
-                      capture_note "functional receipt: result.env cannot be written"
+                  if (( ${#FR_RESULT_TEXT} > FR_RESULT_RESERVE )); then
+                      fr_incomplete "result.env has ${#FR_RESULT_TEXT} bytes, above its ${FR_RESULT_RESERVE}-byte reserve, so it is not written"
+                      fr_result_text
+                  elif ! fr_result_write "${FR_DIR}/result.env"; then
+                      fr_incomplete "result.env cannot be written completely"
+                      rm -f -- "${FR_DIR}/result.env" 2> /dev/null || true
+                      fr_result_text
                   fi
               fi
+              fr_result_write "$FR_SIDE_RESULT" || true
               return 0
           }
 
@@ -2464,6 +2589,7 @@ jobs:
               local now cap
               local -A FR_REC_ROW=() FR_REC_OUTCOME=() FR_REC_REASON=() FR_REC_BYTES=()
               local -A FR_E_CHECK=() FR_E_WHY=() FR_C_RESULT=() FR_C_EVIDENCE=() FR_C_REASON=()
+              local FR_E_REFERENCES=""
               local -A FR_REQUIREMENT=() FR_LIMITATION=()
               local -a FR_ENTRY_ROWS=()
               fr_entry_list
@@ -2484,7 +2610,7 @@ jobs:
                              [F10]="evidence construction only; not M3 acceptance")
               FR_DIR="${EVIDENCE_DIR}/functional-receipt"
               FR_SIDE_RESULT="${EVIDENCE_DIR%/*}/functional-receipt-result.env"
-              FR_RESULT=COMPLETE FR_REASON="" FR_USED=0 FR_AVAILABLE=0 FR_WRITE=0 FR_CHECKS="" FR_METRIC_BYTES=UNAVAILABLE
+              FR_RESULT=COMPLETE FR_REASON="" FR_USED=0 FR_AVAILABLE=0 FR_WRITE=0 FR_CHECKS="" FR_METRIC_BYTES=UNAVAILABLE FR_RESULT_TEXT=""
               FR_INVENTORY_SHA=UNAVAILABLE FR_INVENTORY_BYTES=UNAVAILABLE FR_LIMIT_TEXT="" FR_WORK=""
               : > "$FR_SIDE_RESULT" 2> /dev/null || true
               printf -v FR_START "%(%s)T" -1
@@ -5273,19 +5399,30 @@ jobs:
           fi
 
           # The functional-record receipt result. A capture that stops before or in
-          # the receipt work keeps an explicit result. The receipt directory gets
-          # that result only when the receipt work made the directory, because the
-          # receipt keeps 2048 bytes free for result.env inside its limits.
+          # the receipt work keeps an explicit result. A result is complete only
+          # in a regular file that starts with one known result line and ends with
+          # the WORK_FINISH line and its line end: a partial first line is no
+          # result. With no complete result, a receipt that started (its result
+          # copy exists) or made its directory is INCOMPLETE. When the receipt
+          # directory exists, the explicit result then replaces its result.env, in
+          # the 2048 bytes that the receipt keeps free for result.env. A copy that
+          # is not exact is removed, and a directory at that path stays as it is.
           receipt_dir="${EVIDENCE_DIR}/functional-receipt"
           receipt_result="${receipt_dir}/result.env"
           receipt_side="${EVIDENCE_DIR%/*}/functional-receipt-result.env"
-          if ! grep -q '^FUNCTIONAL_RECEIPT_RESULT=' "$receipt_result" 2>/dev/null; then
-              if grep -q '^FUNCTIONAL_RECEIPT_RESULT=' "$receipt_side" 2>/dev/null; then
-                  receipt_result="$receipt_side"
-              else
+          receipt_complete() {
+              local text="" first last
+              first='^FUNCTIONAL_RECEIPT_RESULT=(COMPLETE|INCOMPLETE|NOT_ATTEMPTED)'$'\n'
+              last=$'\n''WORK_FINISH=[0-9]+'$'\n''$'
+              [[ -f "$1" && ! -L "$1" ]] || return 1
+              IFS= read -r -d '' text 2>/dev/null < "$1" && return 1
+              [[ "$text" =~ $first && "$text" =~ $last && $'\n'"${text#*$'\n'}" != *$'\n'FUNCTIONAL_RECEIPT_RESULT=* ]]
+          }
+          if ! receipt_complete "$receipt_result"; then
+              if ! receipt_complete "$receipt_side"; then
                   receipt_state=NOT_ATTEMPTED
                   receipt_reason="the capture did not reach the functional-record work"
-                  if [[ -d "$receipt_dir" ]]; then
+                  if [[ -d "$receipt_dir" || -e "$receipt_side" ]]; then
                       receipt_state=INCOMPLETE
                       receipt_reason="the capture stopped the functional-record work"
                   fi
@@ -5294,9 +5431,16 @@ jobs:
                     echo "FUNCTIONAL_RECEIPT_REASON=${receipt_reason}: ${capture_result}: ${capture_reason:0:400}"
                     echo "FUNCTIONAL_RECEIPT_CHECKS=UNAVAILABLE"
                   } > "$receipt_side"
-                  receipt_result="$receipt_side"
-                  if [[ -d "$receipt_dir" ]] && cp -- "$receipt_side" "${receipt_dir}/result.env" 2>/dev/null; then
-                      receipt_result="${receipt_dir}/result.env"
+              fi
+              receipt_result="$receipt_side"
+              receipt_target="${receipt_dir}/result.env"
+              if [[ -d "$receipt_dir" ]] && [[ -L "$receipt_target" || ! -d "$receipt_target" ]]; then
+                  rm -f -- "$receipt_target" 2>/dev/null || true
+                  if (( $(wc -c < "$receipt_side") <= 2048 )) && cp -- "$receipt_side" "$receipt_target" 2>/dev/null &&
+                          cmp -s -- "$receipt_side" "$receipt_target"; then
+                      receipt_result="$receipt_target"
+                  else
+                      rm -f -- "$receipt_target" 2>/dev/null || true
                   fi
               fi
           fi
