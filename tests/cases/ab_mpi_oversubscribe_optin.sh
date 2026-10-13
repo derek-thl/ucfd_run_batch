@@ -163,6 +163,11 @@
 # (S96), the selected Setup entries (S97), and the time and byte limits (S98).
 # S99 checks the frozen blocks and the unchanged interface. A controlled record
 # is capability evidence only, never an actual Case receipt or M3 acceptance.
+# PR #102 review 5500290409 adds: R1 (S95), a NUL byte after a valid prefix of
+# the time record or the signature, and a retained record that a read cannot
+# give completely; R2 (S97), a reference source (a DOE Batch CSV or a geometry
+# log) that changes between its hashes; R3 (S98), a result.env that cannot be
+# written, and a partial result.env.
 #
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
@@ -8240,7 +8245,9 @@ ab_fr_fixture() {
 
 # ab_fr_signature <workspace> <signature-text>... - the extracted fr_signature
 # result for each retained signature text, one line each: the state, the
-# flow_latest value, and the reason. No other receipt function runs.
+# flow_latest value, and the reason. No other receipt function runs. The first
+# <NUL> in a text is written as a NUL byte. The retained byte count is the
+# byte count of the written record.
 ab_fr_signature() {
     local workspace="$1" library
     shift
@@ -8248,9 +8255,15 @@ ab_fr_signature() {
     mkdir -p "${workspace}/signature/files/case_7/vtk"
     env FR_DIR="${workspace}/signature" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
         "${AB_STEP_BASH[@]}" -c "${library}"'
-declare -A FR_REC_OUTCOME=([POST_SIGNATURE]=RETAINED) FR_REC_REASON=()
+declare -A FR_REC_OUTCOME=([POST_SIGNATURE]=RETAINED) FR_REC_REASON=() FR_REC_BYTES=()
+record="${FR_DIR}/files/case_7/vtk/post_processing.complete"
 for text in "$@"; do
-    printf "%s" "$text" > "${FR_DIR}/files/case_7/vtk/post_processing.complete"
+    if [[ "$text" == *"<NUL>"* ]]; then
+        printf "%s\0%s" "${text%%<NUL>*}" "${text#*<NUL>}" > "$record"
+    else
+        printf "%s" "$text" > "$record"
+    fi
+    FR_REC_BYTES[POST_SIGNATURE]="$(stat -c %s -- "$record")"
     fr_signature
     printf "%s|%s|%s\n" "$SIG_STATE" "$SIG_TIME" "$SIG_WHY"
 done' signature "$@"
@@ -8488,7 +8501,7 @@ s94_receipt_complete_controlled_fixture() {
 # ---- S95: the time, signature, VTU, and producer checks ---------------------
 
 s95_receipt_time_signature_and_producer_checks() {
-    local workspace results
+    local workspace results record
     # The unit baseline equals the integrated result of S94.
     workspace="$(new_workspace s95_baseline)"
     ab_fr_fixture "$workspace"
@@ -8508,6 +8521,13 @@ FAIL|2|the signature keys are not in the order flow_latest transport_ready trans
 FAIL|2|the signature does not end with a line end
 FAIL|2|the signature has scalar_field=S, not scalar_field=T" "$results" \
         "S95: the exact signature passes, and a duplicate, missing, wrong, or reordered key or a missing line end fails"
+    # R1: a NUL byte ends a shell read. An unknown or a duplicate key after a
+    # NUL byte that follows the exact signature fails, and no part is parsed.
+    results="$(ab_fr_signature "$workspace" "${AB_FR_SIGNATURE}"$'\n<NUL>unknown_key=invalid\n' \
+        "${AB_FR_SIGNATURE}"$'\n<NUL>flow_latest=2\n')"
+    assert_eq "FAIL||post_processing.complete has a NUL byte after 149 of its 170 bytes
+FAIL||post_processing.complete has a NUL byte after 149 of its 164 bytes" "$results" \
+        "S95: a signature with a NUL byte after the exact signature fails"
     # A wrong post time fails F3 and F6 in the complete receipt.
     ab_fr_case "S95 post time" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_post_time
@@ -8516,6 +8536,36 @@ FAIL|2|the signature has scalar_field=S, not scalar_field=T" "$results" \
         ab_fr_time_zero
     ab_fr_case "S95 time without line end" "F1=PASS;F2=FAIL;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_time_no_end
+    # R1: a time record of more than 64 bytes and a signature, each with a NUL
+    # byte after a valid prefix, fail with their complete byte counts. Each
+    # stays a retained record with all its bytes.
+    ab_fr_case "S95 NUL records" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_nul_records
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F2 reason)" "flow_latest_time.txt has a NUL byte after 2 of its 74 bytes" \
+        "S95: the time record with a NUL byte is named with its byte counts"
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "post_processing.complete has a NUL byte after 149 of its 170 bytes" \
+        "S95: the signature with a NUL byte is named with its byte counts"
+    assert_eq "74 RETAINED 170 RETAINED" "$(ab_fr_record "$AB_FR_LAST" LATEST_TIME retained_bytes) $(ab_fr_record "$AB_FR_LAST" LATEST_TIME) $(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE retained_bytes) $(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE)" \
+        "S95: the records with a NUL byte stay retained with their complete byte counts"
+    for record in case_7/vtk/flow_latest_time.txt case_7/vtk/post_processing.complete; do
+        cmp -s -- "${AB_FR_LAST}/checkout/src/batch_9/${record}" "$(ab_fr_dir "$AB_FR_LAST")/files/${record}" ||
+            _fail "S95: the retained ${record} keeps every byte"
+    done
+    # R1: a retained record that a read cannot give completely is not used.
+    # The checks that need it stay NOT_VERIFIED, and the construction is
+    # INCOMPLETE with a capture note.
+    workspace="$(new_workspace s95_short_read)"
+    ab_fr_fixture "$workspace"
+    ab_fr_fake_truncating_hash "$workspace"
+    ab_fr_expect_unit "S95 short read" "$workspace" \
+        "F1=PASS;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED"
+    assert_eq "INCOMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S95 short read: the construction is incomplete"
+    assert_contains "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_REASON)" "flow_latest_time.txt gives 1 of its 2 bytes" \
+        "S95 short read: the reason names the incomplete read"
+    assert_contains "$(ab_fr_check "$workspace" F3 reason)" "post_processing.complete gives 148 of its 149 bytes" \
+        "S95 short read: F3 names the incomplete signature read"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "functional receipt" \
+        "S95 short read: the incomplete read is a capture note"
     ab_fr_case "S95 collector time" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=FAIL;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_metric_time
     ab_fr_case "S95 no collection" "F1=NOT_VERIFIED;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=NOT_VERIFIED;F8=PASS;F9=NOT_VERIFIED;F10=NOT_VERIFIED" \
@@ -8539,6 +8589,36 @@ ab_fr_post_time() {
 }
 ab_fr_time_zero() { printf '0\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
 ab_fr_time_no_end() { printf '2' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
+ab_fr_nul_records() {
+    local vtk="${1}/checkout/src/batch_9/case_7/vtk"
+    { printf '2\n\0'; head -c 70 /dev/zero | tr '\0' 'x'; printf '\n'; } > "${vtk}/flow_latest_time.txt"
+    printf '%s\n\0unknown_key=invalid\n' "$AB_FR_SIGNATURE" > "${vtk}/post_processing.complete"
+}
+
+# ab_fr_fake_truncating_hash <workspace> - a sha256sum that, when it hashes the
+# earlier evidence (the first operation of the checks), first removes the last
+# byte of the retained time record and the retained signature, as another
+# writer would after the record copy.
+ab_fr_fake_truncating_hash() {
+    local real
+    real="$(command -v sha256sum)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\n' "$real"
+        cat <<'FAKE_HASH'
+for argument in "$@"; do
+    case "$argument" in
+        */runner_temp/evidence/vtu-point-data.txt)
+            for record in case_7/vtk/flow_latest_time.txt case_7/vtk/post_processing.complete; do
+                truncate -s -1 -- "${argument%/vtu-point-data.txt}/functional-receipt/files/${record}"
+            done ;;
+    esac
+done
+exec "$real" "$@"
+FAKE_HASH
+    } > "${1}/fakebin/sha256sum"
+    chmod +x "${1}/fakebin/sha256sum"
+}
 ab_fr_metric_time() {
     sed -i -e 's/^SELECTED_TIME=2$/SELECTED_TIME=3/' "${1}/runner_temp/evidence/m3-mean-speed/result.env"
 }
@@ -8687,6 +8767,7 @@ FAKE_HASH
 # ---- S97: the selected Setup entries fail closed ----------------------------
 
 s97_receipt_setup_entries_fail_closed() {
+    local workspace evidence reason before after
     # Checks 1 and 4: one run with a distinct fault in each of the six
     # dictionaries: a non-ASCII byte, an oversized file, a duplicate entry, a
     # pattern keyword, a macro value, and a truncated file.
@@ -8712,6 +8793,113 @@ s97_receipt_setup_entries_fail_closed() {
     ab_fr_case "S97 row" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_other_row
     assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 reason)" "doe_row.csv" "S97: a row that differs from the DOE Batch CSV is named"
+    # R2: a reference source that changes between its hash before and its hash
+    # after the entry read gives no supported expected value. The first run
+    # changes the approved CSV and the transform log, the second run the Batch
+    # Workspace DOE Batch CSV and the surface-check log. Each dependent check
+    # stays NOT_VERIFIED, the other checks keep their results and their
+    # evidence, and F1 names each reference source with its SHA-256 or change.
+    ab_fr_changed_sources "S97 changed approved CSV and transform log" \
+        src/output_batch_1.csv src/batch_9/case_7/flow/log.surfaceTransformPoints
+    workspace="$AB_FR_LAST"
+    assert_eq "NOT_VERIFIED NOT_VERIFIED PASS PASS PASS" "$(ab_fr_entry "$workspace" xMin) $(ab_fr_entry "$workspace" geometry.refinementDomain.point1) $(ab_fr_entry "$workspace" boundaryField.inlet.Uref) $(ab_fr_entry "$workspace" boundaryField.f18p1_seb_a.value) $(ab_fr_entry "$workspace" numberOfSubdomains)" \
+        "S97 changed approved CSV and transform log: only the geometry entries lose their expected value"
+    assert_eq "13" "$(awk -F '\t' 'NR > 1 && $11 == "NOT_VERIFIED"' "$(ab_fr_dir "$workspace")/setup-entry-values.tsv" | wc -l)" \
+        "S97 changed approved CSV and transform log: the 13 geometry entries are NOT_VERIFIED"
+    assert_eq "FOUND|-698.500|-" "$(ab_fr_entry "$workspace" xMin outcome)|$(ab_fr_entry "$workspace" xMin value)|$(ab_fr_entry "$workspace" xMin expected)" \
+        "S97 changed approved CSV and transform log: the entry keeps its actual value, and no expected value from the changed log is kept"
+    assert_contains "$(ab_fr_entry "$workspace" xMin reason)" "src/batch_9/case_7/flow/log.surfaceTransformPoints changed during the capture" \
+        "S97 changed approved CSV and transform log: the entry names the changed log"
+    reason="$(ab_fr_check "$workspace" F1 reason)"
+    assert_contains "$reason" "doe_row.csv: the reference src/output_batch_1.csv changed during the capture" \
+        "S97 changed approved CSV and transform log: F1 names the changed approved CSV of the DOE row check"
+    assert_contains "$reason" "xMin is FOUND: the reference src/batch_9/case_7/flow/log.surfaceTransformPoints changed during the capture" \
+        "S97 changed approved CSV and transform log: F1 names the changed log of the geometry entries"
+    assert_not_contains "$reason" "setup_metadata.env" \
+        "S97 changed approved CSV and transform log: the metadata check keeps its result"
+    evidence="$(ab_fr_check "$workspace" F1 evidence)"
+    before="$(sha256sum < "${REPO_ROOT}/src/output_batch_1.csv" | cut -d ' ' -f 1)"
+    after="$(sha256sum < "${workspace}/checkout/src/output_batch_1.csv" | cut -d ' ' -f 1)"
+    assert_contains "$evidence" "src/output_batch_1.csv:CHANGED:${before}:${after}" \
+        "S97 changed approved CSV and transform log: F1 keeps both SHA-256 values of the changed CSV"
+    assert_contains "$evidence" "src/batch_9/output_batch_9.csv:$(sha256sum < "${workspace}/checkout/src/batch_9/output_batch_9.csv" | cut -d ' ' -f 1)" \
+        "S97 changed approved CSV and transform log: F1 names the unchanged DOE Batch CSV with its SHA-256"
+    assert_contains "$evidence" "src/batch_9/case_7/flow/log.surfaceTransformPoints:CHANGED:" \
+        "S97 changed approved CSV and transform log: F1 names the changed log"
+    assert_contains "$evidence" "src/batch_9/case_7/flow/log.surfaceCheck:$(sha256sum < "${workspace}/checkout/src/batch_9/case_7/flow/log.surfaceCheck" | cut -d ' ' -f 1)" \
+        "S97 changed approved CSV and transform log: F1 names the unchanged log with its SHA-256"
+    ab_fr_changed_sources "S97 changed DOE Batch CSV and surface-check log" \
+        src/batch_9/output_batch_9.csv src/batch_9/case_7/flow/log.surfaceCheck
+    workspace="$AB_FR_LAST"
+    assert_eq "NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED PASS PASS" "$(ab_fr_entry "$workspace" xMin) $(ab_fr_entry "$workspace" geometry.refinementDomain.point1) $(ab_fr_entry "$workspace" boundaryField.inlet.Uref) $(ab_fr_entry "$workspace" boundaryField.f18p1_seb_a.value) $(ab_fr_entry "$workspace" numberOfSubdomains) $(ab_fr_entry "$workspace" snap)" \
+        "S97 changed DOE Batch CSV and surface-check log: the geometry and the row entries lose their expected value"
+    assert_eq "52" "$(awk -F '\t' 'NR > 1 && $11 == "NOT_VERIFIED"' "$(ab_fr_dir "$workspace")/setup-entry-values.tsv" | wc -l)" \
+        "S97 changed DOE Batch CSV and surface-check log: the 13 geometry and the 39 row entries are NOT_VERIFIED"
+    reason="$(ab_fr_check "$workspace" F1 reason)"
+    assert_contains "$reason" "doe_row.csv: the reference src/batch_9/output_batch_9.csv changed during the capture" \
+        "S97 changed DOE Batch CSV and surface-check log: F1 names the changed CSV of the DOE row check"
+    assert_contains "$reason" "setup_metadata.env: the reference src/batch_9/output_batch_9.csv changed during the capture" \
+        "S97 changed DOE Batch CSV and surface-check log: F1 names the changed CSV of the metadata check"
+    assert_contains "$reason" "xMin is FOUND: the reference src/batch_9/case_7/flow/log.surfaceCheck changed during the capture" \
+        "S97 changed DOE Batch CSV and surface-check log: F1 names the changed log of the geometry entries"
+    evidence="$(ab_fr_check "$workspace" F1 evidence)"
+    assert_contains "$evidence" "src/batch_9/output_batch_9.csv:CHANGED:" \
+        "S97 changed DOE Batch CSV and surface-check log: F1 names the changed CSV"
+    assert_contains "$evidence" "src/batch_9/case_7/flow/log.surfaceCheck:CHANGED:" \
+        "S97 changed DOE Batch CSV and surface-check log: F1 names the changed log"
+}
+
+# ab_fr_changed_sources <label> <source>... - one unit run in a new workspace in
+# which each named source, relative to the checkout, changes after the entry
+# read and before its hash after. The construction stays COMPLETE with no
+# capture note, and the checks are the baseline with F1 NOT_VERIFIED. Sets
+# AB_FR_LAST to the workspace.
+ab_fr_changed_sources() {
+    local label="$1" workspace
+    shift
+    workspace="$(new_workspace "${label//[^A-Za-z0-9_.-]/_}")"
+    ab_fr_fixture "$workspace"
+    ab_fr_fake_changing_sources "$workspace" "$@"
+    ab_fr_expect_unit "$label" "$workspace" \
+        "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED"
+    assert_eq "COMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "${label}: the construction is complete"
+    assert_eq "" "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" \
+        "${label}: a changed source gives no capture note"
+    AB_FR_LAST="$workspace"
+}
+
+# ab_fr_fake_changing_sources <workspace> <source>... - a sha256sum that, in its
+# second run that hashes a named source (the hash after the entry read), first
+# appends one line to each named source of that run, as another writer would
+# after the read.
+ab_fr_fake_changing_sources() {
+    local workspace="$1" real
+    shift
+    real="$(command -v sha256sum)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\ncount=%q\nsources=(' "$real" "${workspace}/source_hashes"
+        printf ' %q' "$@"
+        printf ' )\n'
+        cat <<'FAKE_HASH'
+named=()
+for argument in "$@"; do
+    for source in "${sources[@]}"; do
+        [[ "$argument" != */checkout/"$source" ]] || named+=("$argument")
+    done
+done
+if (( ${#named[@]} > 0 )); then
+    printf 'run\n' >> "$count"
+    if (( $(wc -l < "$count") == 2 )); then
+        for argument in "${named[@]}"; do
+            printf 'changed\n' >> "$argument"
+        done
+    fi
+fi
+exec "$real" "$@"
+FAKE_HASH
+    } > "${workspace}/fakebin/sha256sum"
+    chmod +x "${workspace}/fakebin/sha256sum"
 }
 ab_fr_dictionary() { printf '%s\n' "${1}/checkout/src/batch_9/case_7/flow/${2}"; }
 ab_fr_entry_faults() {
@@ -8794,6 +8982,46 @@ s98_receipt_limits_fail_closed() {
     assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 combined: GITHUB_ENV has the receipt result"
     assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`INCOMPLETE\`" \
         "S98 combined: the summary shows the receipt result"
+    # R3: a result.env that cannot be written (a directory in its place) makes
+    # the construction INCOMPLETE in the capture note, the result outside the
+    # evidence directory, GITHUB_ENV, and the summary. The check results stay,
+    # the step ends with status 0, and no file goes into that directory.
+    workspace="$(new_workspace s98_result)"
+    ab_capture_fixture "$workspace"
+    ab_fr_records "${workspace}/checkout"
+    dir="$(ab_fr_dir "$workspace")"
+    mkdir -p "${dir}/result.env"
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100000 ))")"
+    assert_contains "$run" "status=0" "S98 result: the capture step ends with status 0"
+    assert_eq "INCOMPLETE" "$(ab_file_value "${workspace}/runner_temp/functional-receipt-result.env" FUNCTIONAL_RECEIPT_RESULT)" \
+        "S98 result: the result outside the evidence directory is INCOMPLETE"
+    assert_contains "$(ab_file_value "${workspace}/runner_temp/functional-receipt-result.env" FUNCTIONAL_RECEIPT_REASON)" \
+        "result.env cannot be written" "S98 result: the reason names the result write"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 result: GITHUB_ENV has the INCOMPLETE result"
+    assert_ne "UNAVAILABLE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_CHECKS)" "S98 result: GITHUB_ENV keeps the check results"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S98 result: the capture is incomplete"
+    assert_contains "$(ab_env_last "$workspace" CAPTURE_REASON)" "functional receipt: result.env cannot be written" \
+        "S98 result: the capture note names the result write"
+    assert_eq "" "$(ls -A -- "${dir}/result.env")" "S98 result: no file goes into the directory in place of result.env"
+    assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`INCOMPLETE\`" \
+        "S98 result: the summary shows INCOMPLETE"
+    # R3: a partial result.env, as a receipt that stops in its result write
+    # leaves it, is no result: its first line is not complete evidence. The
+    # explicit INCOMPLETE result replaces it.
+    workspace="$(new_workspace s98_partial)"
+    ab_capture_fixture "$workspace"
+    dir="$(ab_fr_dir "$workspace")"
+    mkdir -p "$dir"
+    printf 'FUNCTIONAL_RECEIPT_RESULT=COMPLETE\n' > "${dir}/result.env"
+    run="$(ab_run_capture "$workspace" "$(( $(date +%s) + 100 ))")"
+    assert_contains "$run" "status=0" "S98 partial: the capture step ends with status 0"
+    assert_eq "SKIPPED_NO_BUDGET" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S98 partial: the capture work does not run"
+    assert_eq "INCOMPLETE" "$(ab_env_last "$workspace" FUNCTIONAL_RECEIPT_RESULT)" "S98 partial: GITHUB_ENV has the INCOMPLETE result"
+    assert_eq "INCOMPLETE" "$(ab_fr_value "$workspace" FUNCTIONAL_RECEIPT_RESULT)" \
+        "S98 partial: the INCOMPLETE result replaces the partial result.env"
+    assert_eq "1" "$(grep -c '^FUNCTIONAL_RECEIPT_RESULT=' "${dir}/result.env")" "S98 partial: result.env has one result line"
+    assert_contains "$(ab_fr_summary "$workspace")" "| Functional receipt | \`INCOMPLETE\`" \
+        "S98 partial: the summary shows INCOMPLETE"
 }
 ab_fr_big_records() {
     local flow="${1}/checkout/src/batch_9/case_7/flow" name
