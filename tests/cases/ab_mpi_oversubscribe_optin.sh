@@ -8219,12 +8219,41 @@ ab_fr_library() {
 
 # ab_fr_fixture <workspace> - the extracted capture step, the controlled
 # records, the capture evidence of the earlier items, and an available
-# collection record, for ab_fr_unit.
+# collection record, for ab_fr_unit. The first call of an observation builds
+# the fixture in its own workspace, and each call copies it, so each run starts
+# from the same controlled bytes. The metadata then names the physical DOE
+# Batch CSV path of the new workspace, as Setup writes it.
 ab_fr_fixture() {
-    ab_capture_fixture "$1"
-    ab_fr_records "${1}/checkout"
-    ab_fr_scanner_evidence "$1"
-    ab_fr_metric_evidence "$1"
+    local workspace="$1" batch
+    if [[ -z "${AB_FR_TEMPLATE:-}" ]]; then
+        AB_FR_TEMPLATE="$(new_workspace fr_template)"
+        ab_capture_fixture "$AB_FR_TEMPLATE"
+        ab_fr_records "${AB_FR_TEMPLATE}/checkout"
+        ab_fr_scanner_evidence "$AB_FR_TEMPLATE"
+        ab_fr_metric_evidence "$AB_FR_TEMPLATE"
+    fi
+    cp -a -- "${AB_FR_TEMPLATE}/." "${workspace}/"
+    batch="${workspace}/checkout/src/batch_9"
+    sed -i -e "s#^csv_file=.*#csv_file=$(cd -P -- "$batch" && pwd -P)/output_batch_9.csv#" \
+        "${batch}/case_7/flow/setup_metadata.env"
+}
+
+# ab_fr_signature <workspace> <signature-text>... - the extracted fr_signature
+# result for each retained signature text, one line each: the state, the
+# flow_latest value, and the reason. No other receipt function runs.
+ab_fr_signature() {
+    local workspace="$1" library
+    shift
+    library="$(ab_fr_library "$workspace")"
+    mkdir -p "${workspace}/signature/files/case_7/vtk"
+    env FR_DIR="${workspace}/signature" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        "${AB_STEP_BASH[@]}" -c "${library}"'
+declare -A FR_REC_OUTCOME=([POST_SIGNATURE]=RETAINED) FR_REC_REASON=()
+for text in "$@"; do
+    printf "%s" "$text" > "${FR_DIR}/files/case_7/vtk/post_processing.complete"
+    fr_signature
+    printf "%s|%s|%s\n" "$SIG_STATE" "$SIG_TIME" "$SIG_WHY"
+done' signature "$@"
 }
 
 # ab_fr_unit <workspace> [NAME=value ...] - run the extracted receipt functions
@@ -8459,26 +8488,30 @@ s94_receipt_complete_controlled_fixture() {
 # ---- S95: the time, signature, VTU, and producer checks ---------------------
 
 s95_receipt_time_signature_and_producer_checks() {
-    local workspace
+    local workspace results
     # The unit baseline equals the integrated result of S94.
     workspace="$(new_workspace s95_baseline)"
     ab_fr_fixture "$workspace"
     ab_fr_expect_unit "S95 baseline" "$workspace" "$AB_FR_ALL_PASS"
     ab_fr_assert_inventory "$workspace" "S95 baseline"
+    # Check 3: each signature fault fails. One process checks each retained
+    # signature text with the extracted signature check.
+    results="$(ab_fr_signature "$workspace" "${AB_FR_SIGNATURE}"$'\n' "${AB_FR_SIGNATURE}"$'\nscalar_field=T\n' \
+        "${AB_FR_SIGNATURE%$'\n'vtu_point_data=included}"$'\n' "${AB_FR_SIGNATURE/transport_ready=0/transport_ready=1}"$'\n' \
+        $'flow_latest=2\ntransport_times=\ntransport_ready=0\nscalar_field=T\nflow_zero_fields=(U p wallDistance)\nflow_result_fields=(U p)\nvtu_point_data=included\n' \
+        "$AB_FR_SIGNATURE" "${AB_FR_SIGNATURE/scalar_field=T/scalar_field=S}"$'\n')"
+    assert_eq "OK|2|-
+FAIL|2|the signature has the key scalar_field 2 times
+FAIL|2|the signature has no vtu_point_data line
+FAIL|2|the signature has transport_ready=1, not transport_ready=0
+FAIL|2|the signature keys are not in the order flow_latest transport_ready transport_times scalar_field flow_zero_fields flow_result_fields vtu_point_data
+FAIL|2|the signature does not end with a line end
+FAIL|2|the signature has scalar_field=S, not scalar_field=T" "$results" \
+        "S95: the exact signature passes, and a duplicate, missing, wrong, or reordered key or a missing line end fails"
+    # A wrong post time fails F3 and F6 in the complete receipt.
     ab_fr_case "S95 post time" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_post_time
     assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "flow_latest=3" "S95: a wrong post time is named"
-    ab_fr_case "S95 duplicate key" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_post_duplicate
-    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "scalar_field" "S95: a duplicate key is named"
-    ab_fr_case "S95 missing key" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_post_missing
-    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "vtu_point_data" "S95: a missing key is named"
-    ab_fr_case "S95 transport ready" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_post_ready
-    assert_contains "$(ab_fr_check "$AB_FR_LAST" F3 reason)" "transport_ready=1" "S95: a transport-ready mismatch is named"
-    ab_fr_case "S95 key order" "F1=PASS;F2=PASS;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_post_order
     ab_fr_case "S95 zero time" "F1=PASS;F2=FAIL;F3=FAIL;F4=NOT_VERIFIED;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
         ab_fr_time_zero
     ab_fr_case "S95 time without line end" "F1=PASS;F2=FAIL;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
@@ -8491,24 +8524,18 @@ s95_receipt_time_signature_and_producer_checks() {
     ab_fr_case "S95 other producer" "F1=NOT_VERIFIED;F2=NOT_VERIFIED;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=FAIL;F8=PASS;F9=FAIL;F10=FAIL" \
         ab_fr_metric_producer
     assert_contains "$(ab_fr_check "$AB_FR_LAST" F7 reason)" "producer" "S95: the mixed producer is named"
-    # Check 8: a missing latest VTU file fails F4 and F6; a CellData-only field
-    # fails F5; an incomplete tag record stays NOT_VERIFIED.
-    ab_fr_case "S95 missing VTU" "F1=PASS;F2=PASS;F3=PASS;F4=FAIL;F5=PASS;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_vtu_missing
-    ab_fr_case "S95 CellData only" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=FAIL;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_vtu_cell_only
+    # Check 8: a missing latest VTU file fails F4 and F6, and a CellData-only
+    # time-0 field fails F5, in one run; an incomplete tag record stays
+    # NOT_VERIFIED.
+    ab_fr_case "S95 missing VTU and CellData" "F1=PASS;F2=PASS;F3=PASS;F4=FAIL;F5=FAIL;F6=FAIL;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_vtu_missing_and_cell_only
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F4 reason)" "case_7/vtk/flow_latest_2.vtu" "S95: the missing latest VTU file is named"
+    assert_contains "$(ab_fr_check "$AB_FR_LAST" F5 reason)" "SOURCE_POINTDATA_ABSENT" "S95: CellData only is not PointData"
     ab_fr_case "S95 tag limit" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=NOT_VERIFIED;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
         ab_fr_vtu_tag_limit
 }
-ab_fr_post() {
-    printf '%s\n' "$2" > "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
-}
-ab_fr_post_time() { ab_fr_post "$1" "${AB_FR_SIGNATURE/flow_latest=2/flow_latest=3}"; }
-ab_fr_post_duplicate() { ab_fr_post "$1" "${AB_FR_SIGNATURE}"$'\nscalar_field=T'; }
-ab_fr_post_missing() { ab_fr_post "$1" "${AB_FR_SIGNATURE%$'\n'vtu_point_data=included}"; }
-ab_fr_post_ready() { ab_fr_post "$1" "${AB_FR_SIGNATURE/transport_ready=0/transport_ready=1}"; }
-ab_fr_post_order() {
-    ab_fr_post "$1" $'flow_latest=2\ntransport_times=\ntransport_ready=0\nscalar_field=T\nflow_zero_fields=(U p wallDistance)\nflow_result_fields=(U p)\nvtu_point_data=included'
+ab_fr_post_time() {
+    printf '%s\n' "${AB_FR_SIGNATURE/flow_latest=2/flow_latest=3}" > "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
 }
 ab_fr_time_zero() { printf '0\n' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
 ab_fr_time_no_end() { printf '2' > "${1}/checkout/src/batch_9/case_7/vtk/flow_latest_time.txt"; }
@@ -8520,15 +8547,11 @@ ab_fr_metric_producer() {
     sed -i -e 's/^MAIN_SHA=.*/MAIN_SHA=0000000000000000000000000000000000000000/' \
         "${1}/runner_temp/evidence/m3-mean-speed/result.env"
 }
-ab_fr_vtu_missing() {
-    local manifest="${1}/runner_temp/evidence/vtu-point-data.txt"
+ab_fr_vtu_missing_and_cell_only() {
     sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_latest_2.vtu$/,/^VTU_TAG_EVIDENCE=/{
         s/^VTU_REQUIRED_FIELDS_RESULT=MATCH$/VTU_REQUIRED_FIELDS_RESULT=MISSING_FILE/
         s/^VTU_TAG_EVIDENCE=COMPLETE$/VTU_TAG_EVIDENCE=UNAVAILABLE/
-    }' "$manifest"
-}
-ab_fr_vtu_cell_only() {
-    sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_0.vtu$/,/^VTU_TAG_EVIDENCE=/{
+    }' -e '/^VTU_PATH=case_7\/vtk\/flow_0.vtu$/,/^VTU_TAG_EVIDENCE=/{
         s/^VTU_REQUIRED_FIELDS_RESULT=MATCH$/VTU_REQUIRED_FIELDS_RESULT=SOURCE_POINTDATA_ABSENT/
     }' "${1}/runner_temp/evidence/vtu-point-data.txt"
 }
@@ -8540,21 +8563,20 @@ ab_fr_vtu_tag_limit() {
 # ---- S96: the source records stay distinct ----------------------------------
 
 s96_receipt_source_records_stay_distinct() {
-    local workspace
-    ab_fr_case "S96 missing" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_missing_row
-    assert_eq "MISSING" "$(ab_fr_record "$AB_FR_LAST" DOE_ROW)" "S96: a missing record is MISSING"
-    assert_file_missing "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/flow/doe_row.csv" "S96: no record replaces a missing one"
-    ab_fr_case "S96 link" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_link_marker
-    assert_eq "LINK" "$(ab_fr_record "$AB_FR_LAST" FLOW_MARKER)" "S96: a linked record is LINK"
-    ab_fr_case "S96 FIFO" "F1=PASS;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_fifo_marker
-    assert_eq "NOT_REGULAR" "$(ab_fr_record "$AB_FR_LAST" RESTART_MARKER)" "S96: a FIFO is NOT_REGULAR"
-    ab_fr_case "S96 oversized" "F1=PASS;F2=PASS;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_big_post
-    assert_eq "OVERSIZED" "$(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE)" "S96: a record above 65536 bytes is OVERSIZED"
+    local workspace unreadable=UNREADABLE id
+    # Check 4: one run with five distinct record faults: a missing record, an
+    # unreadable record, a link, a FIFO, and an oversized record. No part of a
+    # failed record is kept, and the FIFO read never blocks.
+    [[ "$(id -u)" != 0 ]] || unreadable=RETAINED
+    ab_fr_case "S96 records" "F1=NOT_VERIFIED;F2=PASS;F3=NOT_VERIFIED;F4=NOT_VERIFIED;F5=PASS;F6=NOT_VERIFIED;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_record_faults
+    chmod 644 "${AB_FR_LAST}/checkout/src/batch_9/case_7/flow/setup_metadata.env"
+    assert_eq "MISSING ${unreadable} LINK NOT_REGULAR RETAINED OVERSIZED" "$(for id in "${AB_FR_RECORD_IDS[@]}"; do
+        ab_fr_record "$AB_FR_LAST" "$id"; done | paste -sd ' ' -)" "S96: each record fault has its own result"
     assert_eq "65537" "$(ab_fr_record "$AB_FR_LAST" POST_SIGNATURE source_bytes_before)" "S96: the oversized size is recorded"
+    for id in doe_row.csv flow.marker restart.marker; do
+        assert_file_missing "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/flow/${id}" "S96: no copy of the failed record ${id} is kept"
+    done
     assert_file_missing "$(ab_fr_dir "$AB_FR_LAST")/files/case_7/vtk/post_processing.complete" "S96: no part of an oversized record is kept"
     ab_fr_case "S96 linked Case" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=NOT_VERIFIED;F9=PASS;F10=NOT_VERIFIED" \
         ab_fr_link_flow
@@ -8562,12 +8584,6 @@ s96_receipt_source_records_stay_distinct() {
         ab_fr_record "$AB_FR_LAST" "$id"; done | paste -sd ' ' -)" "S96: a linked Case directory gives LINK for each of its records"
     assert_eq "LINK" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" \
         "S96: no entry is read through a linked Case directory"
-    if [[ "$(id -u)" != 0 ]]; then
-        ab_fr_case "S96 unreadable" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-            ab_fr_unreadable_metadata
-        assert_eq "UNREADABLE" "$(ab_fr_record "$AB_FR_LAST" SETUP_METADATA)" "S96: an unreadable record is UNREADABLE"
-        chmod 644 "${AB_FR_LAST}/checkout/src/batch_9/case_7/flow/setup_metadata.env"
-    fi
     # A record that changes during the capture is CHANGED, and no copy stays.
     workspace="$(new_workspace s96_changed)"
     ab_fr_fixture "$workspace"
@@ -8586,19 +8602,15 @@ s96_receipt_source_records_stay_distinct() {
     assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
         "S96: a directive at a keyword position makes the entries of its dictionary AMBIGUOUS"
 }
-ab_fr_missing_row() { rm -f -- "${1}/checkout/src/batch_9/case_7/flow/doe_row.csv"; }
-ab_fr_link_marker() {
+ab_fr_record_faults() {
     local flow="${1}/checkout/src/batch_9/case_7/flow"
+    rm -f -- "${flow}/doe_row.csv" "${flow}/flow.marker" "${flow}/restart.marker"
+    if [[ "$(id -u)" != 0 ]]; then
+        chmod 000 "${flow}/setup_metadata.env"
+    fi
     printf 'other\n' > "${1}/checkout/src/other.marker"
-    rm -f -- "${flow}/flow.marker"
     ln -s ../../../other.marker "${flow}/flow.marker"
-}
-ab_fr_fifo_marker() {
-    local flow="${1}/checkout/src/batch_9/case_7/flow"
-    rm -f -- "${flow}/restart.marker"
     mkfifo "${flow}/restart.marker"
-}
-ab_fr_big_post() {
     head -c 65537 /dev/zero | tr '\0' 'x' > "${1}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
 }
 ab_fr_link_flow() {
@@ -8606,7 +8618,6 @@ ab_fr_link_flow() {
     mv -- "${case_dir}/flow" "${1}/checkout/src/flow_elsewhere"
     ln -s ../../flow_elsewhere "${case_dir}/flow"
 }
-ab_fr_unreadable_metadata() { chmod 000 "${1}/checkout/src/batch_9/case_7/flow/setup_metadata.env"; }
 ab_fr_command_text() {
     local flow="${1}/checkout/src/batch_9/case_7/flow"
     sed -i -e "s#^ws=5.0\$#ws=\$(touch ${1}/executed)#" "${flow}/setup_metadata.env"
@@ -8638,34 +8649,21 @@ FAKE_HEAD
 # ---- S97: the selected Setup entries fail closed ----------------------------
 
 s97_receipt_setup_entries_fail_closed() {
-    ab_fr_case "S97 duplicate" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_duplicate_entry
-    assert_eq "DUPLICATE" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" "S97: a duplicate entry is DUPLICATE"
-    ab_fr_case "S97 pattern" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_pattern_entry
-    assert_eq "AMBIGUOUS" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.f18p1_oai_a1.value outcome)" \
-        "S97: a pattern keyword makes the entries of its dictionary AMBIGUOUS"
-    ab_fr_case "S97 macro" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_macro_entry
-    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k)" \
-        "S97: a macro value is UNSUPPORTED"
-    ab_fr_case "S97 truncated" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_truncated_entry
-    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/epsilon)" \
-        "S97: an entry of a truncated dictionary is UNSUPPORTED"
-    ab_fr_case "S97 oversized" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_big_dictionary
-    assert_eq "OVERSIZED" "$(ab_fr_entry "$AB_FR_LAST" snap outcome)" "S97: a dictionary above 1048576 bytes is OVERSIZED"
-    ab_fr_case "S97 byte" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
-        ab_fr_binary_dictionary
-    assert_eq "UNSUPPORTED" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome)" "S97: a non-ASCII byte is UNSUPPORTED"
-    ab_fr_case "S97 wrong value" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_wrong_ranks
-    assert_eq "FAIL" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains)" "S97: a wrong required value fails"
-    assert_eq "4" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains value)" "S97: the actual value is kept"
-    ab_fr_case "S97 placeholder" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
-        ab_fr_placeholder
-    assert_eq "FAIL" "$(ab_fr_entry "$AB_FR_LAST" nx)" "S97: an unresolved placeholder fails"
+    # Checks 1 and 4: one run with a distinct fault in each of the six
+    # dictionaries: a non-ASCII byte, an oversized file, a duplicate entry, a
+    # pattern keyword, a macro value, and a truncated file.
+    ab_fr_case "S97 entries" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
+        ab_fr_entry_faults
+    assert_eq "UNSUPPORTED OVERSIZED DUPLICATE AMBIGUOUS AMBIGUOUS UNSUPPORTED UNSUPPORTED" \
+        "$(ab_fr_entry "$AB_FR_LAST" xMin outcome) $(ab_fr_entry "$AB_FR_LAST" snap outcome) $(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains outcome) $(ab_fr_entry "$AB_FR_LAST" boundaryField.f18p1_oai_a1.value outcome) $(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome) $(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/k) $(ab_fr_entry "$AB_FR_LAST" boundaryField.inlet.Uref outcome case_7/flow/0/epsilon)" \
+        "S97: a byte, an oversized file, a duplicate, a pattern, a macro, and a truncated file each have their own result"
+    assert_eq "57" "$(awk -F '\t' 'NR > 1 && $11 == "NOT_VERIFIED" && $7 == "-"' "$(ab_fr_dir "$AB_FR_LAST")/setup-entry-values.tsv" | wc -l)" \
+        "S97: no entry of a faulty dictionary is used"
+    # Wrong required values fail, and the actual values are kept.
+    ab_fr_case "S97 wrong values" "F1=FAIL;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=FAIL" \
+        ab_fr_wrong_values
+    assert_eq "FAIL 4 FAIL <nx>" "$(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains) $(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains value) $(ab_fr_entry "$AB_FR_LAST" nx) $(ab_fr_entry "$AB_FR_LAST" nx value)" \
+        "S97: a wrong rank count and an unresolved placeholder fail with their actual values"
     ab_fr_case "S97 no geometry log" "F1=NOT_VERIFIED;F2=PASS;F3=PASS;F4=NOT_VERIFIED;F5=PASS;F6=PASS;F7=PASS;F8=PASS;F9=PASS;F10=NOT_VERIFIED" \
         ab_fr_no_geometry_log
     assert_eq "NOT_VERIFIED PASS" "$(ab_fr_entry "$AB_FR_LAST" xMin) $(ab_fr_entry "$AB_FR_LAST" numberOfSubdomains)" \
@@ -8678,19 +8676,20 @@ s97_receipt_setup_entries_fail_closed() {
     assert_contains "$(ab_fr_check "$AB_FR_LAST" F1 reason)" "doe_row.csv" "S97: a row that differs from the DOE Batch CSV is named"
 }
 ab_fr_dictionary() { printf '%s\n' "${1}/checkout/src/batch_9/case_7/flow/${2}"; }
-ab_fr_duplicate_entry() { printf 'numberOfSubdomains 8;\n' >> "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
-ab_fr_pattern_entry() {
+ab_fr_entry_faults() {
+    printf '// \351\n' >> "$(ab_fr_dictionary "$1" system/blockMeshDict)"
+    head -c 1048600 /dev/zero | tr '\0' ' ' >> "$(ab_fr_dictionary "$1" system/snappyHexMeshDict)"
+    printf 'numberOfSubdomains 8;\n' >> "$(ab_fr_dictionary "$1" system/decomposeParDict)"
     sed -i -e 's#^boundaryField$#boundaryField\n{\n    ".*_oai_.*"\n    {\n        type            fixedValue;\n    }\n}\nboundaryField#' \
         "$(ab_fr_dictionary "$1" 0/U)"
+    sed -i -e 's#^        Uref            5;$#        Uref            $UrefValue;#' "$(ab_fr_dictionary "$1" 0/k)"
+    sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"
+    sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"
 }
-ab_fr_macro_entry() { sed -i -e 's#^        Uref            5;$#        Uref            $UrefValue;#' "$(ab_fr_dictionary "$1" 0/k)"; }
-ab_fr_truncated_entry() { sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"; sed -i -e '$d' "$(ab_fr_dictionary "$1" 0/epsilon)"; }
-ab_fr_big_dictionary() {
-    head -c 1048600 /dev/zero | tr '\0' ' ' >> "$(ab_fr_dictionary "$1" system/snappyHexMeshDict)"
+ab_fr_wrong_values() {
+    sed -i -e 's/^numberOfSubdomains 8;$/numberOfSubdomains 4;/' "$(ab_fr_dictionary "$1" system/decomposeParDict)"
+    sed -i -e 's/^nx    45;/nx    <nx>;/' "$(ab_fr_dictionary "$1" system/blockMeshDict)"
 }
-ab_fr_binary_dictionary() { printf '// \351\n' >> "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
-ab_fr_wrong_ranks() { sed -i -e 's/^numberOfSubdomains 8;$/numberOfSubdomains 4;/' "$(ab_fr_dictionary "$1" system/decomposeParDict)"; }
-ab_fr_placeholder() { sed -i -e 's/^nx    45;/nx    <nx>;/' "$(ab_fr_dictionary "$1" system/blockMeshDict)"; }
 ab_fr_no_geometry_log() { rm -f -- "$(ab_fr_dictionary "$1" log.surfaceCheck)"; }
 ab_fr_wrong_model() { sed -i -e 's/^ras_model=kEpsilon$/ras_model=kOmega/' "$(ab_fr_dictionary "$1" setup_metadata.env)"; }
 ab_fr_other_row() { sed -i -e '2s/^7,/8,/' "$(ab_fr_dictionary "$1" doe_row.csv)"; }
@@ -8796,7 +8795,7 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
     # The receipt adds no OpenFOAM command, privilege, package, network, Case
     # template, or reader.
     if grep -v '^[[:space:]]*#' <<< "$block" |
-            grep -nE 'foamDictionary|foamListTimes|simpleFoam|sudo|apt-get|curl|wget|foamToVTK|vtk[A-Z]|python|eval '; then
+            grep -nE 'foamDictionary|foamListTimes|simpleFoam -|sudo|apt-get|curl|wget|foamToVTK|vtk[A-Z]|python|eval '; then
         _fail "S99: the receipt runs no OpenFOAM command, privilege, package, network, template, or reader"
     fi
     for constant in 'FR_WORK_SECONDS=30' 'FR_FILE_LIMIT=65536' 'FR_TREE_LIMIT=262144' 'FR_SCAN_LIMIT=1048576' \
