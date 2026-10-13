@@ -1413,13 +1413,16 @@ jobs:
 
           # fr_record_work <top> <files> <work> <limit> <left> <ID=path>... - the record
           # work, in one bounded process. One stat and one sha256sum give the sizes and
-          # hashes before. Then each record in turn is read once into the work directory,
-          # and one sha256sum hashes the source and the copy after. Equal SHA-256 values
-          # mean equal bytes, so the byte counts after are the counts before; a changed
-          # source gets its byte count after from stat. The copy stays only when the
-          # source and the copy agree, and each row is printed when its record is done.
+          # hashes before. Then each record in turn is read once into the work directory
+          # (a shell read and write for a text record; head for a record with a NUL byte,
+          # where a shell read ends), and one sha256sum hashes the source and the copy
+          # after. Equal SHA-256 values mean equal bytes, so the byte counts after are the
+          # counts before; a changed source gets its byte count after from stat. The copy
+          # stays only when the source and the copy agree, and each row is printed when
+          # its record is done.
           fr_record_work() {
               local top="$1" files="$2" work="$3" limit="$4" left="$5" pair i id rel src part line b1 h1 b2 h2 kept kb kh outcome reason
+              local content
               local -a ids=() rels=() first=() why=() paths=() got=()
               local -A size=() sum=()
               shift 5
@@ -1450,8 +1453,19 @@ jobs:
                           outcome=OVERSIZED reason="the record has ${b1} bytes, above the ${limit}-byte record limit"
                       elif (( b1 > left )); then
                           outcome=OUTPUT_LIMIT reason="the record of ${b1} bytes does not fit the ${left} receipt bytes that are left"
-                      elif ! head -c "$(( limit + 1 ))" -- "$src" > "$part" 2> /dev/null ||
-                           ! mapfile -t got < <(sha256sum -- "$src" "$part" 2> /dev/null) || (( ${#got[@]} != 2 )); then
+                      else
+                          content=""
+                          IFS= read -r -d '' content < "$src" 2> /dev/null || true
+                          if (( ${#content} == b1 )); then
+                              printf '%s' "$content" > "$part" 2> /dev/null || rm -f -- "$part"
+                          else
+                              head -c "$(( limit + 1 ))" -- "$src" > "$part" 2> /dev/null || rm -f -- "$part"
+                          fi
+                          content=""
+                      fi
+                      if [[ -n "$outcome" ]]; then
+                          :
+                      elif [[ ! -f "$part" ]] || ! mapfile -t got < <(sha256sum -- "$src" "$part" 2> /dev/null) || (( ${#got[@]} != 2 )); then
                           outcome=READ_FAILURE reason="the record cannot be read completely"
                       else
                           h2="${got[0]%%  *}" kh="${got[1]%%  *}"
