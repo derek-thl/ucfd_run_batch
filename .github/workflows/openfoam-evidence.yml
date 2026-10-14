@@ -7333,40 +7333,13 @@ jobs:
           # ---- M3 mean speed: end ----
 
           # ---- VTU readback: begin ----
-          # The focused readback of the two Case 7 flow VTU files (Issue #80, approved
-          # proposal 6136150842, Sections 2 to 6, admission 6160693923). After the
-          # receipt, the capture binds one witness: the same producer, the collector-
-          # selected time of the receipt (F2 and F3 PASS), the retained time record, the
-          # scanner records, and the two exact paths src/batch_9/case_7/vtk/flow_0.vtu
-          # and flow_latest_<time>.vtu. One fixed native command then loads both files
-          # in full with vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader of the provided
-          # task site, and the capture keeps seven bounded text records in vtu-readback/.
+          # The VTU readback of the two Case 7 flow files (Issue #80, proposal 6136150842).
           #
-          # The readback only reads its sources. Each source must be a regular file with
-          # one link, below directories that are not links, with the scanner bytes and
-          # SHA-256 before and after the native read. These are change-detection
-          # snapshots, not a race-free immutable snapshot. The readback installs nothing
-          # and uses no network; the provision of the Orchestrator step must give
-          # PROVISION_AVAILABLE with the approved block and manifest SHA-256.
+          # The readback only reads its sources. It installs nothing and uses no network.
           #
-          # Results: PASS needs both full native reads and every identity, array, stop,
-          # and record check. A detected malformed payload, a wrong required array or
-          # count, and a changed source are FAIL. A missing consumer, an unsafe or
-          # unsupported input, no time, a limit, a warning, and an incomplete record are
-          # NOT_VERIFIED. A failed product run is NOT_ATTEMPTED. A readback result is
-          # not a capture error; only a record that cannot be written completely is a
-          # capture note. A controlled PASS is capability evidence only, and a PASS alone
-          # never accepts F4 or M3.
+          # PASS needs every check. A PASS alone never accepts F4 or M3.
           #
-          # Limits: the readback work ends by the earlier of 90 seconds after its start
-          # and 10 seconds before the capture work limit. The native command gets at most
-          # 60 seconds, and its 5-second kill grace and a 10-second receipt reserve stay
-          # inside the readback end. Each source holds at most 268435456 bytes, both at
-          # most 536870912. The reader process has a 4294967296-byte address space, 60
-          # CPU seconds, no core file, and 65536 bytes for each stream and record. The
-          # subtree holds at most 262144 bytes, with at most 65536 bytes of provision
-          # text, and the collection, the receipt, and the readback together at most the
-          # existing 10485760-byte added-evidence ceiling.
+          # Limits, in seconds and bytes:
           VR_WORK_SECONDS=90
           VR_NATIVE_SECONDS=60
           VR_KILL_GRACE_SECONDS=5
@@ -7380,7 +7353,7 @@ jobs:
           VR_PROVISION_TEXT_LIMIT=65536
           VR_COMBINED_LIMIT=10485760
           VR_PYTHON=/usr/bin/python3.12
-          # The SHA-256 of the provision block of both workflows and of its manifest.
+          # The SHA-256 of the provision block and of its manifest.
           VR_PROVISION_BLOCK_SHA256=cb0b8ea9aa06690a4092c0ba27853a67c567f243ec6e95bf27f14b7aa4ac4a4e
           VR_MANIFEST_SHA256=9f52889f36445c17ae472a5def7f2bbf60559e5a63a2ef27505ed9937c39a3cc
           VR_TIME_RE='^[0-9]+([.][0-9]+)?$'
@@ -7392,15 +7365,13 @@ jobs:
               printf '%s\n' "$(( 10#$t / 1000 ))"
           }
 
-          # vr_clock <name> - set <name> to the wall clock in milliseconds, with no
-          # subshell.
+          # vr_clock <name> - vr_now_ms with no subshell.
           vr_clock() {
               local vr_clock_value="${EPOCHREALTIME//[!0-9]/}"
               printf -v "$1" '%s' "$(( 10#$vr_clock_value / 1000 ))"
           }
 
-          # vr_one <name> <text> [<limit>] - set <name> to one line of at most <limit>
-          # (300) characters, with no tab, with no subshell.
+          # vr_one <name> <text> [<limit>] - one bounded line.
           vr_one() {
               local vr_one_value="${2//[$'\t\r\n']/ }"
               printf -v "$1" '%s' "${vr_one_value:0:${3:-300}}"
@@ -7415,7 +7386,7 @@ jobs:
               return 0
           }
 
-          # vr_key <file> <key> - the one value of <key> in a KEY=value file, or nothing.
+          # vr_key <file> <key> - the one value of <key>, or nothing.
           vr_key() {
               local line value="" count=0
               [[ -f "$1" && ! -L "$1" ]] || return 0
@@ -7429,8 +7400,7 @@ jobs:
               return 0
           }
 
-          # vr_complete <file> <last-key> - status 0 for a regular file of at most
-          # VR_FILE_LIMIT bytes that ends with its <last-key>=<number> line.
+          # vr_complete <file> <last-key> - status 0 for a complete record.
           vr_complete() {
               local text="" pattern="(^|"$'\n'")${2}=[0-9]+"$'\n''$'
               [[ -f "$1" && ! -L "$1" ]] || return 1
@@ -7439,9 +7409,7 @@ jobs:
               [[ "$text" =~ $pattern ]]
           }
 
-          # vr_group_members <group> - the PID of each live process in one process group,
-          # from the /proc/<pid>/stat files that every user can read. A zombie has
-          # stopped. Returns 1 when the stat file of a listed process cannot be read.
+          # vr_group_members <group> - the live PIDs of one group; status 1 on a read error.
           vr_group_members() {
               local file line rest state
               for file in /proc/[0-9]*/stat; do
@@ -7461,18 +7429,14 @@ jobs:
               return 0
           }
 
-          # vr_group_empty <group> - status 0 for a complete check with no live process.
+          # vr_group_empty <group> - status 0 for no live process.
           vr_group_empty() {
               local members
               members="$(vr_group_members "$1")" || return 1
               [[ -z "$members" ]]
           }
 
-          # vr_stop_group <group> <end-ms> - stop each process that is still in the group
-          # after the command returned: SIGTERM, then SIGKILL one second before <end-ms>
-          # or after the kill grace, whichever is first. The stop and its check end by
-          # <end-ms>. A group ID below 2 is refused. Sets VR_STOP to EMPTY, STOPPED, or
-          # NOT_STOPPED, and returns 1 for NOT_STOPPED.
+          # vr_stop_group <group> <end-ms> - stop the group; sets VR_STOP.
           vr_stop_group() {
               local group="$1" end="$2" kill_at now members=""
               VR_STOP=EMPTY
@@ -7507,8 +7471,7 @@ jobs:
               return 1
           }
 
-          # vr_bytes <directory>... - VR_EVIDENCE_USED: the regular-file bytes below the
-          # existing directories, with one find. Status 1 when find fails.
+          # vr_bytes <directory>... - VR_EVIDENCE_USED, the regular-file bytes.
           vr_bytes() {
               local out="" total=0 line dir
               local -a dirs=()
@@ -7525,10 +7488,7 @@ jobs:
               return 0
           }
 
-          # vr_provision - the provision gate, and the bounded provision text for the
-          # records: the task-root receipt lines in VR_P_ID and its command rows in
-          # VR_P_ROWS. Only a mode-700 root of this user directly below RUNNER_TEMP is
-          # read.
+          # vr_provision - the provision gate and its bounded text.
           vr_provision() {
               local root="${M3_VTU_DEP_ROOT:-}" parent="" env_result="${M3_VTU_PROVISION_RESULT:-NOT_ATTEMPTED}" line value safe=0
               vr_one value "$env_result"
@@ -7573,7 +7533,7 @@ jobs:
               return 0
           }
 
-          # vr_check <check> - the result of one receipt check in checks.tsv.
+          # vr_check <check> - one receipt check result.
           vr_check() {
               awk -F '\t' -v want="$1" '
                   NR == 1 { for (i = 1; i <= NF; i++) if ($i == "result") col = i; next }
@@ -7581,9 +7541,7 @@ jobs:
                   END { if (n == 1) print value }' "${EVIDENCE_DIR}/functional-receipt/checks.tsv" 2> /dev/null || true
           }
 
-          # vr_scanner <path> - the one scanner record of a VTU path relative to the
-          # Batch Workspace: VR_S_BYTES and VR_S_SHA, with status 0 for one complete
-          # MATCH record.
+          # vr_scanner <path> - one complete MATCH scanner record.
           vr_scanner() {
               local line cur="" count=0 bytes="" sha="" result=""
               VR_S_BYTES="" VR_S_SHA=""
@@ -7601,9 +7559,7 @@ jobs:
               return 0
           }
 
-          # vr_bind - one witness of this producer: the collector-selected time, the
-          # receipt F2 and F3, the retained time record, and one complete scanner MATCH
-          # record for each of the two files. Sets VR_TIME and the scanner values.
+          # vr_bind - one witness of this producer.
           vr_bind() {
               local metric="${EVIDENCE_DIR}/m3-mean-speed/result.env" files="${EVIDENCE_DIR}/functional-receipt/files/case_7/vtk"
               local sha run time f2 f3 text="" role
@@ -7640,9 +7596,7 @@ jobs:
               return 0
           }
 
-          # vr_stat <role> <prefix> - the device, inode, bytes, link count, and change
-          # times of one source in VR_<prefix>_DEV, _INO, _BYTES, _LINKS, and _CHG.
-          # Status 1 when stat fails.
+          # vr_stat <role> <prefix> - the stat values of one source.
           vr_stat() {
               local line
               local -a fields=()
@@ -7654,8 +7608,7 @@ jobs:
               return 0
           }
 
-          # vr_sources - the two exact sources: directories that are not links, regular
-          # files with one link, and the size limits, before any hash.
+          # vr_sources - the two exact sources, before any hash.
           vr_sources() {
               local base="${GITHUB_WORKSPACE:-}" dir part role total=0
               if [[ -z "$base" || "$base" != /* || ! -d "$base" ]]; then
@@ -7697,9 +7650,7 @@ jobs:
               return 0
           }
 
-          # vr_hash <before|after> - the device, inode, bytes, and change times, and then
-          # the SHA-256, of both sources, in the readback time. Before: a change since
-          # vr_sources is recorded in VR_CHANGED. Status 1 without a complete result.
+          # vr_hash <before|after> - stat values and SHA-256 of both sources.
           vr_hash() {
               local phase="$1" left now out status=0 line role sum outcome=COMPLETED
               local -A dev=() ino=() bytes=() chg=()
@@ -7745,9 +7696,7 @@ jobs:
               return 0
           }
 
-          # vr_native <directory> - the fixed native command of proposal Section 4, in
-          # its own process group, with the reader result on file descriptor 3. The
-          # reader values go to VR_RV; a key that is not unique is not kept.
+          # vr_native <directory> - the fixed native command.
           vr_native() {
               local dir="$1" task limit start now status=124 outcome=NOT_STARTED vector line key
               local -A seen=()
@@ -7811,17 +7760,14 @@ jobs:
               return 0
           }
 
-          # vr_note <key> <text> - one capture note for each key, also when a final
-          # record is written again.
+          # vr_note <key> <text> - one capture note for each key.
           vr_note() {
               [[ -z "${VR_NOTED[$1]:-}" ]] || return 0
               VR_NOTED[$1]=1
               capture_note "$2"
           }
 
-          # vr_write <directory> <name> <text> - write one record when it fits the record
-          # limit and the subtree budget. Otherwise nothing is written, and the gap is a
-          # capture note. VR_SIZE keeps the bytes of each written record.
+          # vr_write <directory> <name> <text> - one bounded record.
           vr_write() {
               local LC_ALL=C bytes="${#3}"
               if (( bytes > VR_FILE_LIMIT || VR_USED + bytes > VR_AVAILABLE )); then
@@ -7838,8 +7784,7 @@ jobs:
               return 0
           }
 
-          # vr_unwrite <directory> <name> - remove one final record before it is written
-          # again, and give back its bytes. Only a regular file or a link is removed.
+          # vr_unwrite <directory> <name> - remove one final record.
           vr_unwrite() {
               if [[ -n "${VR_SIZE[$2]:-}" ]]; then
                   VR_USED=$(( VR_USED - ${VR_SIZE[$2]} ))
@@ -7851,10 +7796,7 @@ jobs:
               return 0
           }
 
-          # vr_records <directory> - the seven bounded text records: identity.env,
-          # commands.tsv, files.tsv, the reader records arrays.tsv and errors.txt (or
-          # their header lines), result.env, and last inventory.tsv with the bytes and
-          # SHA-256 of the other six.
+          # vr_records <directory> - the seven bounded text records.
           vr_records() {
               local dir="$1" text name role value key bytes sha out line pass state
               local LC_ALL=C
@@ -7971,8 +7913,7 @@ jobs:
               return 0
           }
 
-          # vr_side <file> <reason> - a complete INCOMPLETE side result, for a readback
-          # that writes no record. The capture step publishes it.
+          # vr_side <file> <reason> - a complete INCOMPLETE side result.
           vr_side() {
               local reason finish
               vr_one reason "$2"
@@ -7981,7 +7922,7 @@ jobs:
                   "$reason" "$VR_START_MS" "$finish" > "$1" 2> /dev/null || true
           }
 
-          # vr_result_text - result.env as VR_RESULT_TEXT, with WORK_FINISH last.
+          # vr_result_text - result.env as VR_RESULT_TEXT.
           vr_result_text() {
               local provision finish
               vr_one provision "${M3_VTU_PROVISION_RESULT:-NOT_ATTEMPTED}"
@@ -7996,8 +7937,7 @@ jobs:
               VR_RESULT_TEXT+="WORK_START=${VR_START_MS}"$'\n'"WORK_FINISH=${finish}"$'\n'
           }
 
-          # vr_capture - the complete readback work of the capture. It always returns 0;
-          # a record gap is a capture note.
+          # vr_capture - the readback work. It always returns 0.
           vr_capture() {
               local dir="${EVIDENCE_DIR}/vtu-readback" side="${EVIDENCE_DIR%/*}/vtu-readback-result.env" role value expected clean
               local -A VR_FILE=() VR_PATH=() VR_SCAN_BYTES=() VR_SCAN_SHA=() VR_DEV0=() VR_INO0=() VR_BYTES0=() VR_CHG0=() VR_SHA0=()
@@ -8114,7 +8054,7 @@ jobs:
               return 0
           }
 
-          # The fixed reader program: the exact standard input of the native command.
+          # The fixed reader program: the standard input of the native command.
           IFS= read -r -d '' VR_READER_PY <<'VR_READER_PY' || true
           import base64, gc, hashlib, os, platform, re, resource, signal, stat, struct, sys, sysconfig, threading, warnings
 

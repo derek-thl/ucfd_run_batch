@@ -9339,17 +9339,25 @@ ab_vp_step_without() {
 # no other byte.
 
 # ab_vc_guard <workflow> <base> - the cap guard of S100. Print one result:
-# "REJECT_BEFORE_NORMALIZATION: <reason>" when the contract-tests job does not
-# hold the one authorized cap line. Else write <base>, the workflow with that
-# line set back to 15 and without the provision step, and print "ACCEPT" when
-# <base> is the admitted base file or "REJECT_AT_BASE_HASH" when it is not. A
-# missing workflow or a tool error prints no result and returns 1, so it is
-# never an expected rejection. A cap line is a contract-tests line with
-# "timeout-minutes" and less than 8 leading spaces, that is, not a step line.
+# "REJECT_BEFORE_NORMALIZATION: <reason>" when the workflow does not end with
+# an LF (AWK would add that byte, Owner decision 6173182935) or the
+# contract-tests job does not hold the one authorized cap line. Else write
+# <base>, the workflow with that line set back to 15 and without the provision
+# step, and print "ACCEPT" when <base> is the admitted base file or
+# "REJECT_AT_BASE_HASH" when it is not. A missing workflow or a tool error
+# prints no result and returns 1, so it is never an expected rejection. A cap
+# line is a contract-tests line with "timeout-minutes" and less than 8 leading
+# spaces, that is, not a step line.
 ab_vc_guard() {
-    local workflow="$1" base="$2" verdict hash
+    local workflow="$1" base="$2" verdict hash last
     rm -f -- "$base" || { _fail "S100: the cap guard cannot remove ${base}"; return 1; }
     [[ -f "$workflow" ]] || { _fail "S100: the cap guard has no workflow file ${workflow}"; return 1; }
+    last="$(tail -c 1 -- "$workflow" | od -An -tx1 | tr -d ' \n')" ||
+        { _fail "S100: the cap guard cannot read the last byte of ${workflow}"; return 1; }
+    if [[ "$last" != 0a ]]; then
+        printf 'REJECT_BEFORE_NORMALIZATION: the workflow has no final LF\n'
+        return 0
+    fi
     verdict="$(awk '
         /^[^ #]/ { jobs = ($0 == "jobs:"); job = "" }
         jobs && /^  [^ #]/ { job = $0; steps = 0; if (job == "  contract-tests:") count++ }
