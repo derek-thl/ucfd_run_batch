@@ -523,10 +523,11 @@ jobs:
               printf '%s\n' "$(( 10#$t / 1000 ))"
           }
 
-          # vp_text <text> - one line of at most 300 characters, with no tab.
+          # vp_text <text> [<limit>] - one line of at most <limit> (300) characters,
+          # with no tab.
           vp_text() {
               local text="${1//[$'\t\r\n']/ }"
-              printf '%s\n' "${text:0:300}"
+              printf '%s\n' "${text:0:${2:-300}}"
           }
 
           # vp_block_sha - the SHA-256 of this block in the running script, from the
@@ -669,7 +670,7 @@ jobs:
                       > "${VP_ROOT}/records/commands.tsv"
               VP_OP_SEQ=$(( ${VP_OP_SEQ:-0} + 1 ))
               printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$VP_OP_SEQ" "$label" "$limit" "$start" "$(vp_now_ms)" \
-                  "$VP_OP_STATUS" "$VP_OP_OUTCOME" "$VP_OP_GROUP" "$VP_STOP" "$code" "$(vp_text "$record")" \
+                  "$VP_OP_STATUS" "$VP_OP_OUTCOME" "$VP_OP_GROUP" "$VP_STOP" "$code" "$(vp_text "$record" 4000)" \
                   >> "${VP_ROOT}/records/commands.tsv"
               VP_OP_RECORD=""
               return 0
