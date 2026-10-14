@@ -9398,7 +9398,7 @@ s100_provision_block_is_identical_in_both_workflows() {
                   'vp_provision "$(( ${CAPTURE_DEADLINE:-0} - ${CAPTURE_START_GUARD_SECONDS:-60} - 60 ))"' \
                   'if [[ "$VP_RESULT" != PROVISION_AVAILABLE ]]; then' \
                   '    echo "M3 VTU provision: ${VP_RESULT}: ${VP_REASON}" >&2' '    exit 1' 'fi' \
-                  '# ---- M3 VTU provision gate: end ----' '' 'source "$LIB"')" \
+                  '# ---- M3 VTU provision gate: end ----' 'source "$LIB"')" \
         "$(ab_step_run_body "Run the Orchestrator" | sed -n -e '/^# ---- M3 VTU provision: end ----$/,/^source "\$LIB"$/p')" \
         "S100: the gate comes after the block and before the bounded-runner library and the OpenFOAM environment"
     assert_eq "set -euo pipefail" "$(ab_step_run_body "Run the Orchestrator" | head -n 1)" \
@@ -9409,7 +9409,7 @@ s100_provision_block_is_identical_in_both_workflows() {
         "$(ab_workflow_step_block "Run the Orchestrator" | sed -n -e 's/^        if: //p')" \
         "S100: the Orchestrator step condition stays"
     # The job summary shows the provision result.
-    assert_eq "1" "$(grep -cF -- '| VTU provision | `${M3_VTU_PROVISION_RESULT:-NOT_ATTEMPTED}` |' "$WORKFLOW")" \
+    assert_eq "1" "$(grep -cF -- '| VTU provision | \`${M3_VTU_PROVISION_RESULT:-NOT_ATTEMPTED}\` |' "$WORKFLOW")" \
         "S100: the job summary shows the provision result"
     for name in "Start the evidence clock" "Check out the repository" "Prepare the one-Case DOE Batch CSV" "Capture the evidence"; do
         assert_eq "0" "$(ab_workflow_step_block "$name" | grep -c 'M3 VTU provision: begin')" \
@@ -9421,10 +9421,11 @@ s100_provision_block_is_identical_in_both_workflows() {
 # not signal: kill -0 gives EPERM and sends no signal. Fails when the host has
 # none, for example when the tests run as root.
 ab_vp_foreign_group() {
-    local group
+    local group text
     while read -r group; do
         [[ "$group" =~ ^[0-9]+$ ]] && (( group > 1 )) || continue
-        if LC_ALL=C kill -0 -- "-${group}" 2>&1 | grep -q 'Operation not permitted'; then
+        text="$(LC_ALL=C kill -0 -- "-${group}" 2>&1)" || true
+        if [[ "$text" == *"Operation not permitted"* ]]; then
             printf '%s\n' "$group"
             return 0
         fi
@@ -9665,7 +9666,7 @@ import errno, os, ssl, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 from vp_fakes import wheel, task_root, env_file, URL, metadata
 
-code = open(sys.argv[1], encoding="utf-8").read()
+code = compile(open(sys.argv[1], encoding="utf-8").read(), "vp-fetch", "exec")
 work = sys.argv[2]
 
 class Response:
@@ -9702,10 +9703,13 @@ class Connection:
     def close(self):
         pass
 
+NS = {"__name__": "vp_unit"}
+exec(code, NS)
+NS["HTTPSConnection"] = Connection
+
 def run_case(label, rows, serve=None, lock=None, requires=None, mode=0o700, patch=None, prepare=None):
-    ns = {"__name__": "vp_unit"}
-    exec(compile(code, "vp-fetch", "exec"), ns)
-    ns["HTTPSConnection"] = Connection
+    ns = NS
+    saved = dict(ns)
     if patch:
         patch(ns)
     root = task_root(os.path.join(work, label), rows, lock=lock, requires=requires, mode=mode)
@@ -9718,6 +9722,8 @@ def run_case(label, rows, serve=None, lock=None, requires=None, mode=0o700, patc
     if serve:
         serve(Connection.served, rows)
     status = ns["run"](root)
+    ns.clear()
+    ns.update(saved)
     values = env_file(os.path.join(root, "records", "fetch.env"))
     requests = [c for c in Connection.calls if c[0] == "GET"]
     print("\t".join([label, values.get("FETCH_RESULT", "MISSING"), values.get("FETCH_REASON", "MISSING"),
@@ -9728,7 +9734,7 @@ def path_of(file):
     return "/packages/aa/bb/" + "c" * 60 + "/" + file
 
 def base_rows(**changes):
-    alpha = wheel("alpha", "1.0", requires=["beta>=1.5"], **changes.get("alpha", {}))
+    alpha = wheel("alpha", "1.0", **dict({"requires": ["beta>=1.5"]}, **changes.get("alpha", {})))
     beta = wheel("beta", "2.0", **changes.get("beta", {}))
     pip = wheel("pip", "25.2", files={"pip/__init__.py": b"", "pip/__main__.py": b""})
     return [("runtime", "alpha", "1.0") + alpha, ("runtime", "beta", "2.0") + beta, ("installer", "pip", "25.2") + pip]
@@ -9805,59 +9811,63 @@ run_case("root_mode", base_rows(), requires=REQUIRES, mode=0o755)
 PY
 }
 
-# ab_vp_fake_site <python-file> - write a script that builds a controlled task
-# root with a pip-style --target site of two distributions, alpha and beta, and
-# a pure-Python vtkmodules of alpha. Arguments: <root> <case>.
+# ab_vp_fake_site <python-file> - write a script that builds controlled task
+# roots with a pip-style --target site of two distributions, alpha and beta,
+# and a pure-Python vtkmodules of alpha. Arguments: <directory> <case>...; each
+# root is <directory>/verify_<case>.
 ab_vp_fake_site() {
     cat > "$1" <<'PY'
 import csv, io, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 from vp_fakes import task_root, metadata, record_hash, wheel
 
-root, case = sys.argv[1], sys.argv[2]
-alpha_meta = metadata("alpha", "1.0", ["beta>=1.5"])
-beta_meta = metadata("beta", "2.0")
-manifest_alpha = metadata("alpha", "1.0", ["beta>=1.6"]) if case == "metadata" else alpha_meta
-rows = [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", manifest_alpha),
-        ("runtime", "beta", "2.0", "beta-2.0-py3-none-any.whl", b"b", beta_meta),
-        ("installer", "pip", "25.2", "pip-25.2-py3-none-any.whl", b"p", metadata("pip", "25.2"))]
-task_root(root, rows, requires=[("alpha", "beta>=1.5")])
-site = os.path.join(root, "site")
-core = (b"import os\n"
-        b"limits = os.environ.get('AB_FAKE_LIMITS')\n"
-        b"if limits:\n"
-        b"    open(limits, 'w').write(open('/proc/self/limits').read())\n"
-        b"class vtkVersion:\n"
-        b"    @staticmethod\n"
-        b"    def GetVTKVersion():\n"
-        b"        return os.environ.get('AB_FAKE_VTK_VERSION', '9.5.2')\n")
-alpha_files = {"alpha/__init__.py": b"VALUE = 1\n", "../../bin/alpha-tool": b"#!/bin/sh\n"}
-if case != "no_module":
-    alpha_files.update({"vtkmodules/__init__.py": b"", "vtkmodules/vtkCommonCore.py": core,
-                        "vtkmodules/vtkIOXML.py": b"class vtkXMLUnstructuredGridReader:\n    pass\n"})
-dists = [("alpha", "1.0", alpha_meta, alpha_files), ("beta", "2.0", beta_meta, {"beta/__init__.py": b"VALUE = 2\n"})]
-if case == "no_dist":
-    dists = dists[:1]
-for name, version, meta, files in dists:
-    info = "%s-%s.dist-info/" % (name, version)
-    files = dict(files, **{info + "METADATA": meta, info + "INSTALLER": b"pip\n"})
-    record = io.StringIO()
-    writer = csv.writer(record, lineterminator="\n")
-    for rel, data in files.items():
-        path = os.path.join(site, rel[len("../../"):] if rel.startswith("../../") else rel)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(data)
-        writer.writerow([rel, record_hash(data), len(data)])
-    writer.writerow([info + "RECORD", "", ""])
-    with open(os.path.join(site, info + "RECORD"), "w") as f:
-        f.write(record.getvalue())
-if case == "link":
-    os.symlink("/etc/hostname", os.path.join(site, "alpha", "link.py"))
-elif case == "unlisted":
-    open(os.path.join(site, "alpha", "extra.py"), "w").write("x = 1\n")
-elif case == "changed":
-    open(os.path.join(site, "alpha", "__init__.py"), "w").write("VALUE = 3\n")
+def make(root, case):
+    alpha_meta = metadata("alpha", "1.0", ["beta>=1.5"])
+    beta_meta = metadata("beta", "2.0")
+    manifest_alpha = metadata("alpha", "1.0", ["beta>=1.6"]) if case == "metadata" else alpha_meta
+    rows = [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", manifest_alpha),
+            ("runtime", "beta", "2.0", "beta-2.0-py3-none-any.whl", b"b", beta_meta),
+            ("installer", "pip", "25.2", "pip-25.2-py3-none-any.whl", b"p", metadata("pip", "25.2"))]
+    task_root(root, rows, requires=[("alpha", "beta>=1.5")])
+    site = os.path.join(root, "site")
+    core = (b"import os\n"
+            b"limits = os.environ.get('AB_FAKE_LIMITS')\n"
+            b"if limits:\n"
+            b"    open(limits, 'w').write(open('/proc/self/limits').read())\n"
+            b"class vtkVersion:\n"
+            b"    @staticmethod\n"
+            b"    def GetVTKVersion():\n"
+            b"        return os.environ.get('AB_FAKE_VTK_VERSION', '9.5.2')\n")
+    alpha_files = {"alpha/__init__.py": b"VALUE = 1\n", "../../bin/alpha-tool": b"#!/bin/sh\n"}
+    if case != "no_module":
+        alpha_files.update({"vtkmodules/__init__.py": b"", "vtkmodules/vtkCommonCore.py": core,
+                            "vtkmodules/vtkIOXML.py": b"class vtkXMLUnstructuredGridReader:\n    pass\n"})
+    dists = [("alpha", "1.0", alpha_meta, alpha_files), ("beta", "2.0", beta_meta, {"beta/__init__.py": b"VALUE = 2\n"})]
+    if case == "no_dist":
+        dists = dists[:1]
+    for name, version, meta, files in dists:
+        info = "%s-%s.dist-info/" % (name, version)
+        files = dict(files, **{info + "METADATA": meta, info + "INSTALLER": b"pip\n"})
+        record = io.StringIO()
+        writer = csv.writer(record, lineterminator="\n")
+        for rel, data in files.items():
+            path = os.path.join(site, rel[len("../../"):] if rel.startswith("../../") else rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            writer.writerow([rel, record_hash(data), len(data)])
+        writer.writerow([info + "RECORD", "", ""])
+        with open(os.path.join(site, info + "RECORD"), "w") as f:
+            f.write(record.getvalue())
+    if case == "link":
+        os.symlink("/etc/hostname", os.path.join(site, "alpha", "link.py"))
+    elif case == "unlisted":
+        open(os.path.join(site, "alpha", "extra.py"), "w").write("x = 1\n")
+    elif case == "changed":
+        open(os.path.join(site, "alpha", "__init__.py"), "w").write("VALUE = 3\n")
+
+for case in sys.argv[2:]:
+    make(os.path.join(sys.argv[1], "verify_" + case), case)
 PY
 }
 
@@ -9945,8 +9955,8 @@ PY
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
 from vp_fakes import task_root, wheel, metadata
-root, kind = sys.argv[1], sys.argv[2]
-main = (b"import json, os, resource, sys\n"
+def make(root, kind):
+  main = (b"import json, os, resource, sys\n"
         b"target = [a for a in sys.argv if a.startswith('--target=')][0][len('--target='):]\n"
         b"limits = {n: resource.getrlimit(getattr(resource, n))[0] for n in ('RLIMIT_AS', 'RLIMIT_CPU', 'RLIMIT_CORE', 'RLIMIT_FSIZE')}\n"
         b"json.dump({'argv': sys.argv[1:], 'config': os.environ.get('PIP_CONFIG_FILE'), 'tmpdir': os.environ.get('TMPDIR'),\n"
@@ -9955,14 +9965,17 @@ main = (b"import json, os, resource, sys\n"
         b"if os.environ.get('AB_FAKE_PIP_FLOOD'):\n"
         b"    sys.stdout.write('p' * 100000)\n"
         b"sys.exit(0)\n")
-file, data, meta = wheel("pip", "25.2", files={"pip/__init__.py": b"", "pip/__main__.py": main})
-pip_row = ("installer", "pip", "25.2", file, b"wrong" if kind == "hash" else data, meta)
-task_root(root, [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", metadata("alpha", "1.0")), pip_row])
-open(os.path.join(root, "installer", file), "wb").write(data)
+  file, data, meta = wheel("pip", "25.2", files={"pip/__init__.py": b"", "pip/__main__.py": main})
+  pip_row = ("installer", "pip", "25.2", file, b"wrong" if kind == "hash" else data, meta)
+  task_root(root, [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", metadata("alpha", "1.0")), pip_row])
+  open(os.path.join(root, "installer", file), "wb").write(data)
+for kind in sys.argv[2:]:
+  make(os.path.join(sys.argv[1], "install_" + kind), kind)
 PY
+    /usr/bin/python3.12 -I "${workspace}/fake_pip.py" "$workspace" ok flood hash vector config ||
+        _fail "S102: the installer roots are made"
     for kind in ok flood hash vector config; do
         root="${workspace}/install_${kind}"
-        /usr/bin/python3.12 -I "${workspace}/fake_pip.py" "$root" "$kind" || _fail "S102: the ${kind} installer root is made"
         pip="${root}/installer/pip-25.2-py3-none-any.whl"
         args=(--isolated --disable-pip-version-check install --no-index "--find-links=${root}/wheels" --require-hashes
               --only-binary=:all: --no-cache-dir --no-compile "--target=${root}/site" "--requirement=${root}/requirements.lock")
@@ -10016,9 +10029,10 @@ PY
     # The distribution and import check, with the exact vector on a controlled
     # site. A pure-Python vtkmodules is not the native consumer.
     ab_vp_fake_site "${workspace}/fake_site.py"
+    /usr/bin/python3.12 -I "${workspace}/fake_site.py" "$workspace" native version no_module link unlisted changed no_dist metadata ||
+        _fail "S102: the controlled sites are made"
     while read -r kind result reason; do
         root="${workspace}/verify_${kind}"
-        /usr/bin/python3.12 -I "${workspace}/fake_site.py" "$root" "$kind" || _fail "S102: the ${kind} site is made"
         env AB_FAKE_LIMITS="${workspace}/limits_${kind}" AB_FAKE_VTK_VERSION="$([[ "$kind" == version ]] && echo 9.4.0 || echo 9.5.2)" \
             /usr/bin/python3.12 -I - "${root}/site" < "${workspace}/verify.py" \
             > "${root}/records/verify.out" 2> "${root}/records/verify.err" && status=0 || status=$?
