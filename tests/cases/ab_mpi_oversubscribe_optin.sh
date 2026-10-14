@@ -203,6 +203,16 @@
 # boundary, and the published result. A fake site never proves native decoding,
 # and a controlled PASS is capability evidence only, never F4 or M3 acceptance.
 #
+# Checks S108 and S109 cover the review corrections R1 and R2 of PR #103 (Issue
+# #80, correction 6166142012). A fake site writes one complete reader record to
+# file descriptor 3 and then ends the native command; the record drives the
+# outcome and record guards only and is never a native read. S108: after a
+# complete PASS record, an unexpected exit status or a signal gives no PASS,
+# and a FAIL record stays FAIL. S109: a result.env that cannot be written, an
+# inventory.tsv that cannot be written, and a missing final SHA-256 give no
+# retained, side, or published PASS; the publication of the capture step gives
+# no PASS without the complete inventory of the retained records.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -10866,6 +10876,203 @@ s107_readback_keeps_the_frozen_blocks_and_interface() {
     assert_contains "$(ab_env_last "$workspace" VTU_READBACK_REASON)" "SKIPPED_NO_BUDGET" "S107: the reason names the capture result"
 }
 
+# ab_vr_record_run <workspace> <time0> <latest> <end> - one readback unit run
+# with a fake root of the native kind whose vtkmodules import writes one
+# complete reader record to file descriptor 3: the file results <time0> and
+# <latest> (PASS or FAIL), and the reader result PASS when both are PASS, or
+# FAIL. The import then ends the reader with <end>: an exit status, or the name
+# of a signal that the reader sends to itself. The record drives the outcome
+# and record guards only; it never proves a native read.
+ab_vr_record_run() {
+    local root result=PASS
+    root="$(ab_vr_fake_root "$1" native)"
+    [[ "$2 $3" == "PASS PASS" ]] || result=FAIL
+    {
+        printf 'import os, signal\n'
+        printf 'record = "READER_SCHEMA=vtu-readback-reader/1\\nREADER_RESULT=%s\\nREADER_REASON=a controlled record\\n"\n' "$result"
+        printf 'record += "FILE_time0_RESULT=%s\\nFILE_time0_REASON=controlled\\n"\n' "$2"
+        printf 'record += "FILE_latest_RESULT=%s\\nFILE_latest_REASON=controlled\\n"\n' "$3"
+        printf 'os.write(3, (record + "READER_FINISH=1\\n").encode())\n'
+        if [[ "$4" =~ ^[0-9]+$ ]]; then
+            printf 'os._exit(%s)\n' "$4"
+        else
+            printf 'os.kill(os.getpid(), signal.%s)\n' "$4"
+        fi
+    } > "${root}/site/vtkmodules/__init__.py"
+    ab_vr_unit "$1" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${1}/runner_temp" > "${1}/guard.status"
+}
+
+# ab_vr_result_of <file> - the VTU_READBACK_RESULT of one result file, or - when
+# it is not a regular file.
+ab_vr_result_of() {
+    if [[ -f "$1" && ! -L "$1" ]]; then
+        ab_vp_value "$1" VTU_READBACK_RESULT
+    else
+        printf -- '-\n'
+    fi
+}
+
+# ab_vr_side <workspace> - the side result file of the readback.
+ab_vr_side() {
+    printf '%s\n' "${1}/runner_temp/vtu-readback-result.env"
+}
+
+# ab_vr_publish <workspace> - run the readback-result publication of the capture
+# step, from its "The VTU readback result." comment through the evidence
+# verdicts that go to GITHUB_ENV, as the capture step runs it after the capture
+# work. Prints the published VTU_READBACK_RESULT.
+ab_vr_publish() {
+    local workspace="$1" out
+    ab_step_run_body "Capture the evidence" | awk '
+        done { next }
+        index($0, "# The VTU readback result. ") == 1 { inside = 1 }
+        inside { print }
+        inside && $0 == "} | tee -a \"$GITHUB_ENV\"" { inside = 0; done = 1 }' > "${workspace}/publish.sh"
+    [[ "$(tail -n 1 "${workspace}/publish.sh")" == '} | tee -a "$GITHUB_ENV"' ]] ||
+        { _fail "the readback-result publication of the capture step must be extracted"; return 1; }
+    : > "${workspace}/github_env"
+    out="$(env EVIDENCE_DIR="${workspace}/runner_temp/evidence" GITHUB_ENV="${workspace}/github_env" \
+        capture_result=COMPLETE capture_reason="a controlled capture" \
+        metric_result="${workspace}/no_metric" receipt_result="${workspace}/no_receipt" \
+        "${AB_STEP_BASH[@]}" "${workspace}/publish.sh" 2>&1)" ||
+        { _fail "the readback-result publication runs" "$out"; return 1; }
+    ab_env_last "$workspace" VTU_READBACK_RESULT
+}
+
+# ab_vr_inventory_gaps <workspace> - each inventory.tsv row with a SHA-256 that
+# does not bind its record: other bytes or SHA-256, or no regular file. A row
+# with - and UNAVAILABLE binds nothing. Prints nothing when every row binds.
+ab_vr_inventory_gaps() {
+    local dir name bytes sha
+    dir="$(ab_vr_dir "$1")"
+    while IFS=$'\t' read -r name bytes sha; do
+        [[ "$name" != name && "$sha" != UNAVAILABLE ]] || continue
+        if [[ ! -f "${dir}/${name}" || -L "${dir}/${name}" ]] ||
+                [[ "$(wc -c < "${dir}/${name}" | tr -d ' ') $(sha256sum < "${dir}/${name}" | cut -d ' ' -f 1)" != "${bytes} ${sha}" ]]; then
+            printf '%s ' "$name"
+        fi
+    done < "${dir}/inventory.tsv"
+}
+
+s108_readback_pass_needs_a_clean_native_exit() {
+    local template workspace case name time0 latest end results="" outcome
+    local -A ws=()
+    template="$(new_workspace s108_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S108: the template receipt run ends with status 0"
+
+    # Each case first, so one comparison shows every outcome: label, result,
+    # time-0 result, latest result.
+    for case in exit_0:PASS:PASS:0 exit_3:PASS:PASS:3 exit_1:PASS:PASS:1 signal:PASS:PASS:SIGUSR1 \
+                fail_signal:PASS:FAIL:SIGUSR1; do
+        IFS=: read -r name time0 latest end <<< "$case"
+        ws[$name]="$(ab_vr_case "$template" "s108_${name}")"
+        ab_vr_record_run "${ws[$name]}" "$time0" "$latest" "$end"
+        workspace="${ws[$name]}"
+        results+="${name} $(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT)"
+        results+=" $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT)|"
+    done
+    assert_eq "exit_0 PASS PASS PASS|exit_3 NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|exit_1 NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|signal NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|fail_signal FAIL NOT_VERIFIED FAIL|" \
+        "$results" "S108: only a native command that ends with status 0 after a complete PASS record gives PASS, and a FAIL record stays FAIL"
+
+    # The recorded native outcome and the reason of each case.
+    for case in exit_0:0:COMPLETED exit_3:3:FAILED exit_1:1:COMPLETED signal:138:FAILED fail_signal:138:FAILED; do
+        IFS=: read -r name end outcome <<< "$case"
+        workspace="${ws[$name]}"
+        assert_eq "${end} ${outcome}" "$(ab_vr_native_rows "$workspace" | cut -f 7,8 | tr '\t' ' ')" \
+            "S108 ${name}: commands.tsv records the native status and outcome"
+        ab_vr_assert_records "$workspace" "S108 ${name}"
+        [[ "$name" != exit_0 ]] || continue
+        assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "status ${end}" \
+            "S108 ${name}: the reason names the native status"
+        assert_eq "NOT_VERIFIED" "$(awk -F '\t' '$1 == "time0" { print $18 }' "$(ab_vr_dir "$workspace")/files.tsv")" \
+            "S108 ${name}: files.tsv keeps no time-0 PASS of the failed native command"
+    done
+    assert_contains "$(ab_vr_value "${ws[fail_signal]}" VTU_READBACK_REASON)" "a controlled record" \
+        "S108: the FAIL keeps the reason of its reader record"
+}
+
+s109_readback_pass_needs_the_final_records() {
+    local template complete workspace name results="" real notes
+    local -A ws=()
+    template="$(new_workspace s109_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S109: the template receipt run ends with status 0"
+
+    # complete: a status-0 PASS record and every final record.
+    complete="$(ab_vr_case "$template" s109_complete)"
+    ab_vr_record_run "$complete" PASS PASS 0
+    ws[complete]="$complete"
+    # result_write: result.env cannot be written.
+    ws[result_write]="$(ab_vr_case "$template" s109_result_write)"
+    mkdir -p -- "$(ab_vr_dir "${ws[result_write]}")/result.env"
+    ab_vr_record_run "${ws[result_write]}" PASS PASS 0
+    # inventory_write: inventory.tsv cannot be written.
+    ws[inventory_write]="$(ab_vr_case "$template" s109_inventory_write)"
+    mkdir -p -- "$(ab_vr_dir "${ws[inventory_write]}")/inventory.tsv"
+    ab_vr_record_run "${ws[inventory_write]}" PASS PASS 0
+    # final_hash: the fake sha256sum gives the inventory no SHA-256 of result.env.
+    ws[final_hash]="$(ab_vr_case "$template" s109_final_hash)"
+    real="$(command -v sha256sum)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    if [[ "$argument" == result.env ]]; then\n'
+        printf '        : > %q\n' "${ws[final_hash]}/hash_dropped"
+        printf '        %q "$@" | grep -v -- %q\n' "$real" '  result[.]env$'
+        printf '        exit 0\n'
+        printf '    fi\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$real"
+    } > "${ws[final_hash]}/fakebin/sha256sum"
+    chmod +x "${ws[final_hash]}/fakebin/sha256sum"
+    ab_vr_record_run "${ws[final_hash]}" PASS PASS 0
+    # stopped: the capture work stopped after a complete PASS result.env and
+    # before inventory.tsv, so the side result keeps its first text.
+    ws[stopped]="$(ab_vr_case "$complete" s109_stopped)"
+    rm -f -- "$(ab_vr_dir "${ws[stopped]}")/inventory.tsv"
+    printf 'VTU_READBACK_RESULT=INCOMPLETE\nVTU_READBACK_REASON=the readback work did not reach its end\nWORK_START=1\n' \
+        > "$(ab_vr_side "${ws[stopped]}")"
+    # side_only: no result.env, and the side result keeps the PASS text.
+    ws[side_only]="$(ab_vr_case "$complete" s109_side_only)"
+    rm -f -- "$(ab_vr_dir "${ws[side_only]}")/result.env"
+
+    # Each case first, so one comparison shows every outcome: label, retained
+    # result.env and side result after the readback, published result, and
+    # retained result.env after the publication.
+    for name in complete result_write inventory_write final_hash stopped side_only; do
+        results+="${name} $(ab_vr_result_of "$(ab_vr_dir "${ws[$name]}")/result.env") $(ab_vr_result_of "$(ab_vr_side "${ws[$name]}")")"
+        results+=" $(ab_vr_publish "${ws[$name]}") $(ab_vr_result_of "$(ab_vr_dir "${ws[$name]}")/result.env")|"
+    done
+    assert_eq "complete PASS PASS PASS PASS|result_write - NOT_VERIFIED NOT_VERIFIED -|inventory_write NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|final_hash NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|stopped PASS INCOMPLETE INCOMPLETE INCOMPLETE|side_only - PASS NOT_VERIFIED NOT_VERIFIED|" \
+        "$results" "S109: a final record failure gives no retained, side, or published PASS"
+
+    # The complete case keeps every record, and the publication keeps it.
+    ab_vr_assert_records "$complete" "S109 complete"
+    # Each final record failure is one exact capture note, and the inventory
+    # binds the retained records.
+    notes="$(cat "${ws[result_write]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: result.env cannot be written completely" "$notes" "S109: a result.env that cannot be written is one capture note"
+    assert_eq $'result.env\t-\tUNAVAILABLE' "$(grep '^result\.env' "$(ab_vr_dir "${ws[result_write]}")/inventory.tsv")" \
+        "S109: the inventory binds no result.env that was not written"
+    notes="$(cat "${ws[inventory_write]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: inventory.tsv cannot be written completely" "$notes" "S109: an inventory.tsv that cannot be written is one capture note"
+    assert_contains "$(ab_vr_value "${ws[inventory_write]}" VTU_READBACK_REASON)" "records are not complete" \
+        "S109: the retained result names the incomplete records"
+    assert_file_exists "${ws[final_hash]}/hash_dropped" "S109: the inventory hash of result.env was dropped"
+    notes="$(cat "${ws[final_hash]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: inventory.tsv has no SHA-256 of result.env" "$notes" "S109: a missing final SHA-256 is one capture note"
+    for name in result_write final_hash side_only; do
+        assert_eq "" "$(ab_vr_inventory_gaps "${ws[$name]}")" "S109 ${name}: inventory.tsv binds the retained records"
+    done
+    assert_eq "" "$(grep -v '^name' "$(ab_vr_dir "${ws[side_only]}")/inventory.tsv" | grep UNAVAILABLE)" \
+        "S109: after the publication, the inventory binds the retained result.env"
+    assert_contains "$(ab_vr_value "${ws[side_only]}" VTU_READBACK_REASON)" "inventory" \
+        "S109: the published result names the missing inventory binding"
+    assert_eq "MISSING" "$(ab_vr_value "${ws[stopped]}" VTU_READBACK_TIME0_RESULT)" \
+        "S109: a stopped readback keeps no file PASS in the retained result"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -10991,6 +11198,8 @@ AB_OBSERVATIONS=(
     s105_readback_capture_binds_the_two_files
     s106_readback_guards_fail_closed
     s107_readback_keeps_the_frozen_blocks_and_interface
+    s108_readback_pass_needs_a_clean_native_exit
+    s109_readback_pass_needs_the_final_records
 )
 
 # One observation runs in this process when the caller names it. The scenario
