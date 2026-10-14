@@ -184,6 +184,25 @@
 # root, S103 fails; no test installs a package. A controlled provision is
 # capability evidence only.
 #
+# Checks S104 to S107 cover the focused readback of the two Case 7 flow VTU
+# files (Issue #80, approved proposal 6136150842, Sections 2 to 6, and the
+# same admission). S104 runs the extracted reader functions with the real
+# pinned consumer of the contract-tests provision on controlled VTU files:
+# inline ASCII and base64, appended raw and base64, zlib, a polyhedron, and one
+# file for each failure: a truncated appended payload, a corrupt compressed
+# block, missing or CellData-only U, wrong components, a short array, missing
+# Points or cell offsets, bad XML, polyhedron cells without faces, a missing
+# wallDistance, two pieces, another data set type, and a reader warning. S105
+# runs the extracted readback after the receipt of the S94 fixture with the
+# real consumer: two-file PASS, one-file FAIL, a source change during or before
+# the read, a failed product run, no provision, a missing file, and a mixed
+# time. S106 runs the same readback with controlled fake roots and sites for the
+# guards only: timeout, output, memory, version, native, module, receipt,
+# root, time, source-size, link, combined-evidence, and stop limits. S107 checks
+# the frozen blocks, the call order, the limits, the fixed vector, the reader
+# boundary, and the published result. A fake site never proves native decoding,
+# and a controlled PASS is capability evidence only, never F4 or M3 acceptance.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -10156,6 +10175,696 @@ EOF
     assert_ne "" "$(ls -A "${root}/site")" "S103: the site directory stays for the consumer"
 }
 
+
+# ---- S104 to S107: the focused VTU readback (Issue #80) --------------------
+
+# ab_vr_block - the readback block of the capture work, from the begin marker
+# line through the end marker line and its line end. The awk program reads to
+# the end, so pipefail sees no SIGPIPE.
+ab_vr_block() {
+    ab_step_run_body "Capture the evidence" | awk '
+        done { next }
+        $0 == "# ---- VTU readback: begin ----" { inside = 1 }
+        inside { print }
+        inside && $0 == "# ---- VTU readback: end ----" { inside = 0; done = 1 }'
+}
+
+# ab_vr_constant <name> - the value of the one VR_<name>= line of the block.
+ab_vr_constant() {
+    ab_vr_block | awk -v key="VR_${1}=" 'index($0, key) == 1 { n++; value = substr($0, length(key) + 1) }
+                                        END { if (n == 1) print value }'
+}
+
+# ab_vr_reader <file> - write the fixed reader program VR_READER_PY.
+ab_vr_reader() {
+    ab_vr_block > "${1}.block"
+    ab_vp_heredoc "${1}.block" VR_READER_PY > "$1"
+    [[ -s "$1" ]] || _fail "the capture work must hold the reader program VR_READER_PY"
+}
+
+# ab_vr_need_root <label> - the provisioned task root of the contract-tests job.
+ab_vr_need_root() {
+    [[ -n "${AB_VTU_DEP_ROOT:-}" ]] ||
+        _fail "${1}: the native readback tests need the task root of the contract-tests provision step in M3_VTU_DEP_ROOT, and none is set. A local run needs a separately authorized pre-provisioned environment with the same manifest; no test installs a package."
+}
+
+# ab_vr_vtus <directory> - write the controlled VTU files and cases.tsv (label,
+# role, file). One hexahedron of 8 points (a VTK_POLYHEDRON cube in poly) with
+# PointData U (3 components), p, and, for time 0, wallDistance, and CellData
+# cellId. The writer uses only the Python standard library and the VTK 9.5.2
+# XML layout: inline ASCII, inline base64 binary, appended raw and base64 with
+# a UInt64 header, zlib compression, and the legacy faces and faceoffsets
+# arrays. The bad files each change one thing.
+ab_vr_vtus() {
+    mkdir -p "$1"
+    cat > "${1}/make.py" <<'PY'
+import base64, os, struct, sys, zlib
+
+out = sys.argv[1]
+CODE = {"Float32": "f", "Int32": "i", "Int64": "q", "UInt8": "B"}
+POINTS = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+FACES = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+
+def arrays(time_zero=True, poly=False, drop=(), cell_u=False, u_components=3, p_values=8):
+    stream = [len(FACES)] + [v for f in FACES for v in [len(f)] + f]
+    a = [("Points", "Points", "Float32", 3, [float(c) for p in POINTS for c in p]),
+         ("Cells", "connectivity", "Int64", 1, list(range(8))), ("Cells", "offsets", "Int64", 1, [8]),
+         ("Cells", "types", "UInt8", 1, [42 if poly else 12])]
+    if poly:
+        a += [("Cells", "faces", "Int64", 1, stream), ("Cells", "faceoffsets", "Int64", 1, [len(stream)])]
+    a += [("CellData", "cellId", "Int32", 1, [7])]
+    if cell_u:
+        a += [("CellData", "U", "Float32", 3, [1.0, 2.0, 3.0])]
+    else:
+        u = [float(i % 5) for i in range(8 * u_components)]
+        a += [("PointData", "U", "Float32", u_components, u)]
+    a += [("PointData", "p", "Float32", 1, [float(i) for i in range(p_values)])]
+    if time_zero:
+        a += [("PointData", "wallDistance", "Float32", 1, [0.5] * 8)]
+    return [x for x in a if x[1] not in drop]
+
+def vtu(arrs, fmt="appended", encoding="raw", compress=False, pieces=1, kind="UnstructuredGrid", marker=True):
+    hs, hcode = 8, "Q"
+    chunks, offset = [], 0
+    def block(raw):
+        if compress:
+            packed = zlib.compress(raw)
+            return struct.pack("<4" + hcode, 1, 32768, len(raw), len(packed)), packed
+        return struct.pack("<" + hcode, len(raw)), raw
+    lines = ['<?xml version="1.0"?>',
+             '<VTKFile type="%s" version="1.0" byte_order="LittleEndian" header_type="UInt64"%s>'
+             % (kind, ' compressor="vtkZLibDataCompressor"' if compress else ""), "<%s>" % kind]
+    for _ in range(pieces):
+        lines.append('<Piece NumberOfPoints="8" NumberOfCells="1">')
+        for group in ("Points", "Cells", "CellData", "PointData"):
+            members = [x for x in arrs if x[0] == group]
+            if not members:
+                continue
+            lines.append("<%s>" % group)
+            for _, name, typ, comps, values in members:
+                head = 'type="%s" Name="%s" NumberOfComponents="%d"' % (typ, name, comps)
+                raw = struct.pack("<%d%s" % (len(values), CODE[typ]), *values)
+                if fmt == "ascii":
+                    text = " ".join(repr(v) if isinstance(v, float) else str(v) for v in values)
+                    lines.append('<DataArray %s format="ascii">%s</DataArray>' % (head, text))
+                elif fmt == "binary":
+                    header, data = block(raw)
+                    lines.append('<DataArray %s format="binary">%s</DataArray>' % (head, base64.b64encode(header + data).decode()))
+                else:
+                    header, data = block(raw)
+                    if encoding == "raw":
+                        chunk = header + data
+                    else:
+                        chunk = (base64.b64encode(header) + base64.b64encode(data)) if compress else base64.b64encode(header + data)
+                    lines.append('<DataArray %s format="appended" offset="%d"/>' % (head, offset))
+                    chunks.append(chunk)
+                    offset += len(chunk)
+            lines.append("</%s>" % group)
+        lines.append("</Piece>")
+    lines.append("</%s>" % kind)
+    text = ("\n".join(lines) + "\n").encode()
+    payload = b"".join(chunks)
+    if fmt == "appended":
+        text += ('<AppendedData encoding="%s">\n' % encoding).encode() + (b"_" if marker else b"") + payload
+        text += b"\n</AppendedData>\n"
+    return text + b"</VTKFile>\n"
+
+def write(name, data):
+    with open(os.path.join(out, name), "wb") as f:
+        f.write(data)
+
+cases = []
+def case(label, role, data):
+    write(label + ".vtu", data)
+    cases.append("%s\t%s\t%s.vtu" % (label, role, label))
+
+case("valid_ascii", "time0", vtu(arrays(), fmt="ascii"))
+case("valid_binary", "time0", vtu(arrays(), fmt="binary"))
+case("valid_raw", "time0", vtu(arrays()))
+case("valid_base64", "time0", vtu(arrays(), encoding="base64"))
+case("valid_zlib", "time0", vtu(arrays(), compress=True))
+case("valid_poly", "time0", vtu(arrays(poly=True)))
+case("latest_raw", "latest", vtu(arrays(time_zero=False)))
+whole = vtu(arrays())
+end = whole.index(b"\n</AppendedData>")
+case("truncated_raw", "time0", whole[:end - 10])
+zipped = vtu(arrays(), compress=True)
+start = zipped.index(b"_", zipped.index(b"<AppendedData")) + 1 + 8 * 4 + 2
+case("corrupt_zlib", "time0", zipped[:start] + bytes([zipped[start] ^ 0xFF]) + zipped[start + 1:])
+case("missing_u", "time0", vtu(arrays(drop=("U",)), fmt="ascii"))
+case("celldata_u", "time0", vtu(arrays(cell_u=True), fmt="ascii"))
+case("wrong_components", "time0", vtu(arrays(u_components=1), fmt="ascii"))
+case("short_p", "time0", vtu(arrays(p_values=7), fmt="ascii"))
+case("no_points", "time0", vtu(arrays(drop=("Points",)), fmt="ascii"))
+case("incomplete_cells", "time0", vtu(arrays(drop=("offsets",)), fmt="ascii"))
+text = vtu(arrays(), fmt="ascii")
+case("bad_xml", "time0", text.replace(b"</Piece>", b"</Piec>"))
+case("poly_no_faces", "time0", vtu([x for x in arrays(poly=True) if x[1] not in ("faces", "faceoffsets")], fmt="ascii"))
+case("no_wall_distance", "time0", vtu(arrays(time_zero=False), fmt="ascii"))
+case("multi_piece", "time0", vtu(arrays(), fmt="ascii", pieces=2))
+case("not_unstructured", "time0", vtu(arrays(), fmt="ascii", kind="PolyData"))
+case("no_marker", "time0", vtu(arrays(), marker=False))
+with open(os.path.join(out, "cases.tsv"), "w") as f:
+    f.write("\n".join(cases) + "\n")
+PY
+    /usr/bin/python3.12 -I "${1}/make.py" "$1" || _fail "the controlled VTU files must be written"
+}
+
+# ab_vr_env <root> - print the environment of a reader run with <root>.
+ab_vr_env() {
+    printf '%s\n' "M3_VTU_DEP_ROOT=$1" "RUNNER_TEMP=${1%/*}" \
+        "VR_PROVISION_BLOCK_SHA256=$(ab_vr_constant PROVISION_BLOCK_SHA256)" \
+        "VR_MANIFEST_SHA256=$(ab_vr_constant MANIFEST_SHA256)"
+}
+
+s104_readback_native_reads_controlled_vtus() {
+    local workspace out line label result reason keyword expected
+    ab_vr_need_root S104
+    workspace="$(new_workspace s104_native)"
+    ab_vr_reader "${workspace}/reader.py"
+    ab_vr_vtus "${workspace}/vtus"
+    cat > "${workspace}/driver.py" <<'PY'
+import os, sys
+ns = {"__name__": "vr_unit"}
+exec(compile(open(sys.argv[1]).read(), "vr-reader", "exec"), ns)
+identity = ns["consumer"]()
+print("identity\t" + "\t".join("%s=%s" % pair for pair in sorted(identity.items())))
+vtus = sys.argv[2]
+for line in open(os.path.join(vtus, "cases.tsv")):
+    label, role, file = line.rstrip("\n").split("\t")
+    r = ns["read_one"](os.path.join(vtus, file), role)
+    print("\t".join([label, r["result"], r["reason"], str(r["points"]), str(r["cells"]), str(len(r["messages"])), r["extent"]]))
+    print("arrays\t%s\t%s" % (label, ";".join("%(association)s:%(name)s:%(components)s:%(tuples)s" % a for a in r["arrays"])))
+# A diagnostic only: the plain native consumer on the truncated payload.
+from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
+from vtkmodules.vtkCommonCore import vtkCommand
+reader, events = vtkXMLUnstructuredGridReader(), []
+reader.AddObserver(vtkCommand.ErrorEvent, lambda *a: events.append(1))
+reader.SetFileName(os.path.join(vtus, "truncated_raw.vtu"))
+reader.Update()
+print("diagnostic\ttruncated_raw\tnative_error_events=%d\terror_code=%d\tpoints=%d" % (
+    len(events), reader.GetErrorCode(), reader.GetOutput().GetNumberOfPoints()))
+PY
+    out="$(env $(ab_vr_env "$AB_VTU_DEP_ROOT") /usr/bin/python3.12 -I "${workspace}/driver.py" \
+        "${workspace}/reader.py" "${workspace}/vtus" 2> "${workspace}/driver.err")" ||
+        _fail "S104: the reader functions run with the provisioned consumer" "$out" "$(tail -n 20 "${workspace}/driver.err")"
+    printf '%s\n' "$out" > "${workspace}/results.tsv"
+    printf '%s\n' "$out" | grep -E '^(identity|diagnostic)' || true
+    assert_contains "$(grep '^identity' <<< "$out")" "VTK_VERSION=9.5.2" "S104: the consumer is VTK 9.5.2"
+    assert_contains "$(grep '^identity' <<< "$out")" "CONSUMER=vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader" \
+        "S104: the consumer is the native XML unstructured-grid reader"
+    assert_contains "$(grep '^identity' <<< "$out")" "VTK_MODULE=${AB_VTU_DEP_ROOT}/site/vtkmodules/" \
+        "S104: the consumer comes from the provisioned site"
+
+    while read -r label expected keyword; do
+        line="$(awk -F '\t' -v want="$label" '$1 == want' <<< "$out")"
+        [[ -n "$line" ]] || _fail "S104: the case ${label} ran" "$out"
+        IFS=$'\t' read -r _ result reason _ <<< "$line"
+        assert_eq "$expected" "$result" "S104: ${label} gives ${expected} (${reason})"
+        [[ "$keyword" == - || "${reason,,}" == *"${keyword//_/ }"* ]] ||
+            _fail "S104: the ${label} reason names '${keyword//_/ }'" "$line"
+    done <<'EOF'
+valid_ascii PASS -
+valid_binary PASS -
+valid_raw PASS -
+valid_base64 PASS -
+valid_zlib PASS -
+valid_poly PASS -
+latest_raw PASS -
+truncated_raw FAIL appended
+corrupt_zlib FAIL error
+missing_u FAIL required_pointdata_u
+celldata_u FAIL celldata
+wrong_components FAIL components
+short_p FAIL error
+no_points FAIL error
+incomplete_cells FAIL error
+bad_xml FAIL xml
+poly_no_faces FAIL polyhedron
+no_wall_distance FAIL walldistance
+multi_piece NOT_VERIFIED piece
+not_unstructured NOT_VERIFIED unstructuredgrid
+no_marker NOT_VERIFIED warning
+EOF
+    # Complete loaded-array evidence of a full read.
+    assert_eq "POINTS:Points:3:8;CELLS:connectivity:1:8;CELLS:offsets:1:1;CELLS:types:1:1;CELL_DATA:cellId:1:1;POINT_DATA:U:3:8;POINT_DATA:p:1:8;POINT_DATA:wallDistance:1:8" \
+        "$(awk -F '\t' '$1 == "arrays" && $2 == "valid_raw" { print $3 }' <<< "$out")" \
+        "S104: the full read records the geometry and each array with its components and tuples"
+    assert_contains "$(awk -F '\t' '$1 == "arrays" && $2 == "valid_poly" { print $3 }' <<< "$out")" \
+        "POLYHEDRON:faces:1:" "S104: the polyhedron read records the loaded face data"
+    assert_eq "8 1 CHECKED" "$(awk -F '\t' '$1 == "valid_raw" { print $4, $5, $7 }' <<< "$out")" \
+        "S104: the appended raw read has 8 points, 1 cell, and a checked appended extent"
+    assert_eq "NATIVE" "$(awk -F '\t' '$1 == "valid_zlib" { print $7 }' <<< "$out")" \
+        "S104: a compressed payload is checked by the native block sizes"
+}
+
+# ab_vr_library <workspace> - the capture work helpers before the VTU reader,
+# the functional-receipt block, and the readback block, from the extracted
+# capture step.
+ab_vr_library() {
+    local step="${1}/capture_step.sh"
+    ab_fr_library "$1"
+    awk '/^# ---- VTU readback: begin ----$/ { inside = 1 } inside && !done { print }
+         /^# ---- VTU readback: end ----$/ { done = 1 }' "$step"
+}
+
+# ab_vr_template <workspace> <time0-vtu> <latest-vtu> - the controlled receipt
+# fixture of S94 with the two given flow VTU files of time 2, their scanner
+# evidence, and one receipt run. Each readback case copies this template.
+ab_vr_template() {
+    local workspace="$1" vtk run
+    ab_fr_fixture "$workspace"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+    cp -- "$2" "${vtk}/flow_0.vtu"
+    cp -- "$3" "${vtk}/flow_latest_2.vtu"
+    ab_fr_scanner_evidence "$workspace"
+    run="$(ab_fr_unit "$workspace")"
+    assert_contains "$run" "status=0" "the template receipt run ends with status 0"
+    assert_eq "PASS PASS" "$(ab_fr_check "$workspace" F2) $(ab_fr_check "$workspace" F3)" \
+        "the template receipt binds the latest time 2"
+}
+
+# ab_vr_unit <workspace> [NAME=value ...] - run the extracted readback alone,
+# as the capture work calls it after the receipt, with a far capture work end,
+# the product result SUCCEEDED, and the producer of the receipt template. The
+# arguments override the environment. Prints status=.
+ab_vr_unit() {
+    local workspace="$1" library status
+    shift
+    library="$(ab_vr_library "$workspace")"
+    [[ "$library" == *"# ---- VTU readback: end ----"* ]] ||
+        { _fail "the readback block of the capture work must be extracted"; return 1; }
+    env PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_WORKSPACE="${workspace}/checkout" CAPTURE_WORK_END="$(( $(date +%s) + 1000 ))" \
+        GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 GITHUB_RUN_ATTEMPT=1 \
+        GITHUB_REPOSITORY=derek-thl/ucfd_run_batch GITHUB_WORKFLOW=openfoam-evidence GITHUB_JOB=evidence \
+        PREPARE_RESULT=SUCCEEDED OVERALL_RESULT=SUCCEEDED M3_VTU_PROVISION_RESULT=PROVISION_AVAILABLE \
+        "$@" "${AB_STEP_BASH[@]}" -c "${library}"'
+vr_capture' > "${workspace}/vr_unit.out" 2>&1 && status=0 || status=$?
+    printf 'status=%s\n' "$status"
+}
+
+# ab_vr_dir <workspace> - the readback subtree.
+ab_vr_dir() {
+    printf '%s\n' "${1}/runner_temp/evidence/vtu-readback"
+}
+
+# ab_vr_value <workspace> <key> - the one value of vtu-readback/result.env.
+ab_vr_value() {
+    ab_vp_value "$(ab_vr_dir "$1")/result.env" "$2"
+}
+
+# ab_vr_case <template> <label> - a new workspace with a copy of the template.
+ab_vr_case() {
+    local workspace
+    workspace="$(new_workspace "s10x_${2}")"
+    cp -a -- "${1}/." "${workspace}/"
+    printf '%s\n' "$workspace"
+}
+
+# ab_vr_native_rows <workspace> - the readback rows of commands.tsv.
+ab_vr_native_rows() {
+    awk -F '\t' '$1 == "readback"' "$(ab_vr_dir "$1")/commands.tsv" 2>/dev/null || true
+}
+
+# ab_vr_assert_records <workspace> <label> - the seven bounded text records,
+# an inventory of the other six with their bytes and SHA-256, and no capture
+# note.
+ab_vr_assert_records() {
+    local dir name bytes total=0 line
+    dir="$(ab_vr_dir "$1")"
+    assert_eq "arrays.tsv commands.tsv errors.txt files.tsv identity.env inventory.tsv result.env" \
+        "$(ls "$dir" | paste -sd ' ' -)" "${2}: the readback keeps exactly the seven text records"
+    for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env inventory.tsv result.env; do
+        bytes="$(wc -c < "${dir}/${name}")"
+        (( bytes <= 65536 )) || _fail "${2}: ${name} holds at most 65536 bytes" "bytes: ${bytes}"
+        total=$(( total + bytes ))
+    done
+    (( total <= 262144 )) || _fail "${2}: the readback subtree holds at most 262144 bytes" "bytes: ${total}"
+    for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env; do
+        line="$(awk -F '\t' -v n="$name" '$1 == n { print $2 "\t" $3 }' "${dir}/inventory.tsv")"
+        assert_eq "$(wc -c < "${dir}/${name}" | tr -d ' ')"$'\t'"$(sha256sum < "${dir}/${name}" | cut -d ' ' -f 1)" "$line" \
+            "${2}: inventory.tsv binds ${name}"
+    done
+    [[ "$(tail -n 1 "${dir}/result.env")" =~ ^WORK_FINISH=[0-9]+$ ]] || _fail "${2}: result.env ends with WORK_FINISH"
+    assert_eq "" "$(cat "${1}/runner_temp/evidence/capture-work-notes.txt")" "${2}: a readback result gives no capture note"
+}
+
+s105_readback_capture_binds_the_two_files() {
+    local base vtus template workspace root before after native line
+    ab_vr_need_root S105
+    root="$AB_VTU_DEP_ROOT"
+    base="$(new_workspace s105_base)"
+    vtus="${base}/vtus"
+    ab_vr_vtus "$vtus"
+    template="$(new_workspace s105_template)"
+    ab_vr_template "$template" "${vtus}/valid_raw.vtu" "${vtus}/latest_raw.vtu"
+
+    # Two full native reads of the same producer, time, and sources: PASS.
+    workspace="$(ab_vr_case "$template" pass)"
+    before="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    assert_contains "$(ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}")" "status=0" \
+        "S105: the readback ends with status 0"
+    after="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    assert_eq "$before" "$after" "S105: the readback writes no source file"
+    assert_eq "PASS PASS PASS 2" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_SELECTED_TIME)" \
+        "S105: both files read completely, so the readback is PASS for time 2 ($(ab_vr_value "$workspace" VTU_READBACK_REASON))"
+    ab_vr_assert_records "$workspace" "S105 pass"
+    line="$(ab_vr_native_rows "$workspace")"
+    assert_eq "1" "$(grep -c . <<< "$line")" "S105: one native command ran"
+    assert_contains "$line" "/usr/bin/python3.12 -I - ${workspace}/checkout/src/batch_9/case_7/vtk/flow_0.vtu ${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu $(ab_vr_dir "$workspace")" \
+        "S105: commands.tsv records the exact native vector with the two sources and the evidence directory"
+    assert_contains "$line" "timeout --signal=TERM --kill-after=5s " "S105: the native command has the 5-second kill grace"
+    ab_vr_reader "${base}/reader.py"
+    assert_contains "$line" $'\t'"$( { cat "${base}/reader.py"; printf '\n'; } | sha256sum | cut -d ' ' -f 1)"$'\t' \
+        "S105: commands.tsv records the SHA-256 of the exact standard input: the reader code and the here-string line end"
+    assert_eq "fetch install verify" "$(awk -F '\t' '$1 == "provision" { printf "%s%s", sep, $3; sep = " " }' "$(ab_vr_dir "$workspace")/commands.tsv")" \
+        "S105: commands.tsv keeps the three provision operations"
+    for line in "VTK_VERSION=9.5.2" "CONSUMER=vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader" "PROVISION_RESULT=PROVISION_AVAILABLE" \
+                "PROVISION_ROOT=${root}" "PROVISION_BLOCK_SHA256=$(ab_vr_constant PROVISION_BLOCK_SHA256)" "SELECTED_TIME=2" \
+                "EXECUTION_SHA=${AB_COLLECT_SHA}" "CAPABILITY_SHA=${AB_COLLECT_SHA}" "CASE_ID=case_7" "BATCH_ID=9" \
+                "CHECKPOINT=POST_ORCHESTRATOR_CAPTURE"; do
+        assert_eq "${line#*=}" "$(ab_vp_value "$(ab_vr_dir "$workspace")/identity.env" "${line%%=*}")" "S105: identity.env has ${line}"
+    done
+    assert_eq "time0 latest" "$(awk -F '\t' 'NR > 1 && $5 == $10 && $5 == $3 && $6 == $11 && $6 == $4 { printf "%s%s", sep, $1; sep = " " }' "$(ab_vr_dir "$workspace")/files.tsv")" \
+        "S105: each source has the scanner bytes and SHA-256 before and after the native read"
+    assert_contains "$(cat "$(ab_vr_dir "$workspace")/arrays.tsv")" $'time0\tPOINT_DATA\twallDistance\tFloat32\t1\t8\t8\tPASS' \
+        "S105: arrays.tsv records the loaded wallDistance of time 0"
+    assert_eq "" "$(ls -A "${root%/*}" | grep '^m3-vtu-readback\.' || true)" "S105: the readback removes its task directory"
+
+    # One file fails: FAIL with each file result.
+    workspace="$(ab_vr_case "$template" one_file)"
+    cp -- "${vtus}/truncated_raw.vtu" "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    ab_fr_scanner_evidence "$workspace"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL PASS FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT)" \
+        "S105: a truncated latest payload fails, and time 0 keeps its PASS ($(ab_vr_value "$workspace" VTU_READBACK_REASON))"
+    ab_vr_assert_records "$workspace" "S105 one file"
+
+    # A source that changes during the native read: FAIL. The fake sha256sum
+    # appends one byte to the latest file after its first readback hash.
+    workspace="$(ab_vr_case "$template" changed_during)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real="$(command -v -a sha256sum | grep -v %q | head -n 1)"\n' "${workspace}/fakebin"
+        printf '"$real" "$@" && status=0 || status=$?\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    if [[ "$argument" == *flow_latest_2.vtu && ! -e %q ]]; then\n' "${workspace}/changed"
+        printf '        : > %q\n' "${workspace}/changed"
+        printf '        printf "x" >> "$argument"\n'
+        printf '    fi\n'
+        printf 'done\n'
+        printf 'exit "$status"\n'
+    } > "${workspace}/fakebin/sha256sum"
+    chmod +x "${workspace}/fakebin/sha256sum"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a source change during the read fails"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "changed" "S105: the reason names the changed source"
+    assert_file_exists "${workspace}/changed" "S105: the source changed after its first readback hash"
+
+    # A source that differs from its scanner record: FAIL before the native read.
+    workspace="$(ab_vr_case "$template" changed_before)"
+    printf 'x' >> "${workspace}/checkout/src/batch_9/case_7/vtk/flow_0.vtu"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a source that differs from the scanner record fails"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "changed" "S105: the reason names the changed source"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs on a changed source"
+
+    # A failed product run: NOT_ATTEMPTED, and no command.
+    workspace="$(ab_vr_case "$template" product)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" OVERALL_RESULT=FAILED_EXIT_1 > /dev/null
+    assert_eq "NOT_ATTEMPTED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a failed product run gives NOT_ATTEMPTED"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs after a failed product run"
+    ab_vr_assert_records "$workspace" "S105 product"
+
+    # No provision: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" no_provision)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT= M3_VTU_PROVISION_RESULT= > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: no provision gives NOT_VERIFIED"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "provision" "S105: the reason names the provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without the provision"
+
+    # A missing latest witness: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" missing)"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a missing latest file gives NOT_VERIFIED"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without both witnesses"
+
+    # Mixed time: the signature names time 3, so the receipt does not bind the
+    # latest time, and no witness is selected.
+    workspace="$(ab_vr_case "$template" mixed_time)"
+    sed -i -e 's/^flow_latest=2$/flow_latest=3/' "${workspace}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
+    rm -rf -- "$(ab_fr_dir "$workspace")"
+    ab_fr_unit "$workspace" > /dev/null
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a mixed latest time gives NOT_VERIFIED"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "time" "S105: the reason names the time binding"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without a bound time"
+}
+
+# ab_vr_fake_root <workspace> <kind> [<parent>] - a controlled provision task
+# root below <parent> (default <workspace>/runner_temp) with a complete receipt
+# that names the approved block and manifest SHA-256, the approved manifest,
+# and a site with a pure-Python fake vtkmodules of <kind>: hang (the import
+# blocks), flood (the import writes 200000 bytes), memory (the import asks for
+# 5 GiB), version (VTK 9.4.0), native (VTK 9.5.2, not native), or none (no
+# vtkmodules). A fake can test the guards only; it is never the consumer.
+# Prints the root.
+ab_vr_fake_root() {
+    local root="${3:-${1}/runner_temp}/m3-vtu-deps.Fake0001" dir
+    mkdir -p "${3:-${1}/runner_temp}"
+    mkdir -m 700 -- "$root"
+    for dir in installer wheels site tmp records; do
+        mkdir -m 700 -- "${root}/${dir}"
+    done
+    ab_vp_expected_manifest > "${root}/manifest.tsv"
+    printf 'seq\tlabel\tlimit_ms\tstart_ms\tend_ms\tstatus\toutcome\tgroup\tstop\tcode_sha256\tvector\n1\tfetch\t30000\t1\t2\t0\tCOMPLETED\t9\tEMPTY\t-\tcontrolled\n' \
+        > "${root}/records/commands.tsv"
+    {
+        printf 'PROVISION_SCHEMA=m3-vtu-provision/1\nPROVISION_RESULT=PROVISION_AVAILABLE\nPROVISION_REASON=controlled\n'
+        printf 'PROVISION_ROOT=%s\nPROVISION_BLOCK_SHA256=%s\nPROVISION_MANIFEST_SHA256=%s\nWORK_FINISH=1\n' \
+            "$root" "$(ab_vr_constant PROVISION_BLOCK_SHA256)" "$(ab_vr_constant MANIFEST_SHA256)"
+    } > "${root}/records/result.env"
+    if [[ "$2" != none ]]; then
+        mkdir -p "${root}/site/vtkmodules"
+        case "$2" in
+            hang) printf 'import time\ntime.sleep(30)\n' ;;
+            flood) printf 'import sys\nsys.stdout.write("v" * 200000)\nsys.stdout.flush()\n' ;;
+            memory) printf 'blob = bytearray(5 * 1024 ** 3)\n' ;;
+            *) printf '' ;;
+        esac > "${root}/site/vtkmodules/__init__.py"
+        printf 'class vtkVersion:\n    @staticmethod\n    def GetVTKVersion():\n        return "%s"\n' \
+            "$([[ "$2" == version ]] && echo 9.4.0 || echo 9.5.2)" > "${root}/site/vtkmodules/vtkCommonCore.py"
+    fi
+    printf '%s\n' "$root"
+}
+
+# ab_vr_guard <template> <label> <kind> [NAME=value ...] - a readback unit run
+# on a copy of the receipt template with a fake root of <kind>. Prints the
+# workspace.
+ab_vr_guard() {
+    local template="$1" label="$2" kind="$3" workspace root
+    shift 3
+    workspace="$(ab_vr_case "$template" "$label")"
+    root="$(ab_vr_fake_root "$workspace" "$kind")"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${workspace}/runner_temp" "$@" > "${workspace}/guard.status"
+    printf '%s\n' "$workspace"
+}
+
+# ab_vr_expect <workspace> <label> <result> <keyword> - the readback result and
+# a keyword of its reason.
+ab_vr_expect() {
+    local reason
+    reason="$(ab_vr_value "$1" VTU_READBACK_REASON)"
+    assert_eq "$3" "$(ab_vr_value "$1" VTU_READBACK_RESULT)" "${2}: the readback is ${3} (${reason})"
+    [[ "${reason,,}" == *"${4//_/ }"* ]] || _fail "${2}: the reason names '${4//_/ }'" "$reason" "$(tail -n 5 "${1}/vr_unit.out")"
+}
+
+s106_readback_guards_fail_closed() {
+    local template workspace start elapsed group out line
+    template="$(new_workspace s106_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S106: the template receipt run ends with status 0"
+
+    # A native command that does not end in its limit: TIMEOUT, NOT_VERIFIED,
+    # and the stopped group. The capture work end leaves 2 seconds for it.
+    start="$(date +%s)"
+    workspace="$(ab_vr_guard "$template" hang hang CAPTURE_WORK_END="$(( $(date +%s) + 27 ))")"
+    elapsed=$(( $(date +%s) - start ))
+    ab_vr_expect "$workspace" "S106 hang" NOT_VERIFIED "did_not_complete"
+    (( elapsed <= 12 )) || _fail "S106: the readback ends shortly after the native limit" "elapsed: ${elapsed} s"
+    line="$(ab_vr_native_rows "$workspace")"
+    assert_contains "$line" $'\tTIMEOUT\t' "S106: commands.tsv records the TIMEOUT"
+    [[ "$(cut -f 4 <<< "$line")" =~ ^[0-9]+$ ]] && (( $(cut -f 4 <<< "$line") <= 2000 )) ||
+        _fail "S106: the native limit shrinks to the time left less the kill and receipt reserves" "$line"
+    if pgrep -f -- "$(ab_vr_dir "$workspace")" > /dev/null 2>&1; then
+        _fail "S106: no reader process of the stopped command remains"
+    fi
+    ab_vr_assert_records "$workspace" "S106 hang"
+
+    workspace="$(ab_vr_guard "$template" flood flood)"
+    ab_vr_expect "$workspace" "S106 flood" NOT_VERIFIED "output"
+    workspace="$(ab_vr_guard "$template" memory memory)"
+    ab_vr_expect "$workspace" "S106 memory" NOT_VERIFIED "memory"
+    workspace="$(ab_vr_guard "$template" version version)"
+    ab_vr_expect "$workspace" "S106 version" NOT_VERIFIED "9.4.0"
+    workspace="$(ab_vr_guard "$template" native native)"
+    ab_vr_expect "$workspace" "S106 native" NOT_VERIFIED "native"
+    workspace="$(ab_vr_guard "$template" none none)"
+    ab_vr_expect "$workspace" "S106 none" NOT_VERIFIED "vtkmodules"
+    assert_not_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "/usr/lib/python3" \
+        "S106: a system vtkmodules is never a fallback"
+
+    # Provision gaps stop the readback before any command.
+    workspace="$(ab_vr_case "$template" receipt)"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    sed -i -e "s/^PROVISION_BLOCK_SHA256=.*/PROVISION_BLOCK_SHA256=$(printf '0%.0s' {1..64})/" "${out}/records/result.env"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 receipt" NOT_VERIFIED "provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command runs with another provision block"
+    workspace="$(ab_vr_case "$template" outside)"
+    out="$(ab_vr_fake_root "$workspace" native "${workspace}/elsewhere")"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 outside" NOT_VERIFIED "provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command runs with a root outside RUNNER_TEMP"
+
+    # No time for the native command: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_guard "$template" no_time native CAPTURE_WORK_END="$(( $(date +%s) + 20 ))")"
+    ab_vr_expect "$workspace" "S106 no time" NOT_VERIFIED "time"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command starts without its time and reserves"
+    ab_vr_assert_records "$workspace" "S106 no time"
+
+    # A source above the 268435456-byte limit: NOT_VERIFIED before any hash.
+    workspace="$(ab_vr_case "$template" source_limit)"
+    truncate -s 268435457 "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_latest_2.vtu$/,/^VTU_TAG_EVIDENCE=/ s/^VTU_BYTES=.*/VTU_BYTES=268435457/' \
+        "${workspace}/runner_temp/evidence/vtu-point-data.txt"
+    {
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "${workspace}/hash_calls"
+        printf 'exec %q "$@"\n' "$(command -v sha256sum)"
+    } > "${workspace}/fakebin/sha256sum"
+    chmod +x "${workspace}/fakebin/sha256sum"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 source limit" NOT_VERIFIED "268435456"
+    assert_not_contains "$(cat "${workspace}/hash_calls" 2>/dev/null)" "flow_latest_2.vtu" "S106: the oversized source is never hashed"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command reads an oversized source"
+
+    # A linked vtk directory: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" linked)"
+    mv -- "${workspace}/checkout/src/batch_9/case_7/vtk" "${workspace}/checkout/vtk_real"
+    ln -s -- "${workspace}/checkout/vtk_real" "${workspace}/checkout/src/batch_9/case_7/vtk"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 linked" NOT_VERIFIED "link"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command reads through a link"
+
+    # The combined added-evidence limit: with the collection evidence at the
+    # 10485760-byte ceiling, no readback record fits, and the gap is a capture
+    # note.
+    workspace="$(ab_vr_case "$template" combined)"
+    truncate -s 10485760 "${workspace}/runner_temp/evidence/m3-mean-speed/big.bin"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "VTU readback:" \
+        "S106: a readback record that does not fit the combined ceiling is a capture note"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "10485760" \
+        "S106: the note names the combined ceiling"
+    assert_eq "" "$(ls -A "$(ab_vr_dir "$workspace")" 2>/dev/null)" "S106: no readback record is written past the ceiling"
+
+    # The stop check of the readback: a group that cannot be signaled stays
+    # NOT_STOPPED by its deadline.
+    workspace="$(new_workspace s106_stop)"
+    {
+        printf 'set -euo pipefail\n'
+        ab_vr_block
+        printf '%s\n' 'start=$(vr_now_ms)' 'vr_stop_group "$1" $(( start + 1500 )) && status=0 || status=$?' \
+            'printf "stop=%s status=%s elapsed=%s\n" "$VR_STOP" "$status" "$(( $(vr_now_ms) - start ))"'
+    } > "${workspace}/stop.sh"
+    group="$(ab_vp_foreign_group)"
+    out="$(bash "${workspace}/stop.sh" "$group" 2>&1)" || _fail "S106: the stop script runs" "$out"
+    assert_contains "$out" "stop=NOT_STOPPED status=1" "S106: a group that cannot be signaled is NOT_STOPPED"
+    [[ "$out" =~ elapsed=([0-9]+) ]] && (( BASH_REMATCH[1] <= 1700 )) || _fail "S106: the stop check ends by its deadline" "$out"
+}
+
+s107_readback_keeps_the_frozen_blocks_and_interface() {
+    local workspace body block constant vector pattern reader summary deadline
+    workspace="$(new_workspace s107_interface)"
+    assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
+        "S107: the VTU header reader block is unchanged"
+    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+        "S107: the M3 mean-speed block is unchanged"
+    body="$(ab_step_run_body "Capture the evidence")"
+    assert_eq $'metric_collect\nfr_capture\nvr_capture' \
+        "$(grep -xE '[[:space:]]*(metric_collect|fr_capture|vr_capture)' <<< "$body" | tr -d ' ')" \
+        "S107: the readback runs once, after the collection and the receipt"
+    block="$(ab_vr_block)"
+    [[ "$block" == *"# ---- VTU readback: end ----" ]] || _fail "S107: the capture work holds the complete readback block"
+    assert_eq "1" "$(grep -cx '# ---- VTU readback: begin ----' <<< "$body")" "S107: the readback block is in the capture work once"
+    for constant in VR_WORK_SECONDS=90 VR_NATIVE_SECONDS=60 VR_KILL_GRACE_SECONDS=5 VR_RECEIPT_RESERVE_SECONDS=10 \
+                    VR_SOURCE_LIMIT=268435456 VR_SOURCES_LIMIT=536870912 VR_AS_LIMIT=4294967296 VR_CPU_SECONDS=60 \
+                    VR_FILE_LIMIT=65536 VR_TREE_LIMIT=262144 VR_PROVISION_TEXT_LIMIT=65536 VR_COMBINED_LIMIT=10485760 \
+                    VR_PYTHON=/usr/bin/python3.12; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$block")" "S107: the readback sets ${constant}"
+    done
+    ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${workspace}/provision.block"
+    assert_eq "$(sha256sum < "${workspace}/provision.block" | cut -d ' ' -f 1)" "$(ab_vr_constant PROVISION_BLOCK_SHA256)" \
+        "S107: the readback names the SHA-256 of the provision block of both workflows"
+    assert_eq "$(ab_vp_expected_manifest | sha256sum | cut -d ' ' -f 1)" "$(ab_vr_constant MANIFEST_SHA256)" \
+        "S107: the readback names the SHA-256 of the approved manifest"
+    # The fixed native vector of proposal Section 4.
+    for vector in 'timeout --signal=TERM --kill-after=5s "${READBACK_RUN_SECONDS}s" \' '/usr/bin/python3.12 -I - \' \
+                  '"$READBACK_SOURCE_0" "$READBACK_SOURCE_LATEST" "$READBACK_EVIDENCE_DIR"'; do
+        assert_eq "1" "$(sed -e 's/^[[:space:]]*//' <<< "$block" | grep -cxF -- "$vector")" \
+            "S107: the readback holds the fixed vector line [${vector}] once"
+    done
+    # The reader: the one native consumer, no installation, network, process,
+    # writer, or value calculation.
+    ab_vr_reader "${workspace}/reader.py"
+    reader="$(cat "${workspace}/reader.py")"
+    assert_contains "$reader" "vtkXMLUnstructuredGridReader" "S107: the reader uses the native XML unstructured-grid reader"
+    for pattern in subprocess socket http urllib 'import pip' os.system Popen Writer numpy vtkmodules.all \
+                   GetRange GetTuple GetComponent; do
+        assert_eq "0" "$(grep -cF -- "$pattern" <<< "$reader")" "S107: the reader holds no [${pattern}]"
+    done
+    for pattern in 'pip ' 'sudo' 'apt-get' 'curl ' 'wget ' 'PYTHONPATH' 'LD_LIBRARY_PATH'; do
+        assert_eq "0" "$(grep -cF -- "$pattern" <<< "$block")" "S107: the readback block holds no [${pattern}]"
+    done
+    # The job summary and the interface.
+    summary="$(ab_step_run_body "Write the job summary")"
+    assert_contains "$summary" '| VTU readback | \`${VTU_READBACK_RESULT:-UNAVAILABLE}\` ${VTU_READBACK_REASON:-UNAVAILABLE} |' \
+        "S107: the job summary shows the readback result and reason"
+    assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
+        "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S107: the step list stays"
+    assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
+        "S107: the Orchestrator vector stays"
+    assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
+        "S107: the capture step guard stays 10 minutes"
+
+    # The capture step publishes the readback result. A failed product run gives
+    # NOT_ATTEMPTED; a capture with no work budget never reaches the readback.
+    ab_capture_fixture "$workspace"
+    deadline=$(( $(date +%s) + 6000 ))
+    ab_run_capture "$workspace" "$deadline" > /dev/null
+    assert_eq "NOT_ATTEMPTED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" \
+        "S107: after a failed product run, the readback result is NOT_ATTEMPTED"
+    assert_eq "NOT_ATTEMPTED" "$(ab_env_last "$workspace" VTU_READBACK_RESULT)" "S107: GITHUB_ENV gets the readback result"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" VTU_READBACK_RESULT="$(ab_env_last "$workspace" VTU_READBACK_RESULT)" \
+        VTU_READBACK_REASON="$(ab_env_last "$workspace" VTU_READBACK_REASON)" \
+        bash -eo pipefail "${workspace}/summary_step.sh" > /dev/null 2>&1 || _fail "S107: the summary step succeeds"
+    assert_contains "$(cat "${workspace}/step_summary")" "| VTU readback | \`NOT_ATTEMPTED\` " "S107: the summary shows the readback result"
+    workspace="$(new_workspace s107_no_budget)"
+    ab_capture_fixture "$workspace"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 180 ))" > /dev/null
+    assert_eq "SKIPPED_NO_BUDGET" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S107: the capture had no work budget"
+    assert_eq "NOT_ATTEMPTED" "$(ab_env_last "$workspace" VTU_READBACK_RESULT)" \
+        "S107: a capture that never reaches the readback publishes NOT_ATTEMPTED"
+    assert_contains "$(ab_env_last "$workspace" VTU_READBACK_REASON)" "SKIPPED_NO_BUDGET" "S107: the reason names the capture result"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -10277,6 +10986,10 @@ AB_OBSERVATIONS=(
     s101_provision_gate_and_bounded_operations
     s102_provision_programs_fail_closed
     s103_provision_ci_consumer_is_available
+    s104_readback_native_reads_controlled_vtus
+    s105_readback_capture_binds_the_two_files
+    s106_readback_guards_fail_closed
+    s107_readback_keeps_the_frozen_blocks_and_interface
 )
 
 # One observation runs in this process when the caller names it. The scenario
