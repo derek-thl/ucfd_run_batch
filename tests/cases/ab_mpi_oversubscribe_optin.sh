@@ -10567,7 +10567,7 @@ s105_readback_capture_binds_the_two_files() {
     workspace="$(ab_vr_case "$template" changed_during)"
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'real="$(command -v -a sha256sum | grep -v %q | head -n 1)"\n' "${workspace}/fakebin"
+        printf 'real=%q\n' "$(command -v sha256sum)"
         printf '"$real" "$@" && status=0 || status=$?\n'
         printf 'for argument in "$@"; do\n'
         printf '    if [[ "$argument" == *flow_latest_2.vtu && ! -e %q ]]; then\n' "${workspace}/changed"
