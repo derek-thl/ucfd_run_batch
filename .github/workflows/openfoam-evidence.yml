@@ -7964,7 +7964,7 @@ jobs:
           # vr_capture - the complete readback work of the capture. It always returns 0;
           # a record gap is a capture note.
           vr_capture() {
-              local dir="${EVIDENCE_DIR}/vtu-readback" side="${EVIDENCE_DIR%/*}/vtu-readback-result.env" role value
+              local dir="${EVIDENCE_DIR}/vtu-readback" side="${EVIDENCE_DIR%/*}/vtu-readback-result.env" role value expected clean
               local -A VR_FILE=() VR_PATH=() VR_SCAN_BYTES=() VR_SCAN_SHA=() VR_DEV0=() VR_INO0=() VR_BYTES0=() VR_CHG0=() VR_SHA0=()
               local -A VR_DEV1=() VR_INO1=() VR_BYTES1=() VR_CHG1=() VR_SHA1=() VR_ROLE_RESULT=([time0]=NOT_ATTEMPTED [latest]=NOT_ATTEMPTED)
               local -A VR_ROLE_REASON=() VR_RV=() VR_SIZE=()
@@ -8032,7 +8032,18 @@ jobs:
                   fi
               fi
 
-              # The file and native results.
+              # The file and native results. A complete reader record counts only with
+              # the exit status of its reader result: 0 for PASS, 1 for FAIL, and 2 for
+              # NOT_VERIFIED. After another status or a signal, a PASS record and each
+              # file PASS become NOT_VERIFIED, and a FAIL record stays FAIL.
+              value="${VR_RV[READER_RESULT]:-}"
+              case "$value" in
+                  PASS) expected=0 ;;
+                  FAIL) expected=1 ;;
+                  *) expected=2 ;;
+              esac
+              clean=no
+              [[ "$VR_NATIVE" != COMPLETED || "$VR_NATIVE_STATUS" != "$expected" ]] || clean=yes
               for role in time0 latest; do
                   if [[ -n "${VR_RV[FILE_${role}_RESULT]:-}" ]]; then
                       VR_ROLE_RESULT[$role]="${VR_RV[FILE_${role}_RESULT]}" VR_ROLE_REASON[$role]="${VR_RV[FILE_${role}_REASON]:-}"
@@ -8042,7 +8053,6 @@ jobs:
                   TIMEOUT) vr_fail NOT_VERIFIED "the native command did not complete within its ${VR_NATIVE_LIMIT} ms limit" ;;
                   NOT_STOPPED) vr_fail NOT_VERIFIED "the native command group ${VR_GROUP} did not stop by its deadline" ;;
                   COMPLETED|FAILED)
-                      value="${VR_RV[READER_RESULT]:-}"
                       if [[ "$VR_READER_RECORD" != COMPLETE ]]; then
                           vr_fail NOT_VERIFIED "the native command ended with status ${VR_NATIVE_STATUS} and no complete reader record"
                       elif [[ "$value" == PASS || "$value" == FAIL || "$value" == NOT_VERIFIED ]]; then
@@ -8071,6 +8081,10 @@ jobs:
           # and errors.txt go to the evidence directory. The one consumer is
           # vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader of the provisioned task
           # site. Its own vtkXMLDataParser gives the header evidence of the same file.
+                      if [[ "$clean" == no && "${VR_ROLE_RESULT[$role]}" == PASS ]]; then
+                          VR_ROLE_RESULT[$role]=NOT_VERIFIED
+                          VR_ROLE_REASON[$role]="the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}), not with the status 0 of a PASS"
+                      fi
           # The reader reads two files in series, loads every declared array, and keeps
           # no field value.
 
@@ -8080,6 +8094,10 @@ jobs:
           POLYHEDRON = 42
           REQUIRED = {"time0": (("U", 3), ("p", 1), ("wallDistance", 1)), "latest": (("U", 3), ("p", 1))}
           SINK = []
+                      elif [[ "$value" == PASS && "$clean" == no ]]; then
+                          vr_fail NOT_VERIFIED "the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}) after a complete PASS reader record; a PASS needs status 0"
+                      elif [[ "$value" == FAIL && "$clean" == no ]]; then
+                          vr_fail FAIL "${VR_RV[READER_REASON]:-no reader reason}; the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE})"
           CONSUMER = {}
 
 
