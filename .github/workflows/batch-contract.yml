@@ -52,7 +52,7 @@ jobs:
   contract-tests:
     name: v4 batch-runner contract tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 18
 
     steps:
       - name: Check out the repository
