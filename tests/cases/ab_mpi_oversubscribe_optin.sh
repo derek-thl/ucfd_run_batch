@@ -10447,12 +10447,13 @@ ab_vr_template() {
 # ab_vr_unit <workspace> [NAME=value ...] - run the extracted readback alone,
 # as the capture work calls it after the receipt, with a far capture work end,
 # the product result SUCCEEDED, and the producer of the receipt template. The
-# arguments override the environment. Prints status=.
+# arguments override the environment. The library is a script file, because
+# it is longer than one command-line argument can be. Prints status=.
 ab_vr_unit() {
-    local workspace="$1" library status
+    local workspace="$1" status
     shift
-    library="$(ab_vr_library "$workspace")"
-    [[ "$library" == *"# ---- VTU readback: end ----"* ]] ||
+    { ab_vr_library "$workspace"; printf '\nvr_capture\n'; } > "${workspace}/vr_unit.sh"
+    grep -qx '# ---- VTU readback: end ----' "${workspace}/vr_unit.sh" ||
         { _fail "the readback block of the capture work must be extracted"; return 1; }
     env PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp" \
         RUNNER_TEMP="${workspace}/runner_temp" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
@@ -10460,8 +10461,7 @@ ab_vr_unit() {
         GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 GITHUB_RUN_ATTEMPT=1 \
         GITHUB_REPOSITORY=derek-thl/ucfd_run_batch GITHUB_WORKFLOW=openfoam-evidence GITHUB_JOB=evidence \
         PREPARE_RESULT=SUCCEEDED OVERALL_RESULT=SUCCEEDED M3_VTU_PROVISION_RESULT=PROVISION_AVAILABLE \
-        "$@" "${AB_STEP_BASH[@]}" -c "${library}"'
-vr_capture' > "${workspace}/vr_unit.out" 2>&1 && status=0 || status=$?
+        "$@" "${AB_STEP_BASH[@]}" "${workspace}/vr_unit.sh" > "${workspace}/vr_unit.out" 2>&1 && status=0 || status=$?
     printf 'status=%s\n' "$status"
 }
 
@@ -10689,15 +10689,16 @@ s106_readback_guards_fail_closed() {
     assert_contains "$(ab_fr_unit "$template")" "status=0" "S106: the template receipt run ends with status 0"
 
     # A native command that does not end in its limit: TIMEOUT, NOT_VERIFIED,
-    # and the stopped group. The capture work end leaves 2 seconds for it.
+    # and the stopped group. The capture work end leaves at most 4 seconds for
+    # it, less the time of the case setup.
     start="$(date +%s)"
-    workspace="$(ab_vr_guard "$template" hang hang CAPTURE_WORK_END="$(( $(date +%s) + 27 ))")"
+    workspace="$(ab_vr_guard "$template" hang hang CAPTURE_WORK_END="$(( $(date +%s) + 29 ))")"
     elapsed=$(( $(date +%s) - start ))
     ab_vr_expect "$workspace" "S106 hang" NOT_VERIFIED "did_not_complete"
     (( elapsed <= 12 )) || _fail "S106: the readback ends shortly after the native limit" "elapsed: ${elapsed} s"
     line="$(ab_vr_native_rows "$workspace")"
     assert_contains "$line" $'\tTIMEOUT\t' "S106: commands.tsv records the TIMEOUT"
-    [[ "$(cut -f 4 <<< "$line")" =~ ^[0-9]+$ ]] && (( $(cut -f 4 <<< "$line") <= 2000 )) ||
+    [[ "$(cut -f 4 <<< "$line")" =~ ^[0-9]+$ ]] && (( $(cut -f 4 <<< "$line") <= 4000 )) ||
         _fail "S106: the native limit shrinks to the time left less the kill and receipt reserves" "$line"
     if pgrep -f -- "$(ab_vr_dir "$workspace")" > /dev/null 2>&1; then
         _fail "S106: no reader process of the stopped command remains"
