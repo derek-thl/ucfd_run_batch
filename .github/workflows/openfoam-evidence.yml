@@ -2351,13 +2351,13 @@ jobs:
 
 
           def record_path(name, path):
-              """A RECORD path relative to the site. pip --target records a script or a
-              header relative to its temporary lib directory, as ../../bin/<name> or
-              ../../include/<name>."""
-              for prefix, target in (("../../bin/", "bin/"), ("../../include/", "include/")):
-                  if path.startswith(prefix) and ".." not in path[len(prefix):].split("/"):
-                      return target + path[len(prefix):]
-              if path.startswith("/") or ".." in path.split("/") or "\\" in path:
+              """A RECORD path relative to the site. pip --target installs into a
+              temporary home and moves it to the target. RECORD keeps each path of the
+              home data scheme (scripts in bin/, headers in include/, and data files)
+              relative to the lib directory home/lib/python, as ../../<path>."""
+              if path.startswith("../../"):
+                  path = path[len("../../"):]
+              if not path or path.startswith("/") or ".." in path.split("/") or "\\" in path:
                   raise Gap("FAIL", "the RECORD of %s has the unexpected path %s" % (name, path))
               return path
 
