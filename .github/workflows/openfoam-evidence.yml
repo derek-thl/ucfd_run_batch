@@ -7811,6 +7811,14 @@ jobs:
               return 0
           }
 
+          # vr_note <key> <text> - one capture note for each key, also when a final
+          # record is written again.
+          vr_note() {
+              [[ -z "${VR_NOTED[$1]:-}" ]] || return 0
+              VR_NOTED[$1]=1
+              capture_note "$2"
+          }
+
           # vr_write <directory> <name> <text> - write one record when it fits the record
           # limit and the subtree budget. Otherwise nothing is written, and the gap is a
           # capture note. VR_SIZE keeps the bytes of each written record.
@@ -7818,15 +7826,28 @@ jobs:
               local LC_ALL=C bytes="${#3}"
               if (( bytes > VR_FILE_LIMIT || VR_USED + bytes > VR_AVAILABLE )); then
                   VR_RECORDS=INCOMPLETE
-                  capture_note "VTU readback: ${2} of ${bytes} bytes does not fit the ${VR_FILE_LIMIT}-byte record limit and the readback budget of ${VR_AVAILABLE} bytes"
+                  vr_note "$2" "VTU readback: ${2} of ${bytes} bytes does not fit the ${VR_FILE_LIMIT}-byte record limit and the readback budget of ${VR_AVAILABLE} bytes"
                   return 1
               fi
               if ! printf '%s' "$3" > "${1}/${2}" 2> /dev/null; then
                   VR_RECORDS=INCOMPLETE
-                  capture_note "VTU readback: ${2} cannot be written completely"
+                  vr_note "$2" "VTU readback: ${2} cannot be written completely"
                   return 1
               fi
               VR_USED=$(( VR_USED + bytes )) VR_SIZE[$2]="$bytes"
+              return 0
+          }
+
+          # vr_unwrite <directory> <name> - remove one final record before it is written
+          # again, and give back its bytes. Only a regular file or a link is removed.
+          vr_unwrite() {
+              if [[ -n "${VR_SIZE[$2]:-}" ]]; then
+                  VR_USED=$(( VR_USED - ${VR_SIZE[$2]} ))
+                  unset 'VR_SIZE[$2]'
+              fi
+              if [[ -f "${1}/${2}" || -L "${1}/${2}" ]]; then
+                  rm -f -- "${1:?}/${2}" 2> /dev/null || true
+              fi
               return 0
           }
 
@@ -7835,7 +7856,7 @@ jobs:
           # their header lines), result.env, and last inventory.tsv with the bytes and
           # SHA-256 of the other six.
           vr_records() {
-              local dir="$1" text name role value key bytes sha out line
+              local dir="$1" text name role value key bytes sha out line pass state
               local LC_ALL=C
               text="VTU_READBACK_SCHEMA=vtu-readback/1"$'\n'
               for name in GITHUB_SHA GITHUB_REPOSITORY GITHUB_WORKFLOW GITHUB_WORKFLOW_REF GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_JOB; do
@@ -7913,26 +7934,40 @@ jobs:
                   fi
               fi
 
-              if [[ "$VR_RECORDS" != COMPLETE && "$VR_RESULT" == PASS ]]; then
-                  VR_RESULT=NOT_VERIFIED VR_REASON="the readback records are not complete"
-              fi
-              vr_result_text
-              vr_write "$dir" result.env "$VR_RESULT_TEXT" || true
-              text=$'name\tbytes\tsha256\n'
-              out="$(cd -- "$dir" && sha256sum -- arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env 2> /dev/null)" || true
-              for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env; do
-                  sha=""
-                  while IFS= read -r line; do
-                      [[ "$line" != *"  ${name}" ]] || sha="${line%%  *}"
-                  done <<< "$out"
-                  if [[ -n "${VR_SIZE[$name]:-}" && "$sha" =~ ^[0-9a-f]{64}$ ]]; then
-                      text+="${name}"$'\t'"${VR_SIZE[$name]}"$'\t'"${sha}"$'\n'
-                  else
-                      text+="${name}"$'\t-\tUNAVAILABLE\n'
-                      VR_RECORDS=INCOMPLETE
+              # The final records: result.env and, last, inventory.tsv with the bytes and
+              # SHA-256 of the other six. A PASS needs every record, both final writes,
+              # and every SHA-256 of the inventory. When a final write or a SHA-256 is
+              # missing, the records become INCOMPLETE, a PASS becomes NOT_VERIFIED, and
+              # both final records are written once again, so result.env, the side
+              # result, and the inventory keep the same final result. A record that is
+              # written but has no SHA-256 is a capture note.
+              for pass in first again; do
+                  state="$VR_RECORDS"
+                  if [[ "$VR_RECORDS" != COMPLETE && "$VR_RESULT" == PASS ]]; then
+                      VR_RESULT=NOT_VERIFIED VR_REASON="the readback records are not complete"
                   fi
+                  vr_unwrite "$dir" result.env
+                  vr_unwrite "$dir" inventory.tsv
+                  vr_result_text
+                  vr_write "$dir" result.env "$VR_RESULT_TEXT" || true
+                  text=$'name\tbytes\tsha256\n'
+                  out="$(cd -- "$dir" && sha256sum -- arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env 2> /dev/null)" || true
+                  for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env; do
+                      sha=""
+                      while IFS= read -r line; do
+                          [[ "$line" != *"  ${name}" ]] || sha="${line%%  *}"
+                      done <<< "$out"
+                      if [[ -n "${VR_SIZE[$name]:-}" && "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+                          text+="${name}"$'\t'"${VR_SIZE[$name]}"$'\t'"${sha}"$'\n'
+                      else
+                          text+="${name}"$'\t-\tUNAVAILABLE\n'
+                          VR_RECORDS=INCOMPLETE
+                          [[ -z "${VR_SIZE[$name]:-}" ]] || vr_note "sha256:${name}" "VTU readback: inventory.tsv has no SHA-256 of ${name}"
+                      fi
+                  done
+                  vr_write "$dir" inventory.tsv "$text" || true
+                  [[ "$VR_RECORDS" != "$state" ]] || break
               done
-              vr_write "$dir" inventory.tsv "$text" || true
               return 0
           }
 
@@ -7967,7 +8002,7 @@ jobs:
               local dir="${EVIDENCE_DIR}/vtu-readback" side="${EVIDENCE_DIR%/*}/vtu-readback-result.env" role value expected clean
               local -A VR_FILE=() VR_PATH=() VR_SCAN_BYTES=() VR_SCAN_SHA=() VR_DEV0=() VR_INO0=() VR_BYTES0=() VR_CHG0=() VR_SHA0=()
               local -A VR_DEV1=() VR_INO1=() VR_BYTES1=() VR_CHG1=() VR_SHA1=() VR_ROLE_RESULT=([time0]=NOT_ATTEMPTED [latest]=NOT_ATTEMPTED)
-              local -A VR_ROLE_REASON=() VR_RV=() VR_SIZE=()
+              local -A VR_ROLE_REASON=() VR_RV=() VR_SIZE=() VR_NOTED=()
               vr_clock VR_START_MS
               VR_END_MS=$(( VR_START_MS + VR_WORK_SECONDS * 1000 ))
               if (( (CAPTURE_WORK_END - 10) * 1000 < VR_END_MS )); then
@@ -8047,6 +8082,10 @@ jobs:
               for role in time0 latest; do
                   if [[ -n "${VR_RV[FILE_${role}_RESULT]:-}" ]]; then
                       VR_ROLE_RESULT[$role]="${VR_RV[FILE_${role}_RESULT]}" VR_ROLE_REASON[$role]="${VR_RV[FILE_${role}_REASON]:-}"
+                      if [[ "$clean" == no && "${VR_ROLE_RESULT[$role]}" == PASS ]]; then
+                          VR_ROLE_RESULT[$role]=NOT_VERIFIED
+                          VR_ROLE_REASON[$role]="the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}), not with the status 0 of a PASS"
+                      fi
                   fi
               done
               case "$VR_NATIVE" in
@@ -8055,6 +8094,10 @@ jobs:
                   COMPLETED|FAILED)
                       if [[ "$VR_READER_RECORD" != COMPLETE ]]; then
                           vr_fail NOT_VERIFIED "the native command ended with status ${VR_NATIVE_STATUS} and no complete reader record"
+                      elif [[ "$value" == PASS && "$clean" == no ]]; then
+                          vr_fail NOT_VERIFIED "the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}) after a complete PASS reader record; a PASS needs status 0"
+                      elif [[ "$value" == FAIL && "$clean" == no ]]; then
+                          vr_fail FAIL "${VR_RV[READER_REASON]:-no reader reason}; the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE})"
                       elif [[ "$value" == PASS || "$value" == FAIL || "$value" == NOT_VERIFIED ]]; then
                           vr_fail "$value" "${VR_RV[READER_REASON]:-no reader reason}"
                       else
@@ -8081,10 +8124,6 @@ jobs:
           # and errors.txt go to the evidence directory. The one consumer is
           # vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader of the provisioned task
           # site. Its own vtkXMLDataParser gives the header evidence of the same file.
-                      if [[ "$clean" == no && "${VR_ROLE_RESULT[$role]}" == PASS ]]; then
-                          VR_ROLE_RESULT[$role]=NOT_VERIFIED
-                          VR_ROLE_REASON[$role]="the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}), not with the status 0 of a PASS"
-                      fi
           # The reader reads two files in series, loads every declared array, and keeps
           # no field value.
 
@@ -8094,10 +8133,6 @@ jobs:
           POLYHEDRON = 42
           REQUIRED = {"time0": (("U", 3), ("p", 1), ("wallDistance", 1)), "latest": (("U", 3), ("p", 1))}
           SINK = []
-                      elif [[ "$value" == PASS && "$clean" == no ]]; then
-                          vr_fail NOT_VERIFIED "the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE}) after a complete PASS reader record; a PASS needs status 0"
-                      elif [[ "$value" == FAIL && "$clean" == no ]]; then
-                          vr_fail FAIL "${VR_RV[READER_REASON]:-no reader reason}; the native command ended with status ${VR_NATIVE_STATUS} (${VR_NATIVE})"
           CONSUMER = {}
 
 
@@ -8799,18 +8834,53 @@ jobs:
           # keeps NOT_ATTEMPTED, and one that stops in it keeps INCOMPLETE, each with
           # the capture result. A result is complete only in a regular file that
           # starts with the schema and one known result line and ends with the
-          # WORK_FINISH line and its line end. When the readback directory exists,
-          # the explicit result then replaces its result.env.
+          # WORK_FINISH line and its line end. A PASS is complete only with the
+          # complete inventory of the retained records: inventory.tsv binds the bytes
+          # and SHA-256 of each of the six other records, and the PASS text is the
+          # text of the retained result.env. A side PASS without that inventory is
+          # NOT_VERIFIED. When the readback directory exists, the explicit result
+          # then replaces its result.env, and an inventory.tsv is written again for
+          # the retained records.
           readback_dir="${EVIDENCE_DIR}/vtu-readback"
           readback_result="${readback_dir}/result.env"
           readback_side="${EVIDENCE_DIR%/*}/vtu-readback-result.env"
+          readback_refused=""
+          # readback_inventory - the inventory.tsv text of the retained records: the
+          # bytes and SHA-256 of each record, or - and UNAVAILABLE.
+          readback_inventory() {
+              local name sum
+              printf 'name\tbytes\tsha256\n'
+              for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env; do
+                  if [[ -f "${readback_dir}/${name}" && ! -L "${readback_dir}/${name}" ]] &&
+                          sum="$(sha256sum < "${readback_dir}/${name}" 2>/dev/null)"; then
+                      printf '%s\t%s\t%s\n' "$name" "$(stat -c %s -- "${readback_dir}/${name}")" "${sum%% *}"
+                  else
+                      printf '%s\t-\tUNAVAILABLE\n' "$name"
+                  fi
+              done
+          }
           readback_complete() {
-              local text="" first last
+              local text="" first last result inventory="" expected
+              readback_refused=""
               first='^VTU_READBACK_SCHEMA=vtu-readback/1'$'\n''VTU_READBACK_RESULT=(PASS|FAIL|NOT_VERIFIED|NOT_ATTEMPTED|INCOMPLETE)'$'\n'
               last=$'\n''WORK_FINISH=[0-9]+'$'\n''$'
               [[ -f "$1" && ! -L "$1" ]] || return 1
               IFS= read -r -d '' text 2>/dev/null < "$1" && return 1
-              [[ "$text" =~ $first && "$text" =~ $last ]]
+              [[ "$text" =~ $first ]] || return 1
+              result="${BASH_REMATCH[1]}"
+              [[ "$text" =~ $last ]] || return 1
+              [[ "$result" == PASS ]] || return 0
+              expected="$(readback_inventory; printf x)"
+              expected="${expected%x}"
+              if [[ -f "${readback_dir}/inventory.tsv" && ! -L "${readback_dir}/inventory.tsv" ]]; then
+                  IFS= read -r -d '' inventory 2>/dev/null < "${readback_dir}/inventory.tsv" || true
+              fi
+              if [[ "$inventory" == "$expected" && "$expected" != *UNAVAILABLE* ]] &&
+                      cmp -s -- "$1" "${readback_dir}/result.env"; then
+                  return 0
+              fi
+              readback_refused="the PASS result has no complete inventory of the retained readback records"
+              return 1
           }
           if ! readback_complete "$readback_result"; then
               if ! readback_complete "$readback_side"; then
@@ -8819,6 +8889,10 @@ jobs:
                   if [[ -d "$readback_dir" || -e "$readback_side" ]]; then
                       readback_state=INCOMPLETE
                       readback_reason="the capture stopped the VTU readback work"
+                  fi
+                  if [[ -n "$readback_refused" ]]; then
+                      readback_state=NOT_VERIFIED
+                      readback_reason="$readback_refused"
                   fi
                   {
                     echo "VTU_READBACK_SCHEMA=vtu-readback/1"
@@ -8837,6 +8911,10 @@ jobs:
                   else
                       rm -f -- "$readback_target" 2>/dev/null || true
                   fi
+              fi
+              if [[ -d "$readback_dir" && ! -L "$readback_dir" ]] &&
+                      [[ -f "${readback_dir}/inventory.tsv" && ! -L "${readback_dir}/inventory.tsv" ]]; then
+                  readback_inventory > "${readback_dir}/inventory.tsv" 2>/dev/null || true
               fi
           fi
 
