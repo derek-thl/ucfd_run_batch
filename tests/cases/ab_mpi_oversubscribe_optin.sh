@@ -9486,7 +9486,7 @@ s100_provision_block_is_identical_in_both_workflows() {
     assert_eq "Check out the repository|Report the runner environment|Check the contract-test harness syntax|${AB_VP_STEP}|Run the v4 contract tests|Confirm that the working tree is unchanged|Check out the repository|Install ShellCheck|Run the ShellCheck baseline gate" \
         "$(sed -n -e 's/^      - name: //p' "$CONTRACT_WORKFLOW" | paste -sd '|' -)" \
         "S100: the provision step comes before the suite, and the other steps stay"
-    # The cap guard on eight focused copies of this workflow text, each with one
+    # The cap guard on nine focused copies of this workflow text, each with one
     # change, and then on the workflow itself. A rejected copy passes only with
     # its expected reason. Before normalization, the guard writes no base file.
     actual=''
@@ -9501,6 +9501,20 @@ s100_provision_block_is_identical_in_both_workflows() {
     assert_eq "legal ACCEPT base|old_15 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 15], not [    timeout-minutes: 18] -|missing REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|duplicate REJECT_BEFORE_NORMALIZATION: the contract-tests job has 2 job-level cap lines -|step REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|shellcheck REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|cap_19 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 19], not [    timeout-minutes: 18] -|job_name REJECT_AT_BASE_HASH base|" \
         "$actual" \
         "S100: the cap guard accepts only the one authorized 18-minute cap line of the contract-tests job, and rejects each changed copy for its reason"
+    # The ninth copy (Owner decision 6173182935): a byte copy of the legal input
+    # without its final LF, and no other change. The guard normalizes no other
+    # byte, so it rejects this copy before normalization.
+    cp -- "${workspace}/cap.legal.yml" "${workspace}/cap.no_final_lf.yml" ||
+        _fail "S100: the focused input no_final_lf is a byte copy of the legal input"
+    truncate -s -1 -- "${workspace}/cap.no_final_lf.yml" ||
+        _fail "S100: the focused input no_final_lf loses its last byte"
+    { cat -- "${workspace}/cap.no_final_lf.yml" && printf '\n'; } | cmp -s -- - "${workspace}/cap.legal.yml" ||
+        _fail "S100: the legal input ends with its final LF, and the focused input no_final_lf is the legal input without only that byte"
+    result="$(ab_vc_guard "${workspace}/cap.no_final_lf.yml" "${workspace}/cap.no_final_lf.base.yml")"
+    base='-'
+    [[ ! -e "${workspace}/cap.no_final_lf.base.yml" ]] || base='base'
+    assert_eq "no_final_lf REJECT_BEFORE_NORMALIZATION: the workflow has no final LF -" "no_final_lf ${result} ${base}" \
+        "S100: the cap guard rejects the legal copy without its final LF before normalization, and writes no base file"
     result="$(ab_vc_guard "$CONTRACT_WORKFLOW" "${workspace}/batch-contract-base.yml")"
     [[ "$result" != REJECT_BEFORE_NORMALIZATION* ]] ||
         _fail "S100: the contract-tests job holds the one authorized cap line, [    timeout-minutes: 18], before its steps" "$result"
@@ -10904,7 +10918,7 @@ s106_readback_guards_fail_closed() {
 }
 
 s107_readback_keeps_the_frozen_blocks_and_interface() {
-    local workspace body block constant vector pattern reader summary deadline
+    local workspace body block constant vector pattern reader summary deadline bytes
     workspace="$(new_workspace s107_interface)"
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S107: the VTU header reader block is unchanged"
@@ -10956,6 +10970,13 @@ s107_readback_keeps_the_frozen_blocks_and_interface() {
         "S107: the Orchestrator vector stays"
     assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
         "S107: the capture step guard stays 10 minutes"
+    # The evidence workflow stays below the GitHub workflow file limit (500 KB):
+    # at most 510000 raw bytes, the ceiling of Owner decision 6173182935.
+    bytes="$(wc -c < "$WORKFLOW")" || _fail "S107: the evidence workflow can be read"
+    bytes="${bytes//[[:space:]]/}"
+    [[ "$bytes" =~ ^(0|[1-9][0-9]*)$ ]] || _fail "S107: the evidence workflow has a valid byte count" "bytes: [${bytes}]"
+    (( bytes <= 510000 )) ||
+        _fail "S107: the evidence workflow has at most 510000 raw bytes" "ceiling: 510000" "actual:  ${bytes}"
 
     # The capture step publishes the readback result. A failed product run gives
     # NOT_ATTEMPTED; a capture with no work budget never reaches the readback.
