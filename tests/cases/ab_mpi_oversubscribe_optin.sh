@@ -9249,12 +9249,13 @@ ab_vp_expected_requires() {
 
 # ab_vp_block <workflow> <step> - the provision block of one step, as the step
 # runs it: from the begin marker line through the end marker line and its line
-# end.
+# end. The awk program reads to the end, so pipefail sees no SIGPIPE.
 ab_vp_block() {
     ab_step_run_body "$2" "$1" | awk '
+        done { next }
         $0 == "# ---- M3 VTU provision: begin ----" { inside = 1 }
         inside { print }
-        inside && $0 == "# ---- M3 VTU provision: end ----" { exit }'
+        inside && $0 == "# ---- M3 VTU provision: end ----" { inside = 0; done = 1 }'
 }
 
 # ab_vp_heredoc <file> <name> - the body of the quoted here-document <name>,
