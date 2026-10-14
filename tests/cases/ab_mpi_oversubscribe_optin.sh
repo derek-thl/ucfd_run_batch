@@ -9172,8 +9172,8 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
         "S99: the Orchestrator vector stays"
     assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
         "S99: the capture step guard stays 10 minutes"
-    assert_eq "10 15" "$(awk '/^    timeout-minutes:/ { print $2 }' "${REPO_ROOT}/.github/workflows/batch-contract.yml" | sort -n | paste -sd ' ' -)" \
-        "S99: the ShellCheck and contract jobs keep their 10-minute and 15-minute limits"
+    assert_eq "10 18" "$(awk '/^    timeout-minutes:/ { print $2 }' "${REPO_ROOT}/.github/workflows/batch-contract.yml" | sort -n | paste -sd ' ' -)" \
+        "S99: the ShellCheck job keeps its 10-minute limit, and the contract-tests job has its 18-minute limit (Owner decision 6170198169)"
     assert_contains "$text" "include-hidden-files: true" "S99: the upload keeps the hidden files"
     assert_contains "$text" 'path: ${{ runner.temp }}/evidence' "S99: the upload keeps the evidence directory"
 }
@@ -9332,8 +9332,96 @@ ab_vp_step_without() {
         { print }' "$1"
 }
 
+# The contract-tests job cap of S100 (Owner decision 6170198169, contract
+# 6170722644, Section 4). The job must hold exactly one job-level cap line,
+# "    timeout-minutes: 18", before its steps. Only that validated line goes
+# back to 15 for the comparison with the admitted base file; S100 normalizes
+# no other byte.
+
+# ab_vc_guard <workflow> <base> - the cap guard of S100. Print one result:
+# "REJECT_BEFORE_NORMALIZATION: <reason>" when the contract-tests job does not
+# hold the one authorized cap line. Else write <base>, the workflow with that
+# line set back to 15 and without the provision step, and print "ACCEPT" when
+# <base> is the admitted base file or "REJECT_AT_BASE_HASH" when it is not. A
+# missing workflow or a tool error prints no result and returns 1, so it is
+# never an expected rejection. A cap line is a contract-tests line with
+# "timeout-minutes" and less than 8 leading spaces, that is, not a step line.
+ab_vc_guard() {
+    local workflow="$1" base="$2" verdict hash
+    rm -f -- "$base" || { _fail "S100: the cap guard cannot remove ${base}"; return 1; }
+    [[ -f "$workflow" ]] || { _fail "S100: the cap guard has no workflow file ${workflow}"; return 1; }
+    verdict="$(awk '
+        /^[^ #]/ { jobs = ($0 == "jobs:"); job = "" }
+        jobs && /^  [^ #]/ { job = $0; steps = 0; if (job == "  contract-tests:") count++ }
+        job != "  contract-tests:" { next }
+        $0 == "    steps:" { steps = 1 }
+        /timeout-minutes/ { match($0, /^ */); if (RLENGTH < 8) { n++; line = NR; text = $0; late = steps } }
+        END {
+            if (count != 1) print "REJECT the workflow has " count + 0 " contract-tests jobs"
+            else if (n == 0) print "REJECT the contract-tests job has no job-level cap line"
+            else if (n > 1) print "REJECT the contract-tests job has " n " job-level cap lines"
+            else if (text != "    timeout-minutes: 18") print "REJECT the job-level cap line of contract-tests is [" text "], not [    timeout-minutes: 18]"
+            else if (late) print "REJECT the job-level cap line of contract-tests comes after its steps"
+            else print "LINE " line
+        }' "$workflow")" || { _fail "S100: the cap guard cannot read ${workflow}"; return 1; }
+    case "$verdict" in
+        "REJECT "*) printf 'REJECT_BEFORE_NORMALIZATION: %s\n' "${verdict#REJECT }"; return 0 ;;
+        "LINE "*) ;;
+        *) _fail "S100: the cap guard gives no result for ${workflow}" "$verdict"; return 1 ;;
+    esac
+    awk -v cap="${verdict#LINE }" 'NR == cap { print "    timeout-minutes: 15"; next } { print }' "$workflow" |
+        awk -v want="      - name: ${AB_VP_STEP}" '
+        $0 == want { skip = 1; next }
+        skip && /^      - name: / { skip = 0 }
+        !skip { print }' > "$base" || { _fail "S100: the cap guard cannot write ${base}"; return 1; }
+    hash="$(sha256sum < "$base" | cut -d ' ' -f 1)" || { _fail "S100: the cap guard cannot hash ${base}"; return 1; }
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { _fail "S100: the cap guard has no SHA-256 of ${base}" "$hash"; return 1; }
+    if [[ "$hash" == 307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766 ]]; then
+        printf 'ACCEPT\n'
+    else
+        printf 'REJECT_AT_BASE_HASH\n'
+    fi
+}
+
+# ab_vc_input <mode> - one focused input of S100: batch-contract.yml with its
+# job-level contract-tests cap line changed for <mode>, and no other change.
+# legal: "    timeout-minutes: 18"; old_15; missing; duplicate: two 18-minute
+# lines; step: the 18-minute line moves to the step "Run the v4 contract
+# tests"; shellcheck: it moves to the ShellCheck job, in place of the 10-minute
+# line; cap_19; job_name: the legal line and a changed contract-tests job name.
+# Returns 1 when the workflow has no single such line or the edit has no place.
+ab_vc_input() {
+    awk -v mode="$1" '
+        BEGIN {
+            bad = (mode !~ /^(legal|old_15|missing|duplicate|step|shellcheck|cap_19|job_name)$/)
+            need = (mode == "step" || mode == "shellcheck" || mode == "job_name")
+        }
+        /^[^ #]/ { jobs = ($0 == "jobs:"); job = "" }
+        jobs && /^  [^ #]/ { job = $0; steps = 0 }
+        job == "  contract-tests:" && $0 == "    steps:" { steps = 1 }
+        job == "  contract-tests:" && !steps && /^    timeout-minutes: / {
+            caps++
+            if (mode == "legal" || mode == "job_name") print "    timeout-minutes: 18"
+            else if (mode == "old_15") print "    timeout-minutes: 15"
+            else if (mode == "cap_19") print "    timeout-minutes: 19"
+            else if (mode == "duplicate") { print "    timeout-minutes: 18"; print "    timeout-minutes: 18" }
+            next
+        }
+        mode == "step" && job == "  contract-tests:" && $0 == "      - name: Run the v4 contract tests" {
+            print; print "        timeout-minutes: 18"; edits++; next
+        }
+        mode == "shellcheck" && job == "  shellcheck:" && /^    timeout-minutes: / {
+            print "    timeout-minutes: 18"; edits++; next
+        }
+        mode == "job_name" && job == "  contract-tests:" && $0 == "    name: v4 batch-runner contract tests" {
+            print "    name: v4 batch-runner contract tests, changed"; edits++; next
+        }
+        { print }
+        END { exit (bad || caps != 1 || edits != need) }' "$CONTRACT_WORKFLOW"
+}
+
 s100_provision_block_is_identical_in_both_workflows() {
-    local workspace constant vector name pattern
+    local workspace constant vector name pattern mode result base actual
     workspace="$(new_workspace s100_provision)"
     ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${workspace}/contract.block"
     ab_vp_block "$WORKFLOW" "Run the Orchestrator" > "${workspace}/evidence.block"
@@ -9393,18 +9481,33 @@ s100_provision_block_is_identical_in_both_workflows() {
             "S100: the block holds no [${pattern}]"
     done
 
-    # The contract-tests job: one explicit provision step before the suite, and
-    # no other change.
+    # The contract-tests job: one explicit provision step before the suite, the
+    # one authorized cap line, and no other change.
     assert_eq "Check out the repository|Report the runner environment|Check the contract-test harness syntax|${AB_VP_STEP}|Run the v4 contract tests|Confirm that the working tree is unchanged|Check out the repository|Install ShellCheck|Run the ShellCheck baseline gate" \
         "$(sed -n -e 's/^      - name: //p' "$CONTRACT_WORKFLOW" | paste -sd '|' -)" \
         "S100: the provision step comes before the suite, and the other steps stay"
-    awk -v want="      - name: ${AB_VP_STEP}" '
-        $0 == want { skip = 1; next }
-        skip && /^      - name: / { skip = 0 }
-        !skip { print }' "$CONTRACT_WORKFLOW" > "${workspace}/batch-contract-base.yml"
+    # The cap guard on eight focused copies of this workflow text, each with one
+    # change, and then on the workflow itself. A rejected copy passes only with
+    # its expected reason. Before normalization, the guard writes no base file.
+    actual=''
+    for mode in legal old_15 missing duplicate step shellcheck cap_19 job_name; do
+        ab_vc_input "$mode" > "${workspace}/cap.${mode}.yml" ||
+            _fail "S100: the focused input ${mode} has the one job-level contract-tests cap line to change"
+        result="$(ab_vc_guard "${workspace}/cap.${mode}.yml" "${workspace}/cap.${mode}.base.yml")"
+        base='-'
+        [[ ! -e "${workspace}/cap.${mode}.base.yml" ]] || base='base'
+        actual+="${mode} ${result} ${base}|"
+    done
+    assert_eq "legal ACCEPT base|old_15 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 15], not [    timeout-minutes: 18] -|missing REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|duplicate REJECT_BEFORE_NORMALIZATION: the contract-tests job has 2 job-level cap lines -|step REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|shellcheck REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|cap_19 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 19], not [    timeout-minutes: 18] -|job_name REJECT_AT_BASE_HASH base|" \
+        "$actual" \
+        "S100: the cap guard accepts only the one authorized 18-minute cap line of the contract-tests job, and rejects each changed copy for its reason"
+    result="$(ab_vc_guard "$CONTRACT_WORKFLOW" "${workspace}/batch-contract-base.yml")"
+    [[ "$result" != REJECT_BEFORE_NORMALIZATION* ]] ||
+        _fail "S100: the contract-tests job holds the one authorized cap line, [    timeout-minutes: 18], before its steps" "$result"
     assert_eq "307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766" \
         "$(sha256sum < "${workspace}/batch-contract-base.yml" | cut -d ' ' -f 1)" \
-        "S100: without the provision step, batch-contract.yml is the admitted base file"
+        "S100: with that cap line set back to 15 and without the provision step, batch-contract.yml is the admitted base file"
+    assert_eq "ACCEPT" "$result" "S100: the cap guard accepts batch-contract.yml"
     assert_eq "$(printf '        timeout-minutes: 2\n        run: |\n          set -euo pipefail\n          # ---- M3 VTU provision: begin ----')" \
         "$(awk -v want="      - name: ${AB_VP_STEP}" '$0 == want { inside = 1; next } inside { print; if (++n == 4) exit }' "$CONTRACT_WORKFLOW")" \
         "S100: the provision step has no condition, a 2-minute guard, and starts with the block"
