@@ -7,14 +7,21 @@ name: openfoam-evidence
 # post-processing. The transport Stage never runs.
 #
 # The workflow starts only through workflow_dispatch. It is never a required
-# check. GitHub registers the trigger only for a workflow file that exists on
-# the default branch, so this file reaches main before any dispatch.
+# check. The trigger must exist on main. Normal execution needs exact-main
+# Owner admission. Reviewed-head validation-only dispatch needs separate
+# Owner admission and permits no product job.
 #
 # The workflow tunes nothing. The run uses the committed setup defaults, and a
 # real product failure stays a real product failure.
 
 on:
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: Validate workflow only. Run no product job.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +31,7 @@ jobs:
     name: OpenFOAM v2512 four-Stage evidence
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    if: ${{ !inputs.validation_only }}
     defaults:
       run:
         shell: bash
