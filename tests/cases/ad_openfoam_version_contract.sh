@@ -462,7 +462,7 @@ o13_batch_contract_path_filters() {
 # ---- observations 11, 12, and 14 --------------------------------------------
 
 o11_workflow_manual_and_not_required() {
-    local on_block trigger
+    local on_block trigger jobs
     on_block="$(ad_on_block)"
     assert_ne "" "$on_block" "observation 11: the trigger block is readable"
     assert_contains "$on_block" "workflow_dispatch:" \
@@ -471,8 +471,25 @@ o11_workflow_manual_and_not_required() {
         assert_not_contains "$on_block" "$trigger" \
             "observation 11: the workflow has no ${trigger} trigger"
     done
-    assert_contains "$on_block" "  workflow_dispatch:" \
-        "observation 11: workflow_dispatch needs no input"
+    assert_eq $'  workflow_dispatch:\n    inputs:\n      validation_only:\n        description: Validate workflow only. Run no product job.\n        type: boolean\n        required: false\n        default: false' \
+        "$on_block" \
+        "observation 11: workflow_dispatch has only the optional Boolean validation_only input, default false"
+
+    # The job boundary: evidence is the only job, and its one job-level
+    # condition makes it ineligible for a true validation_only input.
+    jobs="$(awk '
+        /^jobs:[[:space:]]*$/ { inside = 1; next }
+        inside && /^[^[:space:]]/ { exit }
+        inside && /^  [^[:space:]#]/ { print }
+    ' "$WORKFLOW")"
+    assert_eq "  evidence:" "$jobs" "observation 11: evidence is the only job"
+    assert_contains "$(cat -- "$WORKFLOW")" $'\n  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120\n    if: ${{ !inputs.validation_only }}\n    defaults:\n' \
+        "observation 11: the evidence job header holds the job-level validation_only condition"
+    assert_eq 1 "$(grep -c '^    if:' "$WORKFLOW")" \
+        "observation 11: the evidence job has one job-level condition"
+    assert_eq $'      validation_only:\n    if: ${{ !inputs.validation_only }}' \
+        "$(grep -F -- 'validation_only' "$WORKFLOW")" \
+        "observation 11: only the input and the job-level condition name validation_only"
 }
 
 o12_preserved_accepted_behavior() {

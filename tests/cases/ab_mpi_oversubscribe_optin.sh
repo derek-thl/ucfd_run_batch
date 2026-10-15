@@ -7185,12 +7185,20 @@ s81_collect_keeps_the_workflow_interface() {
     workspace="$(new_workspace s81_interface)"
     ab_collect_fixture "$workspace"
     body="$(cat "${workspace}/capture_step.sh")"
-    assert_eq $'on:\n  workflow_dispatch:' \
+    assert_eq $'on:\n  workflow_dispatch:\n    inputs:\n      validation_only:\n        description: Validate workflow only. Run no product job.\n        type: boolean\n        required: false\n        default: false' \
         "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$WORKFLOW")" \
-        "S81: workflow_dispatch without inputs is the only trigger"
+        "S81: workflow_dispatch with only the optional Boolean validation_only input (default false) is the only trigger"
     assert_contains "$(cat "$WORKFLOW")" $'permissions:\n  contents: read' "S81: the token can only read contents"
     assert_contains "$(cat "$WORKFLOW")" $'  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120' \
         "S81: the job, runner, and 120-minute setting stay"
+    # evidence is the only job. Its one job-level condition makes it ineligible
+    # for a true validation_only input, before runner assignment.
+    assert_eq "  evidence:" "$(awk '/^jobs:/ { jobs = 1; next } jobs && /^[^ ]/ { exit } jobs && /^  [^ #]/ { print }' "$WORKFLOW")" \
+        "S81: evidence is the only job"
+    assert_contains "$(cat "$WORKFLOW")" $'\njobs:\n  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120\n    if: ${{ !inputs.validation_only }}\n    defaults:\n' \
+        "S81: the job-level validation_only condition follows the 120-minute setting in the evidence job header"
+    assert_eq $'      validation_only:\n    if: ${{ !inputs.validation_only }}' "$(grep -F -- 'validation_only' "$WORKFLOW")" \
+        "S81: only the input and the one job-level condition name validation_only"
     assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
         "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S81: the step list stays"
     assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
