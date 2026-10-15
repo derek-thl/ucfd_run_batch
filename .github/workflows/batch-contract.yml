@@ -52,7 +52,7 @@ jobs:
   contract-tests:
     name: v4 batch-runner contract tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 18
 
     steps:
       - name: Check out the repository
@@ -76,6 +76,2067 @@ jobs:
             bash -n "$script"
             echo "syntax OK: $script"
           done < <(find tests -type f -name '*.sh' | sort)
+
+      - name: Provision the M3 VTU reader dependencies
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          # ---- M3 VTU provision: begin ----
+          # The fixed provision of the pinned VTU reader (Issue #80, admission 6160693923
+          # of dependency addendum 6158946927, Sections 2 to 6, and Owner decision
+          # 6160428682). This block is byte-identical in batch-contract.yml and in
+          # openfoam-evidence.yml, so the manifest and the provision code have one
+          # SHA-256 in both workflows. The readback checks that SHA-256.
+          #
+          # vp_provision [<latest-end>] makes one fresh task root of this user,
+          # RUNNER_TEMP/m3-vtu-deps.XXXXXXXX, and runs the three fixed vectors of the
+          # addendum, Section 4: the standard-library downloader of the thirteen exact
+          # HTTPS artifacts with the ZIP, METADATA, tag, and closure checks; the offline
+          # hash-required target install with the verified pip wheel; and the installed
+          # closure and native import check. <latest-end> is an absolute time in seconds
+          # by which the provision must end. The provision writes only below its task
+          # root, the validated root and the result in GITHUB_ENV, and no system, user,
+          # repository, Case, or DOE Batch CSV path. It uses no privilege, system
+          # package, index, resolver, source build, mirror, proxy, retry, or fallback.
+          #
+          # Results: PROVISION_AVAILABLE only when all three operations PASS, each
+          # process group stopped, the archives and the installer data are removed, and
+          # the receipt is complete. Wrong bytes or SHA-256, an invalid lock, an
+          # unexpected distribution or requirement, and an unsafe layout are FAIL. No
+          # time, a missing interpreter or library, an unsupported layout, a limit, a
+          # warning, and an incomplete record are NOT_VERIFIED. No provision time before
+          # any work is NOT_ATTEMPTED. Each record in records/ holds at most 65536 bytes.
+          # The task-size value is a phase checkpoint, not a continuous disk quota.
+          VP_TOTAL_MS=90000
+          VP_FETCH_MS=30000
+          VP_INSTALL_MS=35000
+          VP_VERIFY_MS=10000
+          VP_RESERVE_MS=15000
+          VP_KILL_GRACE_MS=5000
+          VP_ARCHIVE_LIMIT=154218283
+          VP_EXPANDED_LIMIT=1073741824
+          VP_TASK_LIMIT=3221225472
+          VP_AS_LIMIT=4294967296
+          VP_CPU_SECONDS=60
+          VP_TEXT_LIMIT=65536
+          VP_PYTHON=/usr/bin/python3.12
+          VP_MARK_BEGIN='# ---- M3 VTU provision: begin ----'
+          VP_MARK_END='# ---- M3 VTU provision: end ----'
+
+          # vp_now_ms - the wall clock in milliseconds.
+          vp_now_ms() {
+              local t="${EPOCHREALTIME//[!0-9]/}"
+              printf '%s\n' "$(( 10#$t / 1000 ))"
+          }
+
+          # vp_text <text> [<limit>] - one line of at most <limit> (300) characters,
+          # with no tab.
+          vp_text() {
+              local text="${1//[$'\t\r\n']/ }"
+              printf '%s\n' "${text:0:${2:-300}}"
+          }
+
+          # vp_block_sha - the SHA-256 of this block in the running script, from the
+          # begin marker line through the end marker line and its line end. Each marker
+          # line must be in the script once.
+          vp_block_sha() {
+              local script="${BASH_SOURCE[0]}" text
+              [[ -f "$script" && -r "$script" ]] || return 1
+              [[ "$(grep -cx -F -- "$VP_MARK_BEGIN" "$script") $(grep -cx -F -- "$VP_MARK_END" "$script")" == "1 1" ]] || return 1
+              text="$(awk -v begin="$VP_MARK_BEGIN" -v end="$VP_MARK_END" '
+                  $0 == begin { inside = 1 }
+                  inside { print }
+                  inside && $0 == end { exit }' "$script")" || return 1
+              printf '%s\n' "$text" | sha256sum | cut -d ' ' -f 1
+          }
+
+          # vp_group_members <group> - print the PID of each live process in one process
+          # group. Every /proc/<pid>/stat file is readable for every user, so the check
+          # does not depend on the permission to signal. A zombie has stopped. Returns 1
+          # when the stat file of a listed process cannot be read.
+          vp_group_members() {
+              local file line rest state
+              for file in /proc/[0-9]*/stat; do
+                  if ! { read -r line < "$file"; } 2>/dev/null; then
+                      [[ -e "$file" ]] && return 1
+                      continue
+                  fi
+                  [[ "$line" == *" $1 "* ]] || continue
+                  rest="${line##*") "}"
+                  state="${rest%% *}"
+                  rest="${rest#* }"
+                  rest="${rest#* }"
+                  if [[ "${rest%% *}" == "$1" && "$state" != Z ]]; then
+                      printf '%s\n' "${file:6:-5}"
+                  fi
+              done
+              return 0
+          }
+
+          # vp_group_empty <group> - status 0 only for a complete check with no live
+          # process in the group.
+          vp_group_empty() {
+              local members
+              members="$(vp_group_members "$1")" || return 1
+              [[ -z "$members" ]]
+          }
+
+          # vp_stop_group <group> <end-ms> - stop each process that is still in the
+          # group after its command returned. The processes get SIGTERM, and SIGKILL one
+          # second before <end-ms> or VP_KILL_GRACE_MS later, whichever is first. The
+          # stop and its check end by <end-ms>. A group ID below 2 is refused. Sets
+          # VP_STOP to EMPTY, STOPPED, or NOT_STOPPED, and returns 1 for NOT_STOPPED.
+          vp_stop_group() {
+              local group="$1" end="$2" kill_at now members=""
+              VP_STOP=EMPTY
+              if [[ ! "$group" =~ ^[1-9][0-9]*$ ]] || (( group < 2 )); then
+                  VP_STOP=NOT_STOPPED
+                  return 1
+              fi
+              vp_group_empty "$group" && return 0
+              VP_STOP=STOPPED
+              now="$(vp_now_ms)"
+              kill_at=$(( end - 1000 ))
+              if (( kill_at > now + VP_KILL_GRACE_MS )); then
+                  kill_at=$(( now + VP_KILL_GRACE_MS ))
+                  end=$(( kill_at + 1000 ))
+              fi
+              if (( now < kill_at )); then
+                  kill -TERM -- "-${group}" 2>/dev/null || true
+                  while (( $(vp_now_ms) < kill_at )); do
+                      vp_group_empty "$group" && return 0
+                      sleep 0.1
+                  done
+              fi
+              kill -KILL -- "-${group}" 2>/dev/null || true
+              while :; do
+                  if members="$(vp_group_members "$group")" && [[ -z "$members" ]]; then
+                      return 0
+                  fi
+                  (( $(vp_now_ms) + 150 < end )) || break
+                  sleep 0.1
+              done
+              VP_STOP=NOT_STOPPED
+              return 1
+          }
+
+          # vp_op <label> <phase-limit-ms> <command> [args...] - one bounded operation.
+          # The limit is the smaller of the phase limit and the time left before the
+          # provision end less VP_RESERVE_MS. Below one second, nothing starts. A fixed
+          # vector function (vp_*_vector) replaces the operation subshell with its own
+          # exact timeout vector; another command runs as timeout --signal=TERM
+          # --kill-after=5s <limit> <command>. Thus the subshell PID is the timeout PID
+          # and the group ID. Standard input is VP_OP_STDIN (empty: /dev/null), and the
+          # two logs are records/<label>.out and records/<label>.err. VP_OP_RECORD is
+          # the expanded vector for commands.tsv, with @SECONDS@ for the limit. Sets
+          # VP_OP_STATUS, VP_OP_OUTCOME (COMPLETED, FAILED, TIMEOUT, NOT_STOPPED, or
+          # NOT_STARTED), VP_OP_LIMIT_MS, VP_OP_SECONDS, VP_OP_GROUP, and VP_STOP.
+          vp_op() {
+              local label="$1" phase="$2" start limit record code=-
+              shift 2
+              start="$(vp_now_ms)"
+              limit=$(( VP_END_MS - VP_RESERVE_MS - start ))
+              (( phase < limit )) && limit="$phase"
+              (( limit > 0 )) || limit=0
+              printf -v VP_OP_SECONDS '%d.%03d' "$(( limit / 1000 ))" "$(( limit % 1000 ))"
+              VP_OP_LIMIT_MS="$limit" VP_OP_STATUS=124 VP_OP_OUTCOME=NOT_STARTED VP_OP_GROUP=- VP_STOP=EMPTY
+              record="${VP_OP_RECORD:-}"
+              if [[ -z "$record" ]]; then
+                  record="timeout --signal=TERM --kill-after=5s @SECONDS@s$(printf ' %q' "$@")"
+              fi
+              record="${record//@SECONDS@/${VP_OP_SECONDS}}"
+              if [[ -n "${VP_OP_STDIN:-}" ]]; then
+                  code="$(sha256sum <<< "$VP_OP_STDIN" | cut -d ' ' -f 1)"
+              fi
+              if (( limit >= 1000 )); then
+                  (
+                      if [[ -n "${VP_OP_STDIN:-}" ]]; then
+                          exec <<< "$VP_OP_STDIN"
+                      else
+                          exec < /dev/null
+                      fi
+                      exec > "${VP_ROOT}/records/${label}.out" 2> "${VP_ROOT}/records/${label}.err"
+                      if [[ "$(type -t "$1")" == function ]]; then
+                          "$@"
+                      fi
+                      exec timeout --signal=TERM --kill-after=5s "${VP_OP_SECONDS}s" "$@"
+                  ) &
+                  VP_OP_GROUP=$!
+                  wait "$VP_OP_GROUP" && VP_OP_STATUS=0 || VP_OP_STATUS=$?
+                  vp_stop_group "$VP_OP_GROUP" "$(( start + limit + VP_KILL_GRACE_MS + 1000 ))" || true
+                  case "$VP_OP_STATUS" in
+                      0) VP_OP_OUTCOME=COMPLETED ;;
+                      124|137) VP_OP_OUTCOME=TIMEOUT ;;
+                      *) VP_OP_OUTCOME=FAILED ;;
+                  esac
+                  [[ "$VP_STOP" != NOT_STOPPED ]] || VP_OP_OUTCOME=NOT_STOPPED
+              fi
+              [[ -s "${VP_ROOT}/records/commands.tsv" ]] ||
+                  printf 'seq\tlabel\tlimit_ms\tstart_ms\tend_ms\tstatus\toutcome\tgroup\tstop\tcode_sha256\tvector\n' \
+                      > "${VP_ROOT}/records/commands.tsv"
+              VP_OP_SEQ=$(( ${VP_OP_SEQ:-0} + 1 ))
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$VP_OP_SEQ" "$label" "$limit" "$start" "$(vp_now_ms)" \
+                  "$VP_OP_STATUS" "$VP_OP_OUTCOME" "$VP_OP_GROUP" "$VP_STOP" "$code" "$(vp_text "$record" 4000)" \
+                  >> "${VP_ROOT}/records/commands.tsv"
+              VP_OP_RECORD=""
+              return 0
+          }
+
+          # The three fixed vectors of the addendum, Section 4. Each one runs in the
+          # subshell of vp_op and replaces it with timeout.
+          vp_fetch_vector() {
+              local DEP_FETCH_SECONDS="$VP_OP_SECONDS"
+              exec \
+              timeout --signal=TERM --kill-after=5s "${DEP_FETCH_SECONDS}s" \
+                /usr/bin/python3.12 -I - "$M3_VTU_DEP_ROOT"
+          }
+
+          vp_install_vector() {
+              local DEP_INSTALL_SECONDS="$VP_OP_SECONDS"
+              PIP_CONFIG_FILE=/dev/null TMPDIR="${M3_VTU_DEP_ROOT}/tmp" \
+              exec \
+              timeout --signal=TERM --kill-after=5s "${DEP_INSTALL_SECONDS}s" \
+                /usr/bin/python3.12 -I - \
+                "${M3_VTU_DEP_ROOT}/installer/pip-25.2-py3-none-any.whl" \
+                --isolated --disable-pip-version-check install --no-index \
+                --find-links="${M3_VTU_DEP_ROOT}/wheels" --require-hashes \
+                --only-binary=:all: --no-cache-dir --no-compile \
+                --target="${M3_VTU_DEP_ROOT}/site" \
+                --requirement="${M3_VTU_DEP_ROOT}/requirements.lock"
+          }
+
+          vp_verify_vector() {
+              local DEP_VERIFY_SECONDS="$VP_OP_SECONDS"
+              exec \
+              timeout --signal=TERM --kill-after=5s "${DEP_VERIFY_SECONDS}s" \
+                /usr/bin/python3.12 -I - "${M3_VTU_DEP_ROOT}/site"
+          }
+
+          # vp_env_value <file> <key> - the one value of <key> in a complete env record
+          # (a regular file that ends with its WORK_FINISH line), or nothing.
+          vp_env_value() {
+              local text="" line value="" count=0 complete=$'(^|\n)WORK_FINISH=[0-9]+\n$'
+              [[ -f "$1" && ! -L "$1" ]] || return 0
+              IFS= read -r -d '' text < "$1" || true
+              [[ "$text" =~ $complete ]] || return 0
+              while IFS= read -r line; do
+                  if [[ "$line" == "$2="* ]]; then
+                      value="${line#*=}"
+                      count=$(( count + 1 ))
+                  fi
+              done <<< "$text"
+              (( count == 1 )) && printf '%s\n' "$value"
+              return 0
+          }
+
+          # vp_phase <label> <record> <prefix> - status 0 when the last operation
+          # completed with status 0 and its record has <prefix>_RESULT=PASS. Otherwise
+          # the first failure sets VP_RESULT and VP_REASON. Sets VP_<prefix>_RESULT.
+          vp_phase() {
+              local file="${VP_ROOT}/records/$2" result reason
+              result="$(vp_env_value "$file" "${3}_RESULT")"
+              reason="$(vp_env_value "$file" "${3}_REASON")"
+              if [[ "$VP_OP_OUTCOME" == COMPLETED && "$result" == PASS ]]; then
+                  printf -v "VP_${3}_RESULT" '%s' PASS
+                  return 0
+              fi
+              case "$VP_OP_OUTCOME" in
+                  NOT_STARTED) vp_fail NOT_VERIFIED "no time was left for the $1 operation (limit ${VP_OP_LIMIT_MS} ms)" ;;
+                  NOT_STOPPED) vp_fail NOT_VERIFIED "process group ${VP_OP_GROUP} of the $1 operation did not stop by its deadline" ;;
+                  TIMEOUT) vp_fail NOT_VERIFIED "the $1 operation did not complete within its ${VP_OP_LIMIT_MS} ms limit" ;;
+                  *)
+                      if [[ "$result" == FAIL || "$result" == NOT_VERIFIED ]]; then
+                          vp_fail "$result" "the $1 operation: ${reason:-no reason}"
+                      else
+                          vp_fail NOT_VERIFIED "the $1 operation ended with status ${VP_OP_STATUS} and no complete PASS record"
+                      fi ;;
+              esac
+              [[ "$result" == FAIL ]] || result=NOT_VERIFIED
+              printf -v "VP_${3}_RESULT" '%s' "$result"
+              return 1
+          }
+
+          # vp_fail <result> <reason> - the first failure sets the result and reason.
+          vp_fail() {
+              if [[ "$VP_RESULT" == PENDING ]]; then
+                  VP_RESULT="$1"
+                  VP_REASON="$(vp_text "$2")"
+              fi
+              return 0
+          }
+
+          # vp_finish - write records/result.env as the last record, when the task root
+          # exists, and publish the validated root and the result in GITHUB_ENV.
+          vp_finish() {
+              local LC_ALL=C text name var
+              [[ "$VP_RESULT" != PENDING ]] || vp_fail NOT_VERIFIED "the provision did not record a result"
+              if [[ -n "$VP_ROOT" && -d "${VP_ROOT}/records" && ! -L "${VP_ROOT}/records" ]]; then
+                  text="PROVISION_SCHEMA=m3-vtu-provision/1"$'\n'
+                  for name in RESULT REASON ROOT PARENT BLOCK_SHA256 MANIFEST_SHA256 LOCK_SHA256 REQUIRES_SHA256 \
+                              FETCH_CODE_SHA256 INSTALL_CODE_SHA256 VERIFY_CODE_SHA256 PYTHON PYTHON_SHA256 IMAGE \
+                              FETCH_RESULT INSTALL_RESULT VERIFY_RESULT CLEANUP START_MS END_MS; do
+                      var="VP_${name}"
+                      text+="PROVISION_${name}=$(vp_text "${!var:-UNAVAILABLE}")"$'\n'
+                  done
+                  text+="PROVISION_FINISH_MS=$(vp_now_ms)"$'\n'"WORK_FINISH=$(vp_now_ms)"$'\n'
+                  if (( ${#text} > VP_TEXT_LIMIT )) || ! printf '%s' "$text" > "${VP_ROOT}/records/result.env" 2> /dev/null; then
+                      VP_RESULT=NOT_VERIFIED VP_REASON="the provision receipt records/result.env cannot be written"
+                  fi
+              fi
+              if [[ -n "${GITHUB_ENV:-}" ]]; then
+                  {
+                      if [[ -n "$VP_ROOT" ]]; then
+                          printf 'M3_VTU_DEP_ROOT=%s\n' "$VP_ROOT"
+                      fi
+                      printf 'M3_VTU_PROVISION_RESULT=%s\n' "$VP_RESULT"
+                  } >> "$GITHUB_ENV" || { VP_RESULT=NOT_VERIFIED; VP_REASON="GITHUB_ENV cannot be written"; }
+              fi
+              # The step log shows the result and the bounded main records.
+              printf 'M3 VTU provision: %s: %s\n' "$VP_RESULT" "$VP_REASON"
+              if [[ -n "$VP_ROOT" ]]; then
+                  for name in result.env commands.tsv fetch.env install.env verify.env; do
+                      if [[ -f "${VP_ROOT}/records/${name}" && ! -L "${VP_ROOT}/records/${name}" ]]; then
+                          printf '== records/%s ==\n' "$name"
+                          head -c "$VP_TEXT_LIMIT" -- "${VP_ROOT}/records/${name}" || true
+                      fi
+                  done
+              fi
+              return 0
+          }
+
+          # vp_root_safe - status 0 when VP_ROOT is one task root of this user directly
+          # below RUNNER_TEMP, of mode 700, with no link.
+          vp_root_safe() {
+              [[ "${VP_ROOT%/*}" == "$VP_PARENT" && "${VP_ROOT##*/}" =~ ^m3-vtu-deps\.[A-Za-z0-9]{8}$ ]] &&
+                  [[ -d "$VP_ROOT" && ! -L "$VP_ROOT" && -O "$VP_ROOT" ]] &&
+                  [[ "$(stat -c %a -- "$VP_ROOT")" == 700 && "$(cd -P -- "$VP_ROOT" && pwd -P)" == "$VP_ROOT" ]]
+          }
+
+          # vp_write <name> <text> - write one task-root file and check its bytes.
+          vp_write() {
+              local LC_ALL=C
+              printf '%s' "$2" > "${VP_ROOT}/$1" && [[ "$(wc -c < "${VP_ROOT}/$1")" == "${#2}" ]]
+          }
+
+          # vp_provision [<latest-end>] - the complete provision; see the block header.
+          # Sets VP_RESULT, VP_REASON, and VP_ROOT, and returns 0.
+          vp_provision() {
+              local latest="${1:-}" name dir var
+              VP_RESULT=PENDING VP_REASON="" VP_ROOT="" M3_VTU_DEP_ROOT="" VP_OP_SEQ=0 VP_OP_RECORD=""
+              VP_FETCH_RESULT=NOT_RUN VP_INSTALL_RESULT=NOT_RUN VP_VERIFY_RESULT=NOT_RUN VP_CLEANUP=NOT_RUN
+              VP_PARENT="${RUNNER_TEMP:-}" VP_IMAGE="${ImageOS:-UNAVAILABLE} ${ImageVersion:-UNAVAILABLE}"
+              VP_START_MS="$(vp_now_ms)"
+              VP_END_MS=$(( VP_START_MS + VP_TOTAL_MS ))
+              if [[ -n "$latest" ]]; then
+                  if [[ ! "$latest" =~ ^-?(0|[1-9][0-9]*)$ ]]; then
+                      vp_fail NOT_ATTEMPTED "the latest provision end '${latest}' is not a whole number of seconds"
+                      vp_finish
+                      return 0
+                  fi
+                  (( latest * 1000 >= VP_END_MS )) || VP_END_MS=$(( latest * 1000 ))
+              fi
+              # The gate before any work and any network access.
+              if (( VP_END_MS - VP_RESERVE_MS - VP_START_MS < 1000 )); then
+                  vp_fail NOT_ATTEMPTED "no provision time: the end ${VP_END_MS} ms leaves less than one second after the ${VP_RESERVE_MS} ms stop and receipt reserve from the start ${VP_START_MS} ms"
+                  vp_finish
+                  return 0
+              fi
+              if (( EUID == 0 )); then
+                  vp_fail NOT_VERIFIED "the provision runs only as an unprivileged user"
+              elif [[ -z "$VP_PARENT" || "$VP_PARENT" != /* || -L "$VP_PARENT" || ! -d "$VP_PARENT" || ! -O "$VP_PARENT" ]] ||
+                      [[ "$(cd -P -- "$VP_PARENT" && pwd -P)" != "$VP_PARENT" ]]; then
+                  vp_fail NOT_VERIFIED "RUNNER_TEMP '${VP_PARENT}' is not an absolute directory of this user without links"
+              elif [[ ! -f "$VP_PYTHON" || -L "$VP_PYTHON" || ! -x "$VP_PYTHON" ]]; then
+                  vp_fail NOT_VERIFIED "the interpreter ${VP_PYTHON} is not an executable regular file"
+              elif ! VP_BLOCK_SHA256="$(vp_block_sha)" || [[ ! "$VP_BLOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+                  vp_fail NOT_VERIFIED "the provision block cannot be read once from the running script"
+              fi
+              if [[ "$VP_RESULT" != PENDING ]]; then
+                  vp_finish
+                  return 0
+              fi
+              VP_PYTHON_SHA256="$(sha256sum < "$VP_PYTHON" | cut -d ' ' -f 1)"
+
+              # One fresh task root, with its named directories and its fixed inputs.
+              VP_ROOT="$(mktemp -d "${VP_PARENT}/m3-vtu-deps.XXXXXXXX" 2> /dev/null)" || VP_ROOT=""
+              if [[ -z "$VP_ROOT" ]] || ! vp_root_safe || [[ -n "$(ls -A -- "$VP_ROOT")" ]]; then
+                  vp_fail NOT_VERIFIED "mktemp gave no new empty task root of this user below RUNNER_TEMP: '${VP_ROOT}'"
+                  VP_ROOT=""
+                  vp_finish
+                  return 0
+              fi
+              M3_VTU_DEP_ROOT="$VP_ROOT"
+              for dir in installer wheels site tmp records; do
+                  mkdir -m 700 -- "${VP_ROOT}/${dir}" || vp_fail NOT_VERIFIED "the task directory ${dir} cannot be made"
+              done
+              for name in manifest.tsv:VP_MANIFEST requirements.lock:VP_LOCK requires.tsv:VP_REQUIRES; do
+                  var="${name#*:}"
+                  vp_write "${name%%:*}" "${!var}" ||
+                      vp_fail NOT_VERIFIED "the task input ${name%%:*} cannot be written completely"
+              done
+              VP_MANIFEST_SHA256="$(sha256sum < "${VP_ROOT}/manifest.tsv" | cut -d ' ' -f 1)"
+              VP_LOCK_SHA256="$(sha256sum < "${VP_ROOT}/requirements.lock" | cut -d ' ' -f 1)"
+              VP_REQUIRES_SHA256="$(sha256sum < "${VP_ROOT}/requires.tsv" | cut -d ' ' -f 1)"
+              VP_FETCH_CODE_SHA256="$(sha256sum <<< "$VP_FETCH_PY" | cut -d ' ' -f 1)"
+              VP_INSTALL_CODE_SHA256="$(sha256sum <<< "$VP_INSTALL_PY" | cut -d ' ' -f 1)"
+              VP_VERIFY_CODE_SHA256="$(sha256sum <<< "$VP_VERIFY_PY" | cut -d ' ' -f 1)"
+              if [[ "$VP_RESULT" != PENDING ]]; then
+                  vp_finish
+                  return 0
+              fi
+
+              # The three fixed operations. A failed operation stops the provision.
+              VP_OP_STDIN="$VP_FETCH_PY"
+              VP_OP_RECORD="timeout --signal=TERM --kill-after=5s @SECONDS@s /usr/bin/python3.12 -I - $(printf '%q' "$VP_ROOT")"
+              vp_op fetch "$VP_FETCH_MS" vp_fetch_vector
+              if vp_phase fetch fetch.env FETCH; then
+                  VP_OP_STDIN="$VP_INSTALL_PY"
+                  VP_OP_RECORD="PIP_CONFIG_FILE=/dev/null TMPDIR=$(printf '%q' "${VP_ROOT}/tmp") timeout --signal=TERM --kill-after=5s @SECONDS@s /usr/bin/python3.12 -I -$(printf ' %q' "${VP_ROOT}/installer/pip-25.2-py3-none-any.whl" --isolated --disable-pip-version-check install --no-index "--find-links=${VP_ROOT}/wheels" --require-hashes --only-binary=:all: --no-cache-dir --no-compile "--target=${VP_ROOT}/site" "--requirement=${VP_ROOT}/requirements.lock")"
+                  vp_op install "$VP_INSTALL_MS" vp_install_vector
+                  if vp_phase install install.env INSTALL; then
+                      VP_OP_STDIN="$VP_VERIFY_PY"
+                      VP_OP_RECORD="timeout --signal=TERM --kill-after=5s @SECONDS@s /usr/bin/python3.12 -I - $(printf '%q' "${VP_ROOT}/site")"
+                      vp_op verify "$VP_VERIFY_MS" vp_verify_vector
+                      vp_phase verify verify.env VERIFY || true
+                  fi
+              fi
+              VP_OP_STDIN=""
+
+              # The cleanup: only after the records exist and each group stopped, and
+              # only the archives and the installer data of this validated root. The
+              # site stays for its consumer. A failed provision keeps everything.
+              if [[ "$VP_RESULT" == PENDING ]]; then
+                  VP_CLEANUP=REMOVED
+                  if vp_root_safe; then
+                      for dir in wheels installer tmp; do
+                          { [[ -d "${VP_ROOT}/${dir}" && ! -L "${VP_ROOT}/${dir}" ]] && rm -rf -- "${VP_ROOT:?}/${dir}" &&
+                              mkdir -m 700 -- "${VP_ROOT}/${dir}"; } || VP_CLEANUP=FAILED
+                      done
+                  else
+                      VP_CLEANUP=FAILED
+                  fi
+                  [[ "$VP_CLEANUP" == REMOVED ]] ||
+                      vp_fail NOT_VERIFIED "the verified archives and the installer data cannot be removed from the task root"
+              fi
+              vp_fail PROVISION_AVAILABLE "the thirteen fixed artifacts are verified, the locked closure is installed in the task site, and the native VTK 9.5.2 consumer imports from it"
+              vp_finish
+              return 0
+          }
+
+          # The fixed inputs: the thirteen artifact rows of addendum Section 2, the exact
+          # runtime lock of Section 4, and the mandatory default requirements of the
+          # exact embedded core metadata.
+          IFS= read -r -d '' VP_MANIFEST <<'VP_MANIFEST' || true
+          role	distribution	version	file	url	bytes	sha256	metadata_bytes	metadata_sha256
+          runtime	vtk	9.5.2	vtk-9.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	https://files.pythonhosted.org/packages/c5/6c/e5544c77b568bfbcc3592fb5e23a5dee8e84df9ee316230509362fb6d432/vtk-9.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	112292112	454711c51038824ddc75f955e1064c4e214b452c2e67083f01a8b43fc0ed62cb	5560	94f35aa687ac84fb560902a2d5bcc2d38d8ab00f3bef2a18295014d808d5ef48
+          runtime	matplotlib	3.10.7	matplotlib-3.10.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	https://files.pythonhosted.org/packages/7d/18/95ae2e242d4a5c98bd6e90e36e128d71cf1c7e39b0874feaed3ef782e789/matplotlib-3.10.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	8696996	d5f256d49fea31f40f166a5e3131235a5d2f4b7f44520b1cf0baf1ce568ccff0	11264	fd8befb2181fe3d11f6477c359d8f452b4fbc90f6969a6893e09046d935e1677
+          runtime	contourpy	1.3.3	contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl	https://files.pythonhosted.org/packages/cc/8f/ec6289987824b29529d0dfda0d74a07cec60e54b9c92f3c9da4c0ac732de/contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl	362601	4d00e655fcef08aba35ec9610536bfe90267d7ab5ba944f7032549c55a146da1	5461	c43cef86baef09cff9c77975e578fa8cca0c9454df40dc176938b499a63de54a
+          runtime	cycler	0.12.1	cycler-0.12.1-py3-none-any.whl	https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl	8321	85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30	3779	23289e19b76f1e01394227696e6af2b6cd1ce79e89731209bf9195148b18ed36
+          runtime	fonttools	4.60.1	fonttools-4.60.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl	https://files.pythonhosted.org/packages/c0/ca/4bb48a26ed95a1e7eba175535fe5805887682140ee0a0d10a88e1de84208/fonttools-4.60.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl	4923716	8177ec9676ea6e1793c8a084a90b65a9f778771998eb919d05db6d4b1c0b114c	112334	0886770f170aaa482341521aebc9dd59b7a8e073fecab90194e2eef9d999ca03
+          runtime	kiwisolver	1.4.9	kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	https://files.pythonhosted.org/packages/70/90/6d240beb0f24b74371762873e9b7f499f1e02166a2d9c5801f4dbf8fa12e/kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	1474756	f6008a4919fdbc0b0097089f67a1eb55d950ed7e90ce2cc3e640abadd2757a04	6260	cad34a37b5cb66cfa1b9676f33721037ae2d850b9b0c71377478a1d6bf0c7d40
+          runtime	numpy	2.3.4	numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl	https://files.pythonhosted.org/packages/f9/58/30a85127bfee6f108282107caf8e06a1f0cc997cb6b52cdee699276fcce4/numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl	16641271	4121c5beb58a7f9e6dfdee612cb24f4df5cd4db6e8261d7f4d7450a997a65d6a	62117	02d05671e1cb75fe80fda9cfd9e7210872ba35b5d54be6e295493ef22a8080a8
+          runtime	packaging	25.0	packaging-25.0-py3-none-any.whl	https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl	66469	29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484	3281	5b611a609c38fefc3d616bf45d20aec98fb7d53f245daca9e2c30fc85c7ac282
+          runtime	pillow	11.3.0	pillow-11.3.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	https://files.pythonhosted.org/packages/8d/33/e9200d2bd7ba00dc3ddb78df1198a6e80d7669cce6c2bdbeb2530a74ec58/pillow-11.3.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl	7644652	67172f2944ebba3d4a7b54f2e95c786a3a50c21b88456329314caaa28cda70f6	9023	d53d4d78f8a8efe182396711ef76840386d2ba4ccdad421f58cc00c3b3401f73
+          runtime	pyparsing	3.2.5	pyparsing-3.2.5-py3-none-any.whl	https://files.pythonhosted.org/packages/10/5e/1aa9a93198c6b64513c9d7752de7422c06402de6600a8767da1524f9570b/pyparsing-3.2.5-py3-none-any.whl	113890	e38a4f02064cf41fe6593d328d0512495ad1f3d8a91c4f73fc401b3079a59a5e	5030	cd543f26f0f59ac7b446f57cc91e8def7a3eb735fdd5e91c4e402b8725696eba
+          runtime	python-dateutil	2.9.0.post0	python_dateutil-2.9.0.post0-py2.py3-none-any.whl	https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl	229892	a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427	8354	a9d436da322be808332f98d88325998e87cb693a678a9969feb4cfad729a6e93
+          runtime	six	1.17.0	six-1.17.0-py2.py3-none-any.whl	https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl	11050	4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274	1658	562042078c2752549f6d8a7c86dbc5dd708088a7be6d80672ec7b07100b72468
+          installer	pip	25.2	pip-25.2-py3-none-any.whl	https://files.pythonhosted.org/packages/b7/3f/945ef7ab14dc4f9d7f40288d2df998d1837ee0888ec3659c813487572faa/pip-25.2-py3-none-any.whl	1752557	6d67a2b4e7f14d8b31b8b52648866fa717f45a1eb70e83002f4331d07e953717	4744	97a3ad14d71fd8914a38f24af5b31a1f9faeb05aea66a4af40d979d6d7ad229f
+          VP_MANIFEST
+          IFS= read -r -d '' VP_LOCK <<'VP_LOCK' || true
+          vtk==9.5.2 --hash=sha256:454711c51038824ddc75f955e1064c4e214b452c2e67083f01a8b43fc0ed62cb
+          matplotlib==3.10.7 --hash=sha256:d5f256d49fea31f40f166a5e3131235a5d2f4b7f44520b1cf0baf1ce568ccff0
+          contourpy==1.3.3 --hash=sha256:4d00e655fcef08aba35ec9610536bfe90267d7ab5ba944f7032549c55a146da1
+          cycler==0.12.1 --hash=sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30
+          fonttools==4.60.1 --hash=sha256:8177ec9676ea6e1793c8a084a90b65a9f778771998eb919d05db6d4b1c0b114c
+          kiwisolver==1.4.9 --hash=sha256:f6008a4919fdbc0b0097089f67a1eb55d950ed7e90ce2cc3e640abadd2757a04
+          numpy==2.3.4 --hash=sha256:4121c5beb58a7f9e6dfdee612cb24f4df5cd4db6e8261d7f4d7450a997a65d6a
+          packaging==25.0 --hash=sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484
+          pillow==11.3.0 --hash=sha256:67172f2944ebba3d4a7b54f2e95c786a3a50c21b88456329314caaa28cda70f6
+          pyparsing==3.2.5 --hash=sha256:e38a4f02064cf41fe6593d328d0512495ad1f3d8a91c4f73fc401b3079a59a5e
+          python-dateutil==2.9.0.post0 --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+          six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+          VP_LOCK
+          IFS= read -r -d '' VP_REQUIRES <<'VP_REQUIRES' || true
+          declaring	requirement
+          vtk	matplotlib>=2.0.0
+          matplotlib	contourpy>=1.0.1
+          matplotlib	cycler>=0.10
+          matplotlib	fonttools>=4.22.0
+          matplotlib	kiwisolver>=1.3.1
+          matplotlib	numpy>=1.23
+          matplotlib	packaging>=20.0
+          matplotlib	pillow>=8
+          matplotlib	pyparsing>=3
+          matplotlib	python-dateutil>=2.7
+          contourpy	numpy>=1.25
+          python-dateutil	six >=1.5
+          VP_REQUIRES
+
+          # The fixed fetch program: the exact standard input of its vector.
+          IFS= read -r -d '' VP_FETCH_PY <<'VP_FETCH_PY' || true
+          import csv, email.parser, hashlib, io, os, re, resource, signal, stat, sys, sysconfig, threading, time
+
+          ARCHIVE_LIMIT = 154218283
+          EXPANDED_LIMIT = 1073741824
+          TASK_LIMIT = 3221225472
+          AS_LIMIT = 4294967296
+          CPU_SECONDS = 60
+          TEXT_LIMIT = 65536
+          MANIFEST_FIELDS = ["role", "distribution", "version", "file", "url", "bytes", "sha256", "metadata_bytes", "metadata_sha256"]
+          URL_RE = re.compile(r"https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/([A-Za-z0-9_.+-]+\.whl)")
+
+
+          class Gap(Exception):
+              """A provision gap with its result (FAIL or NOT_VERIFIED) and its reason."""
+
+              def __init__(self, result, reason):
+                  super().__init__(reason)
+                  self.result, self.reason = result, reason
+
+
+          class Row:
+              def __init__(self, cells):
+                  (self.role, self.name, self.version, self.file, self.url, size, self.sha,
+                   meta_size, self.meta_sha) = cells
+                  self.bytes, self.meta_bytes = int(size), int(meta_size)
+
+
+          def one_line(text, limit=300):
+              text = re.sub(r"[\t\r\n]+", " ", str(text))
+              return text[:limit] if text else "-"
+
+
+          def set_limits(file_limit):
+              """The approved process limits, set before any package code runs."""
+              for name, value in (("RLIMIT_AS", AS_LIMIT), ("RLIMIT_CPU", CPU_SECONDS), ("RLIMIT_CORE", 0),
+                                  ("RLIMIT_FSIZE", file_limit)):
+                  resource.setrlimit(getattr(resource, name), (value, value))
+              signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+
+
+          def bound_streams():
+              """Replace standard output and error with pipes. One thread for each pipe
+              copies at most TEXT_LIMIT bytes to the original file and counts the rest,
+              so a writer never blocks and no log grows past the limit."""
+              sys.stdout.flush()
+              sys.stderr.flush()
+              state = {}
+              for fd, name in ((1, "out"), (2, "err")):
+                  target = os.dup(fd)
+                  read_end, write_end = os.pipe()
+                  os.dup2(write_end, fd)
+                  os.close(write_end)
+                  counts = [0, 0]
+
+                  def drain(read_end=read_end, target=target, counts=counts):
+                      while True:
+                          try:
+                              chunk = os.read(read_end, 65536)
+                          except OSError:
+                              break
+                          if not chunk:
+                              break
+                          keep = memoryview(chunk)[:max(TEXT_LIMIT - counts[0], 0)]
+                          counts[0] += len(keep)
+                          counts[1] += len(chunk) - len(keep)
+                          while keep:
+                              try:
+                                  keep = keep[os.write(target, keep):]
+                              except OSError:
+                                  break
+                      os.close(read_end)
+
+                  thread = threading.Thread(target=drain, daemon=True)
+                  thread.start()
+                  state[name] = (fd, target, counts, thread)
+              return state
+
+
+          def close_streams(state):
+              """Flush, give the original files back, and wait at most 2 seconds for each
+              drain. Returns the kept and dropped byte counts of the two streams."""
+              for stream in (sys.stdout, sys.stderr):
+                  try:
+                      stream.flush()
+                  except Exception:
+                      pass
+              result = {}
+              for name in ("out", "err"):
+                  fd, target, counts, thread = state[name]
+                  os.dup2(target, fd)
+                  os.close(target)
+                  thread.join(2.0)
+                  if thread.is_alive():
+                      counts[1] += 1
+                  result[name + "_kept"], result[name + "_dropped"] = counts
+              return result
+
+
+          def read_text(path, limit=TEXT_LIMIT):
+              st = os.lstat(path)
+              if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                  raise Gap("NOT_VERIFIED", "%s is not a regular file of at most %d bytes" % (os.path.basename(path), limit))
+              with open(path, "rb") as f:
+                  data = f.read(limit + 1)
+              try:
+                  return data.decode("utf-8")
+              except UnicodeDecodeError:
+                  raise Gap("FAIL", "%s is not UTF-8 text" % os.path.basename(path))
+
+
+          def write_record(path, text):
+              """Write one record, with at most TEXT_LIMIT bytes, through no link."""
+              data = text.encode("utf-8", "replace")
+              if len(data) > TEXT_LIMIT:
+                  raise Gap("NOT_VERIFIED", "%s would hold %d bytes, above the %d-byte record limit"
+                            % (os.path.basename(path), len(data), TEXT_LIMIT))
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+              try:
+                  view = memoryview(data)
+                  while view:
+                      view = view[os.write(fd, view):]
+              finally:
+                  os.close(fd)
+
+
+          def write_env(path, values):
+              """KEY=value lines in insertion order, then WORK_FINISH as the last line."""
+              values.pop("WORK_FINISH", None)
+              lines = ["%s=%s" % (key, one_line(value, 4000)) for key, value in values.items()]
+              lines.append("WORK_FINISH=%d" % int(time.time() * 1000))
+              write_record(path, "\n".join(lines) + "\n")
+
+
+          def tsv(rows):
+              return "".join("\t".join(one_line(cell, 1000) for cell in row) + "\n" for row in rows)
+
+
+          def check_root(root, empty=()):
+              """The task root: an absolute owned directory of mode 700 with no link,
+              and the five named directories. The directories in <empty> are empty."""
+              if not os.path.isabs(root) or os.path.realpath(root) != root:
+                  raise Gap("NOT_VERIFIED", "the task root %s is not an absolute path without links" % root)
+              st = os.lstat(root)
+              if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                  raise Gap("NOT_VERIFIED", "the task root %s is not a directory of this user" % root)
+              if stat.S_IMODE(st.st_mode) != 0o700:
+                  raise Gap("NOT_VERIFIED", "the task root has mode %o, not mode 700" % stat.S_IMODE(st.st_mode))
+              for sub in ("installer", "wheels", "site", "tmp", "records"):
+                  path = os.path.join(root, sub)
+                  try:
+                      st = os.lstat(path)
+                  except OSError:
+                      raise Gap("NOT_VERIFIED", "the task root has no %s directory" % sub)
+                  if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not a directory of this user" % sub)
+                  if sub in empty and os.listdir(path):
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not empty" % sub)
+
+
+          def task_bytes(root):
+              """The regular-file bytes below the task root, without following links."""
+              total = 0
+              for base, dirs, files in os.walk(root):
+                  for name in files:
+                      try:
+                          st = os.lstat(os.path.join(base, name))
+                      except OSError:
+                          continue
+                      if stat.S_ISREG(st.st_mode):
+                          total += st.st_size
+              return total
+
+
+          def stdlib_paths():
+              paths = {sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib")}
+              paths.add(os.path.join(sysconfig.get_path("stdlib"), "lib-dynload"))
+              paths.add(os.path.join(sys.base_prefix, "lib", "python%d%d.zip" % sys.version_info[:2]))
+              return paths
+
+
+          def normal_name(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def stem(name, version):
+              return re.sub(r"[-_.]+", "_", name) + "-" + version
+
+
+          def read_manifest(root):
+              text = read_text(os.path.join(root, "manifest.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "\t".join(MANIFEST_FIELDS):
+                  raise Gap("FAIL", "manifest.tsv does not have the fixed header and line ends")
+              rows, names, total = [], set(), 0
+              for number, line in enumerate(lines[1:-1], 2):
+                  cells = line.split("\t")
+                  if len(cells) != len(MANIFEST_FIELDS):
+                      raise Gap("FAIL", "manifest.tsv line %d does not have %d fields" % (number, len(MANIFEST_FIELDS)))
+                  role, name, version, file, url, size, sha, meta_size, meta_sha = cells
+                  match = URL_RE.fullmatch(url)
+                  if role not in ("runtime", "installer") or not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", name) \
+                          or not re.fullmatch(r"[0-9][0-9A-Za-z.+!]*", version) \
+                          or not re.fullmatch(r"[1-9][0-9]*", size) or not re.fullmatch(r"[1-9][0-9]*", meta_size) \
+                          or not re.fullmatch(r"[0-9a-f]{64}", sha) or not re.fullmatch(r"[0-9a-f]{64}", meta_sha):
+                      raise Gap("FAIL", "manifest.tsv line %d is not a valid artifact row" % number)
+                  if not match or match.group(1) != file or not file.startswith(stem(name, version) + "-"):
+                      raise Gap("FAIL", "manifest.tsv line %d: the URL %s is not the exact files.pythonhosted.org URL of %s"
+                                % (number, url, file))
+                  if name in names:
+                      raise Gap("FAIL", "manifest.tsv names %s twice" % name)
+                  names.add(name)
+                  rows.append(Row(cells))
+                  total += int(size)
+              installers = [row for row in rows if row.role == "installer"]
+              if len(installers) != 1 or installers[0].name != "pip" or not any(row.role == "runtime" for row in rows):
+                  raise Gap("FAIL", "manifest.tsv must name one pip installer and at least one runtime artifact")
+              if total > ARCHIVE_LIMIT:
+                  raise Gap("FAIL", "the manifest archives have %d bytes, above the %d-byte limit" % (total, ARCHIVE_LIMIT))
+              return rows
+
+
+          def read_requires(root, rows):
+              text = read_text(os.path.join(root, "requires.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "declaring\trequirement":
+                  raise Gap("FAIL", "requires.tsv does not have the fixed header and line ends")
+              runtime = {row.name for row in rows if row.role == "runtime"}
+              requires = {}
+              for number, line in enumerate(lines[1:-1], 2):
+                  declaring, sep, requirement = line.partition("\t")
+                  if not sep or declaring not in runtime or not requirement or "\t" in requirement:
+                      raise Gap("FAIL", "requires.tsv line %d is not a requirement of a runtime distribution" % number)
+                  requires.setdefault(declaring, []).append(requirement)
+              return requires
+
+
+          def release(version):
+              """The release tuple of a simple version, with an optional .postN."""
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)(?:\.post[0-9]+)?", version)
+              if not match:
+                  raise Gap("NOT_VERIFIED", "the version %s has an unsupported form" % version)
+              return tuple(int(part) for part in match.group(1).split("."))
+
+
+          def satisfies(version, specifier):
+              """Status of <version> for a comma-separated specifier of the forms >=,
+              >, <=, <, ==, and !=, with an optional .* on == and !=."""
+              for clause in specifier.split(","):
+                  clause = clause.strip()
+                  match = re.fullmatch(r"(>=|<=|==|!=|>|<)\s*([0-9][0-9.]*?)(\.\*)?", clause)
+                  if not match or (match.group(3) and match.group(1) not in ("==", "!=")):
+                      raise Gap("NOT_VERIFIED", "the version specifier %s has an unsupported form" % clause)
+                  op, want, wild = match.groups()
+                  have, want = release(version), release(want)
+                  if wild:
+                      equal = have[:len(want)] == want
+                      ok = equal if op == "==" else not equal
+                  else:
+                      width = max(len(have), len(want))
+                      a, b = have + (0,) * (width - len(have)), want + (0,) * (width - len(want))
+                      ok = {">=": a >= b, "<=": a <= b, "==": a == b, "!=": a != b, ">": a > b, "<": a < b}[op]
+                  if not ok:
+                      return False
+              return True
+
+
+          def mandatory_requirements(meta):
+              """The Requires-Dist values of the METADATA bytes that have no extra
+              marker. A value with another marker is not supported."""
+              headers = email.parser.BytesHeaderParser().parsebytes(meta)
+              result = []
+              for value in headers.get_all("Requires-Dist") or []:
+                  value = " ".join(str(value).split())
+                  requirement, sep, marker = value.partition(";")
+                  if sep and re.search(r"\bextra\s*==", marker):
+                      continue
+                  if sep:
+                      raise Gap("NOT_VERIFIED", "the requirement %s has an environment marker, which is not supported" % value)
+                  result.append(value)
+              return headers, result
+
+
+          def check_requirements(name, found, requires, rows):
+              """The mandatory requirements of one distribution are exactly the approved
+              ones, and the selected versions satisfy them."""
+              approved = requires.get(name, [])
+              if sorted(found) != sorted(approved):
+                  raise Gap("FAIL", "the mandatory requirements of %s [%s] are not the approved requirements [%s]"
+                            % (name, "; ".join(found), "; ".join(approved)))
+              versions = {normal_name(row.name): row.version for row in rows if row.role == "runtime"}
+              for requirement in found:
+                  match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)", requirement)
+                  if not match or normal_name(match.group(1)) not in versions:
+                      raise Gap("FAIL", "the requirement %s of %s is not a selected distribution" % (requirement, name))
+                  if match.group(2) and not satisfies(versions[normal_name(match.group(1))], match.group(2)):
+                      raise Gap("FAIL", "the requirement %s of %s is not satisfied by %s %s"
+                                % (requirement, name, match.group(1), versions[normal_name(match.group(1))]))
+
+
+          def file_sha(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1048576), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def finish(env_path, counts, result_key, reason_key, status):
+              """Add the stream counts to the env record. A stream past its limit, or
+              text on standard error after a PASS, is NOT_VERIFIED."""
+              values = {}
+              try:
+                  for line in read_text(env_path).splitlines():
+                      key, sep, value = line.partition("=")
+                      if sep:
+                          values[key] = value
+              except (OSError, Gap):
+                  return status or 2
+              values.update({"STDOUT_KEPT": counts["out_kept"], "STDOUT_DROPPED": counts["out_dropped"],
+                             "STDERR_KEPT": counts["err_kept"], "STDERR_DROPPED": counts["err_dropped"]})
+              if counts["out_dropped"] or counts["err_dropped"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the output passed the %d-byte stream limit: %d and %d bytes were not kept" % (
+                      TEXT_LIMIT, counts["out_dropped"], counts["err_dropped"])
+                  status = 2
+              elif values.get(result_key) == "PASS" and counts["err_kept"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the operation wrote %d bytes of unexplained standard-error text" % counts["err_kept"]
+                  status = 2
+              try:
+                  write_env(env_path, values)
+              except (OSError, Gap):
+                  return 2
+              return status
+
+
+          import http.client, platform, ssl, urllib.parse, zipfile
+
+          HOST = "files.pythonhosted.org"
+          HTTPSConnection = http.client.HTTPSConnection
+          TLS_CONTEXT = []
+
+
+          def tls_context():
+              """One default TLS context with certificate and host-name verification."""
+              if not TLS_CONTEXT:
+                  TLS_CONTEXT.append(ssl.create_default_context())
+              return TLS_CONTEXT[0]
+
+
+          def interpreter_facts():
+              glibc = os.confstr("CS_GNU_LIBC_VERSION") if hasattr(os, "confstr") else ""
+              return {"implementation": sys.implementation.name, "version": platform.python_version(),
+                      "build": " ".join(platform.python_build()), "soabi": sysconfig.get_config_var("SOABI") or "",
+                      "machine": platform.machine(), "platform": sys.platform, "glibc": glibc or "",
+                      "executable": os.path.realpath(sys.executable)}
+
+
+          def glibc_version(facts):
+              match = re.fullmatch(r"glibc ([0-9]+)\.([0-9]+)", facts.get("glibc", ""))
+              return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+          def check_interpreter(facts):
+              """The approved consumer environment: CPython 3.12, the standard cp312 ABI,
+              Linux x86_64, glibc 2.28 or later, and the fixed /usr/bin/python3.12."""
+              wanted = {"implementation": "cpython", "soabi": "cpython-312-x86_64-linux-gnu", "machine": "x86_64",
+                        "platform": "linux", "executable": "/usr/bin/python3.12"}
+              for key, value in wanted.items():
+                  if facts.get(key) != value:
+                      raise Gap("NOT_VERIFIED", "the interpreter %s is %s, not %s" % (key, facts.get(key), value))
+              if not facts.get("version", "").startswith("3.12."):
+                  raise Gap("NOT_VERIFIED", "the interpreter version is %s, not CPython 3.12" % facts.get("version"))
+              if (glibc_version(facts) or (0, 0)) < (2, 28):
+                  raise Gap("NOT_VERIFIED", "the interpreter C library is %s, not glibc 2.28 or later" % facts.get("glibc"))
+
+
+          def check_lock(root, rows):
+              expected = "".join("%s==%s --hash=sha256:%s\n" % (row.name, row.version, row.sha)
+                                 for row in rows if row.role == "runtime")
+              if read_text(os.path.join(root, "requirements.lock")) != expected:
+                  raise Gap("FAIL", "requirements.lock is not the hash lock of the manifest runtime rows")
+
+
+          def fetch_one(root, row, out):
+              """One exact HTTPS GET with TLS verification, no redirect, no proxy, and no
+              retry. The body goes to a .part file with an active byte cap, and the file
+              gets its name only after the registered bytes and SHA-256 match."""
+              final = os.path.join(root, "installer" if row.role == "installer" else "wheels", row.file)
+              part = final + ".part"
+              record = [row.role, row.name, row.version, row.file, row.url, row.bytes, row.sha, "-", "-", "-", "NOT_VERIFIED", "-"]
+              out.append(record)
+              connection = None
+              try:
+                  try:
+                      connection = HTTPSConnection(HOST, 443, timeout=20, context=tls_context())
+                      connection.request("GET", urllib.parse.urlsplit(row.url).path,
+                                         headers={"User-Agent": "ucfd-m3-vtu-provision/1", "Accept-Encoding": "identity"})
+                      response = connection.getresponse()
+                      record[9] = response.status
+                      if response.status != 200:
+                          raise Gap("NOT_VERIFIED", "%s: HTTP status %s; no redirect, retry, or other source is used"
+                                    % (row.file, response.status))
+                      encoding = response.getheader("Content-Encoding")
+                      if encoding not in (None, "", "identity"):
+                          raise Gap("NOT_VERIFIED", "%s: the response has Content-Encoding %s" % (row.file, encoding))
+                      length = response.getheader("Content-Length")
+                      if length is not None and length.strip().isdigit() and int(length) > row.bytes:
+                          raise Gap("FAIL", "%s: the response declares %s bytes, longer than the registered %d bytes"
+                                    % (row.file, length.strip(), row.bytes))
+                      digest, size = hashlib.sha256(), 0
+                      fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                      try:
+                          while True:
+                              chunk = response.read(min(1048576, row.bytes + 1 - size))
+                              if not chunk:
+                                  break
+                              size += len(chunk)
+                              if size > row.bytes:
+                                  raise Gap("FAIL", "%s: the body is longer than the registered %d bytes" % (row.file, row.bytes))
+                              digest.update(chunk)
+                              view = memoryview(chunk)
+                              while view:
+                                  view = view[os.write(fd, view):]
+                      finally:
+                          os.close(fd)
+                  except (OSError, http.client.HTTPException, ssl.SSLError) as error:
+                      raise Gap("NOT_VERIFIED", "%s: the network request failed: %s: %s" % (row.file, type(error).__name__, error))
+                  record[7], record[8] = size, digest.hexdigest()
+                  if size < row.bytes:
+                      raise Gap("NOT_VERIFIED", "%s: the body ended after %d of the registered %d bytes" % (row.file, size, row.bytes))
+                  if record[8] != row.sha:
+                      raise Gap("FAIL", "%s: SHA-256 %s differs from the registered SHA-256 %s" % (row.file, record[8], row.sha))
+                  os.rename(part, final)
+                  record[10] = "PASS"
+              except Gap as gap:
+                  record[10], record[11] = gap.result, gap.reason
+                  try:
+                      os.unlink(part)
+                  except OSError:
+                      pass
+                  raise
+              finally:
+                  if connection is not None:
+                      connection.close()
+
+
+          def member_name_safe(name):
+              if not name or "\x00" in name or "\\" in name or name.startswith("/") or re.match(r"[A-Za-z]:", name):
+                  return False
+              parts = name[:-1].split("/") if name.endswith("/") else name.split("/")
+              return all(part not in ("", ".", "..") for part in parts)
+
+
+          def file_tags(file):
+              parts = file[:-len(".whl")].split("-")
+              if len(parts) not in (5, 6):
+                  raise Gap("NOT_VERIFIED", "%s does not have the wheel file-name tag form" % file)
+              pys, abis, plats = parts[-3].split("."), parts[-2].split("."), parts[-1].split(".")
+              return {"%s-%s-%s" % (p, a, s) for p in pys for a in abis for s in plats}
+
+
+          def tag_supported(tag, facts):
+              py, abi, plat = tag.split("-")
+              if py not in ("py3", "cp312") or abi not in ("none", "cp312"):
+                  return False
+              if plat == "any":
+                  return True
+              legacy = {"manylinux1_x86_64": (2, 5), "manylinux2010_x86_64": (2, 12), "manylinux2014_x86_64": (2, 17)}
+              match = re.fullmatch(r"manylinux_([0-9]+)_([0-9]+)_x86_64", plat)
+              need = legacy.get(plat) or ((int(match.group(1)), int(match.group(2))) if match else None)
+              return need is not None and glibc_version(facts) is not None and need <= glibc_version(facts)
+
+
+          def inspect_wheel(root, row, rows, requires, installed, out, facts):
+              """ZIP, METADATA, WHEEL, RECORD, closure, and installed-path checks of one
+              verified archive. Executes no archive content. Returns the declared
+              expanded bytes."""
+              path = os.path.join(root, "installer" if row.role == "installer" else "wheels", row.file)
+              record = [row.file, "-", "-", "-", "-", "-", "-", "NOT_VERIFIED", "-"]
+              out.append(record)
+              try:
+                  base = stem(row.name, row.version)
+                  info_dir, data_dir = base + ".dist-info/", base + ".data/"
+                  try:
+                      archive = zipfile.ZipFile(path)
+                  except (zipfile.BadZipFile, OSError) as error:
+                      raise Gap("FAIL", "%s is not a valid ZIP archive: %s" % (row.file, error))
+                  with archive:
+                      infos, names, expanded = archive.infolist(), set(), 0
+                      for info in infos:
+                          if not member_name_safe(info.filename):
+                              raise Gap("FAIL", "%s has the unsafe member name %r" % (row.file, info.filename))
+                          kind = stat.S_IFMT(info.external_attr >> 16)
+                          if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                              raise Gap("FAIL", "%s has the member %s, which is a link or a special file" % (row.file, info.filename))
+                          if info.filename in names:
+                              raise Gap("FAIL", "%s has the duplicate member %s" % (row.file, info.filename))
+                          if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or info.flag_bits & 0x1:
+                              raise Gap("NOT_VERIFIED", "%s has the member %s with an unsupported compression" % (row.file, info.filename))
+                          names.add(info.filename)
+                          expanded += info.file_size
+                      record[1], record[2] = len(infos), expanded
+                      infos_dirs = {name.split("/")[0] for name in names if name.split("/")[0].endswith(".dist-info")}
+                      if infos_dirs != {info_dir[:-1]} or not {info_dir + "METADATA", info_dir + "WHEEL", info_dir + "RECORD"} <= names:
+                          raise Gap("FAIL", "%s does not have the one dist-info directory %s with METADATA, WHEEL, and RECORD"
+                                    % (row.file, info_dir))
+                      meta = archive.read(info_dir + "METADATA")
+                      record[3], record[4] = len(meta), hashlib.sha256(meta).hexdigest()
+                      if record[3] != row.meta_bytes or record[4] != row.meta_sha:
+                          raise Gap("FAIL", "%s: the embedded METADATA (%d bytes, SHA-256 %s) is not the published core metadata"
+                                    % (row.file, record[3], record[4]))
+                      headers, found = mandatory_requirements(meta)
+                      if normal_name(headers.get("Name", "")) != normal_name(row.name) or headers.get("Version") != row.version:
+                          raise Gap("FAIL", "%s: the METADATA Name %s and Version %s are not %s %s"
+                                    % (row.file, headers.get("Name"), headers.get("Version"), row.name, row.version))
+                      wanted_python = headers.get("Requires-Python")
+                      if wanted_python and not satisfies(facts.get("version", "0"), wanted_python):
+                          raise Gap("NOT_VERIFIED", "%s requires Python %s" % (row.file, wanted_python))
+                      if row.role == "runtime":
+                          check_requirements(row.name, found, requires, rows)
+                      elif found:
+                          raise Gap("FAIL", "the installer %s has the mandatory requirements %s" % (row.file, "; ".join(found)))
+                      wheel = email.parser.BytesHeaderParser().parsebytes(archive.read(info_dir + "WHEEL"))
+                      tags = set(wheel.get_all("Tag") or [])
+                      if not str(wheel.get("Wheel-Version", "")).startswith("1.") or not tags or not tags <= file_tags(row.file):
+                          raise Gap("NOT_VERIFIED", "%s: the WHEEL version or tags %s do not match the file name"
+                                    % (row.file, " ".join(sorted(tags))))
+                      if not any(tag_supported(tag, facts) for tag in tags):
+                          raise Gap("NOT_VERIFIED", "%s: no tag of %s is supported by CPython 3.12 on Linux x86_64 with %s"
+                                    % (row.file, " ".join(sorted(tags)), facts.get("glibc")))
+                      record[5], record[6] = " ".join(sorted(tags)), "; ".join(found) or "-"
+                      listed = set()
+                      for cells in csv.reader(io.StringIO(archive.read(info_dir + "RECORD").decode("utf-8"))):
+                          if cells:
+                              listed.add(cells[0])
+                      files = {name for name in names if not name.endswith("/")}
+                      if files - {info_dir + "RECORD"} - listed or listed - files:
+                          raise Gap("FAIL", "%s: RECORD does not list exactly the archive files" % row.file)
+                      if row.role == "runtime":
+                          for name in sorted(files):
+                              target = name
+                              if name.startswith(data_dir):
+                                  scheme, _, rest = name[len(data_dir):].partition("/")
+                                  prefix = {"purelib": "", "platlib": "", "data": "", "scripts": "bin/", "headers": "include/"}.get(scheme)
+                                  if prefix is None or not rest:
+                                      raise Gap("NOT_VERIFIED", "%s has the unsupported install layout %s" % (row.file, name))
+                                  target = prefix + rest
+                              if installed.get(target, row.name) != row.name:
+                                  raise Gap("FAIL", "the installed path %s of %s and %s collide" % (target, installed[target], row.name))
+                              installed[target] = row.name
+                  record[7] = "PASS"
+                  return expanded
+              except Gap as gap:
+                  record[7], record[8] = gap.result, gap.reason
+                  raise
+
+
+          def run(root):
+              """The downloader and the archive checks. Writes fetch.tsv, wheels.tsv,
+              and fetch.env in records/. Returns 0 for PASS, 1 for FAIL, and 2 for
+              NOT_VERIFIED."""
+              values = {"FETCH_RESULT": "NOT_VERIFIED", "FETCH_REASON": "the downloader did not reach its end"}
+              fetched, inspected, result, reason = [], [], "PASS", "all archives have the registered bytes and SHA-256 and pass the archive checks"
+              try:
+                  check_root(root, empty=("installer", "wheels", "site"))
+                  values["TASK_BYTES_BEFORE"] = task_bytes(root)
+                  facts = interpreter_facts()
+                  values.update({"PYTHON_" + key.upper(): value for key, value in facts.items()})
+                  check_interpreter(facts)
+                  rows = read_manifest(root)
+                  check_lock(root, rows)
+                  requires = read_requires(root, rows)
+                  values["ARCHIVES"] = len(rows)
+                  values["ARCHIVE_BYTES"] = sum(row.bytes for row in rows)
+                  for row in rows:
+                      fetch_one(root, row, fetched)
+                  installed, expanded = {}, 0
+                  for row in rows:
+                      expanded += inspect_wheel(root, row, rows, requires, installed, inspected, facts)
+                      values["EXPANDED_BYTES"] = expanded
+                      if expanded > EXPANDED_LIMIT:
+                          raise Gap("NOT_VERIFIED", "the declared expanded member bytes %d are above the %d-byte limit"
+                                    % (expanded, EXPANDED_LIMIT))
+                  values["TASK_BYTES_AFTER"] = task_bytes(root)
+                  if values["TASK_BYTES_AFTER"] > TASK_LIMIT:
+                      raise Gap("NOT_VERIFIED", "the task root holds %d bytes, above the %d-byte checkpoint limit"
+                                % (values["TASK_BYTES_AFTER"], TASK_LIMIT))
+              except Gap as gap:
+                  result, reason = gap.result, gap.reason
+              except Exception as error:
+                  result, reason = "NOT_VERIFIED", "the downloader stopped: %s: %s" % (type(error).__name__, error)
+              values["FETCH_RESULT"], values["FETCH_REASON"] = result, reason
+              try:
+                  records = os.path.join(root, "records")
+                  write_record(os.path.join(records, "fetch.tsv"), tsv(
+                      [["role", "distribution", "version", "file", "url", "expected_bytes", "expected_sha256", "bytes", "sha256",
+                        "http_status", "result", "reason"]] + fetched))
+                  write_record(os.path.join(records, "wheels.tsv"), tsv(
+                      [["file", "members", "expanded_bytes", "metadata_bytes", "metadata_sha256", "tags", "requires", "result",
+                        "reason"]] + inspected))
+                  write_env(os.path.join(records, "fetch.env"), values)
+              except (OSError, Gap):
+                  return 2
+              return {"PASS": 0, "FAIL": 1}.get(result, 2)
+
+
+          def main(argv):
+              set_limits(ARCHIVE_LIMIT)
+              state = bound_streams()
+              status = 2
+              try:
+                  status = run(argv[0]) if len(argv) == 1 else 2
+              finally:
+                  counts = close_streams(state)
+              if len(argv) == 1:
+                  status = finish(os.path.join(argv[0], "records", "fetch.env"), counts, "FETCH_RESULT", "FETCH_REASON", status)
+              return status
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
+          VP_FETCH_PY
+
+          # The fixed install program: the exact standard input of its vector.
+          IFS= read -r -d '' VP_INSTALL_PY <<'VP_INSTALL_PY' || true
+          import csv, email.parser, hashlib, io, os, re, resource, signal, stat, sys, sysconfig, threading, time
+
+          ARCHIVE_LIMIT = 154218283
+          EXPANDED_LIMIT = 1073741824
+          TASK_LIMIT = 3221225472
+          AS_LIMIT = 4294967296
+          CPU_SECONDS = 60
+          TEXT_LIMIT = 65536
+          MANIFEST_FIELDS = ["role", "distribution", "version", "file", "url", "bytes", "sha256", "metadata_bytes", "metadata_sha256"]
+          URL_RE = re.compile(r"https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/([A-Za-z0-9_.+-]+\.whl)")
+
+
+          class Gap(Exception):
+              """A provision gap with its result (FAIL or NOT_VERIFIED) and its reason."""
+
+              def __init__(self, result, reason):
+                  super().__init__(reason)
+                  self.result, self.reason = result, reason
+
+
+          class Row:
+              def __init__(self, cells):
+                  (self.role, self.name, self.version, self.file, self.url, size, self.sha,
+                   meta_size, self.meta_sha) = cells
+                  self.bytes, self.meta_bytes = int(size), int(meta_size)
+
+
+          def one_line(text, limit=300):
+              text = re.sub(r"[\t\r\n]+", " ", str(text))
+              return text[:limit] if text else "-"
+
+
+          def set_limits(file_limit):
+              """The approved process limits, set before any package code runs."""
+              for name, value in (("RLIMIT_AS", AS_LIMIT), ("RLIMIT_CPU", CPU_SECONDS), ("RLIMIT_CORE", 0),
+                                  ("RLIMIT_FSIZE", file_limit)):
+                  resource.setrlimit(getattr(resource, name), (value, value))
+              signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+
+
+          def bound_streams():
+              """Replace standard output and error with pipes. One thread for each pipe
+              copies at most TEXT_LIMIT bytes to the original file and counts the rest,
+              so a writer never blocks and no log grows past the limit."""
+              sys.stdout.flush()
+              sys.stderr.flush()
+              state = {}
+              for fd, name in ((1, "out"), (2, "err")):
+                  target = os.dup(fd)
+                  read_end, write_end = os.pipe()
+                  os.dup2(write_end, fd)
+                  os.close(write_end)
+                  counts = [0, 0]
+
+                  def drain(read_end=read_end, target=target, counts=counts):
+                      while True:
+                          try:
+                              chunk = os.read(read_end, 65536)
+                          except OSError:
+                              break
+                          if not chunk:
+                              break
+                          keep = memoryview(chunk)[:max(TEXT_LIMIT - counts[0], 0)]
+                          counts[0] += len(keep)
+                          counts[1] += len(chunk) - len(keep)
+                          while keep:
+                              try:
+                                  keep = keep[os.write(target, keep):]
+                              except OSError:
+                                  break
+                      os.close(read_end)
+
+                  thread = threading.Thread(target=drain, daemon=True)
+                  thread.start()
+                  state[name] = (fd, target, counts, thread)
+              return state
+
+
+          def close_streams(state):
+              """Flush, give the original files back, and wait at most 2 seconds for each
+              drain. Returns the kept and dropped byte counts of the two streams."""
+              for stream in (sys.stdout, sys.stderr):
+                  try:
+                      stream.flush()
+                  except Exception:
+                      pass
+              result = {}
+              for name in ("out", "err"):
+                  fd, target, counts, thread = state[name]
+                  os.dup2(target, fd)
+                  os.close(target)
+                  thread.join(2.0)
+                  if thread.is_alive():
+                      counts[1] += 1
+                  result[name + "_kept"], result[name + "_dropped"] = counts
+              return result
+
+
+          def read_text(path, limit=TEXT_LIMIT):
+              st = os.lstat(path)
+              if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                  raise Gap("NOT_VERIFIED", "%s is not a regular file of at most %d bytes" % (os.path.basename(path), limit))
+              with open(path, "rb") as f:
+                  data = f.read(limit + 1)
+              try:
+                  return data.decode("utf-8")
+              except UnicodeDecodeError:
+                  raise Gap("FAIL", "%s is not UTF-8 text" % os.path.basename(path))
+
+
+          def write_record(path, text):
+              """Write one record, with at most TEXT_LIMIT bytes, through no link."""
+              data = text.encode("utf-8", "replace")
+              if len(data) > TEXT_LIMIT:
+                  raise Gap("NOT_VERIFIED", "%s would hold %d bytes, above the %d-byte record limit"
+                            % (os.path.basename(path), len(data), TEXT_LIMIT))
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+              try:
+                  view = memoryview(data)
+                  while view:
+                      view = view[os.write(fd, view):]
+              finally:
+                  os.close(fd)
+
+
+          def write_env(path, values):
+              """KEY=value lines in insertion order, then WORK_FINISH as the last line."""
+              values.pop("WORK_FINISH", None)
+              lines = ["%s=%s" % (key, one_line(value, 4000)) for key, value in values.items()]
+              lines.append("WORK_FINISH=%d" % int(time.time() * 1000))
+              write_record(path, "\n".join(lines) + "\n")
+
+
+          def tsv(rows):
+              return "".join("\t".join(one_line(cell, 1000) for cell in row) + "\n" for row in rows)
+
+
+          def check_root(root, empty=()):
+              """The task root: an absolute owned directory of mode 700 with no link,
+              and the five named directories. The directories in <empty> are empty."""
+              if not os.path.isabs(root) or os.path.realpath(root) != root:
+                  raise Gap("NOT_VERIFIED", "the task root %s is not an absolute path without links" % root)
+              st = os.lstat(root)
+              if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                  raise Gap("NOT_VERIFIED", "the task root %s is not a directory of this user" % root)
+              if stat.S_IMODE(st.st_mode) != 0o700:
+                  raise Gap("NOT_VERIFIED", "the task root has mode %o, not mode 700" % stat.S_IMODE(st.st_mode))
+              for sub in ("installer", "wheels", "site", "tmp", "records"):
+                  path = os.path.join(root, sub)
+                  try:
+                      st = os.lstat(path)
+                  except OSError:
+                      raise Gap("NOT_VERIFIED", "the task root has no %s directory" % sub)
+                  if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not a directory of this user" % sub)
+                  if sub in empty and os.listdir(path):
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not empty" % sub)
+
+
+          def task_bytes(root):
+              """The regular-file bytes below the task root, without following links."""
+              total = 0
+              for base, dirs, files in os.walk(root):
+                  for name in files:
+                      try:
+                          st = os.lstat(os.path.join(base, name))
+                      except OSError:
+                          continue
+                      if stat.S_ISREG(st.st_mode):
+                          total += st.st_size
+              return total
+
+
+          def stdlib_paths():
+              paths = {sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib")}
+              paths.add(os.path.join(sysconfig.get_path("stdlib"), "lib-dynload"))
+              paths.add(os.path.join(sys.base_prefix, "lib", "python%d%d.zip" % sys.version_info[:2]))
+              return paths
+
+
+          def normal_name(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def stem(name, version):
+              return re.sub(r"[-_.]+", "_", name) + "-" + version
+
+
+          def read_manifest(root):
+              text = read_text(os.path.join(root, "manifest.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "\t".join(MANIFEST_FIELDS):
+                  raise Gap("FAIL", "manifest.tsv does not have the fixed header and line ends")
+              rows, names, total = [], set(), 0
+              for number, line in enumerate(lines[1:-1], 2):
+                  cells = line.split("\t")
+                  if len(cells) != len(MANIFEST_FIELDS):
+                      raise Gap("FAIL", "manifest.tsv line %d does not have %d fields" % (number, len(MANIFEST_FIELDS)))
+                  role, name, version, file, url, size, sha, meta_size, meta_sha = cells
+                  match = URL_RE.fullmatch(url)
+                  if role not in ("runtime", "installer") or not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", name) \
+                          or not re.fullmatch(r"[0-9][0-9A-Za-z.+!]*", version) \
+                          or not re.fullmatch(r"[1-9][0-9]*", size) or not re.fullmatch(r"[1-9][0-9]*", meta_size) \
+                          or not re.fullmatch(r"[0-9a-f]{64}", sha) or not re.fullmatch(r"[0-9a-f]{64}", meta_sha):
+                      raise Gap("FAIL", "manifest.tsv line %d is not a valid artifact row" % number)
+                  if not match or match.group(1) != file or not file.startswith(stem(name, version) + "-"):
+                      raise Gap("FAIL", "manifest.tsv line %d: the URL %s is not the exact files.pythonhosted.org URL of %s"
+                                % (number, url, file))
+                  if name in names:
+                      raise Gap("FAIL", "manifest.tsv names %s twice" % name)
+                  names.add(name)
+                  rows.append(Row(cells))
+                  total += int(size)
+              installers = [row for row in rows if row.role == "installer"]
+              if len(installers) != 1 or installers[0].name != "pip" or not any(row.role == "runtime" for row in rows):
+                  raise Gap("FAIL", "manifest.tsv must name one pip installer and at least one runtime artifact")
+              if total > ARCHIVE_LIMIT:
+                  raise Gap("FAIL", "the manifest archives have %d bytes, above the %d-byte limit" % (total, ARCHIVE_LIMIT))
+              return rows
+
+
+          def read_requires(root, rows):
+              text = read_text(os.path.join(root, "requires.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "declaring\trequirement":
+                  raise Gap("FAIL", "requires.tsv does not have the fixed header and line ends")
+              runtime = {row.name for row in rows if row.role == "runtime"}
+              requires = {}
+              for number, line in enumerate(lines[1:-1], 2):
+                  declaring, sep, requirement = line.partition("\t")
+                  if not sep or declaring not in runtime or not requirement or "\t" in requirement:
+                      raise Gap("FAIL", "requires.tsv line %d is not a requirement of a runtime distribution" % number)
+                  requires.setdefault(declaring, []).append(requirement)
+              return requires
+
+
+          def release(version):
+              """The release tuple of a simple version, with an optional .postN."""
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)(?:\.post[0-9]+)?", version)
+              if not match:
+                  raise Gap("NOT_VERIFIED", "the version %s has an unsupported form" % version)
+              return tuple(int(part) for part in match.group(1).split("."))
+
+
+          def satisfies(version, specifier):
+              """Status of <version> for a comma-separated specifier of the forms >=,
+              >, <=, <, ==, and !=, with an optional .* on == and !=."""
+              for clause in specifier.split(","):
+                  clause = clause.strip()
+                  match = re.fullmatch(r"(>=|<=|==|!=|>|<)\s*([0-9][0-9.]*?)(\.\*)?", clause)
+                  if not match or (match.group(3) and match.group(1) not in ("==", "!=")):
+                      raise Gap("NOT_VERIFIED", "the version specifier %s has an unsupported form" % clause)
+                  op, want, wild = match.groups()
+                  have, want = release(version), release(want)
+                  if wild:
+                      equal = have[:len(want)] == want
+                      ok = equal if op == "==" else not equal
+                  else:
+                      width = max(len(have), len(want))
+                      a, b = have + (0,) * (width - len(have)), want + (0,) * (width - len(want))
+                      ok = {">=": a >= b, "<=": a <= b, "==": a == b, "!=": a != b, ">": a > b, "<": a < b}[op]
+                  if not ok:
+                      return False
+              return True
+
+
+          def mandatory_requirements(meta):
+              """The Requires-Dist values of the METADATA bytes that have no extra
+              marker. A value with another marker is not supported."""
+              headers = email.parser.BytesHeaderParser().parsebytes(meta)
+              result = []
+              for value in headers.get_all("Requires-Dist") or []:
+                  value = " ".join(str(value).split())
+                  requirement, sep, marker = value.partition(";")
+                  if sep and re.search(r"\bextra\s*==", marker):
+                      continue
+                  if sep:
+                      raise Gap("NOT_VERIFIED", "the requirement %s has an environment marker, which is not supported" % value)
+                  result.append(value)
+              return headers, result
+
+
+          def check_requirements(name, found, requires, rows):
+              """The mandatory requirements of one distribution are exactly the approved
+              ones, and the selected versions satisfy them."""
+              approved = requires.get(name, [])
+              if sorted(found) != sorted(approved):
+                  raise Gap("FAIL", "the mandatory requirements of %s [%s] are not the approved requirements [%s]"
+                            % (name, "; ".join(found), "; ".join(approved)))
+              versions = {normal_name(row.name): row.version for row in rows if row.role == "runtime"}
+              for requirement in found:
+                  match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)", requirement)
+                  if not match or normal_name(match.group(1)) not in versions:
+                      raise Gap("FAIL", "the requirement %s of %s is not a selected distribution" % (requirement, name))
+                  if match.group(2) and not satisfies(versions[normal_name(match.group(1))], match.group(2)):
+                      raise Gap("FAIL", "the requirement %s of %s is not satisfied by %s %s"
+                                % (requirement, name, match.group(1), versions[normal_name(match.group(1))]))
+
+
+          def file_sha(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1048576), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def finish(env_path, counts, result_key, reason_key, status):
+              """Add the stream counts to the env record. A stream past its limit, or
+              text on standard error after a PASS, is NOT_VERIFIED."""
+              values = {}
+              try:
+                  for line in read_text(env_path).splitlines():
+                      key, sep, value = line.partition("=")
+                      if sep:
+                          values[key] = value
+              except (OSError, Gap):
+                  return status or 2
+              values.update({"STDOUT_KEPT": counts["out_kept"], "STDOUT_DROPPED": counts["out_dropped"],
+                             "STDERR_KEPT": counts["err_kept"], "STDERR_DROPPED": counts["err_dropped"]})
+              if counts["out_dropped"] or counts["err_dropped"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the output passed the %d-byte stream limit: %d and %d bytes were not kept" % (
+                      TEXT_LIMIT, counts["out_dropped"], counts["err_dropped"])
+                  status = 2
+              elif values.get(result_key) == "PASS" and counts["err_kept"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the operation wrote %d bytes of unexplained standard-error text" % counts["err_kept"]
+                  status = 2
+              try:
+                  write_env(env_path, values)
+              except (OSError, Gap):
+                  return 2
+              return status
+
+
+          import runpy
+
+          PIP_FILE = "pip-25.2-py3-none-any.whl"
+
+
+          def pip_vector(root):
+              return ["--isolated", "--disable-pip-version-check", "install", "--no-index",
+                      "--find-links=" + os.path.join(root, "wheels"), "--require-hashes", "--only-binary=:all:",
+                      "--no-cache-dir", "--no-compile", "--target=" + os.path.join(root, "site"),
+                      "--requirement=" + os.path.join(root, "requirements.lock")]
+
+
+          def run(argv, values):
+              """Check the verified pip wheel, the vector, and the environment, then run
+              pip from that wheel in this process. Returns the result and the reason."""
+              if not argv:
+                  raise Gap("FAIL", "the installer bootstrap got no pip wheel argument")
+              wheel = argv[0]
+              root = os.path.dirname(os.path.dirname(wheel))
+              check_root(root, empty=("site",))
+              if wheel != os.path.join(root, "installer", PIP_FILE):
+                  raise Gap("FAIL", "the installer argument %s is not installer/%s of the task root" % (wheel, PIP_FILE))
+              if argv[1:] != pip_vector(root):
+                  raise Gap("FAIL", "the installer vector is not the approved offline hash-required target vector")
+              if os.environ.get("PIP_CONFIG_FILE") != "/dev/null" or os.environ.get("TMPDIR") != os.path.join(root, "tmp"):
+                  raise Gap("FAIL", "the installer environment is not PIP_CONFIG_FILE=/dev/null with the task TMPDIR")
+              rows = [row for row in read_manifest(root) if row.role == "installer"]
+              st = os.lstat(wheel)
+              sha = file_sha(wheel) if stat.S_ISREG(st.st_mode) else "-"
+              values["PIP_WHEEL_SHA256"] = sha
+              if not stat.S_ISREG(st.st_mode) or st.st_size != rows[0].bytes or sha != rows[0].sha:
+                  raise Gap("FAIL", "the installer wheel is not the registered pip 25.2 wheel (%d bytes, SHA-256 %s)" % (st.st_size, sha))
+              values["TASK_BYTES_BEFORE"] = task_bytes(root)
+              sys.path[:] = [wheel] + [path for path in sys.path if path in stdlib_paths()]
+              sys.dont_write_bytecode = True
+              sys.argv = ["pip"] + argv[1:]
+              try:
+                  runpy.run_module("pip", run_name="__main__", alter_sys=True)
+                  code = 0
+              except SystemExit as stop:
+                  code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+              values["PIP_EXIT"] = code
+              values["TASK_BYTES_AFTER"] = task_bytes(root)
+              if code != 0:
+                  raise Gap("NOT_VERIFIED", "pip ended with status %d" % code)
+              if values["TASK_BYTES_AFTER"] > TASK_LIMIT:
+                  raise Gap("NOT_VERIFIED", "the task root holds %d bytes, above the %d-byte checkpoint limit"
+                            % (values["TASK_BYTES_AFTER"], TASK_LIMIT))
+              return "PASS", "pip installed the locked set offline from the verified wheels"
+
+
+          def main(argv):
+              set_limits(EXPANDED_LIMIT)
+              state = bound_streams()
+              values = {"INSTALL_RESULT": "NOT_VERIFIED", "INSTALL_REASON": "the installer did not reach its end"}
+              try:
+                  try:
+                      result, reason = run(argv, values)
+                  except Gap as gap:
+                      result, reason = gap.result, gap.reason
+                  except Exception as error:
+                      result, reason = "NOT_VERIFIED", "the installer stopped: %s: %s" % (type(error).__name__, error)
+              finally:
+                  counts = close_streams(state)
+              values["INSTALL_RESULT"], values["INSTALL_REASON"] = result, reason
+              status = {"PASS": 0, "FAIL": 1}.get(result, 2)
+              if not argv or not os.path.isdir(os.path.join(os.path.dirname(os.path.dirname(argv[0])), "records")):
+                  return status or 2
+              env = os.path.join(os.path.dirname(os.path.dirname(argv[0])), "records", "install.env")
+              try:
+                  write_env(env, values)
+              except (OSError, Gap):
+                  return 2
+              return finish(env, counts, "INSTALL_RESULT", "INSTALL_REASON", status)
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
+          VP_INSTALL_PY
+
+          # The fixed verify program: the exact standard input of its vector.
+          IFS= read -r -d '' VP_VERIFY_PY <<'VP_VERIFY_PY' || true
+          import csv, email.parser, hashlib, io, os, re, resource, signal, stat, sys, sysconfig, threading, time
+
+          ARCHIVE_LIMIT = 154218283
+          EXPANDED_LIMIT = 1073741824
+          TASK_LIMIT = 3221225472
+          AS_LIMIT = 4294967296
+          CPU_SECONDS = 60
+          TEXT_LIMIT = 65536
+          MANIFEST_FIELDS = ["role", "distribution", "version", "file", "url", "bytes", "sha256", "metadata_bytes", "metadata_sha256"]
+          URL_RE = re.compile(r"https://files\.pythonhosted\.org/packages/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/([A-Za-z0-9_.+-]+\.whl)")
+
+
+          class Gap(Exception):
+              """A provision gap with its result (FAIL or NOT_VERIFIED) and its reason."""
+
+              def __init__(self, result, reason):
+                  super().__init__(reason)
+                  self.result, self.reason = result, reason
+
+
+          class Row:
+              def __init__(self, cells):
+                  (self.role, self.name, self.version, self.file, self.url, size, self.sha,
+                   meta_size, self.meta_sha) = cells
+                  self.bytes, self.meta_bytes = int(size), int(meta_size)
+
+
+          def one_line(text, limit=300):
+              text = re.sub(r"[\t\r\n]+", " ", str(text))
+              return text[:limit] if text else "-"
+
+
+          def set_limits(file_limit):
+              """The approved process limits, set before any package code runs."""
+              for name, value in (("RLIMIT_AS", AS_LIMIT), ("RLIMIT_CPU", CPU_SECONDS), ("RLIMIT_CORE", 0),
+                                  ("RLIMIT_FSIZE", file_limit)):
+                  resource.setrlimit(getattr(resource, name), (value, value))
+              signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+
+
+          def bound_streams():
+              """Replace standard output and error with pipes. One thread for each pipe
+              copies at most TEXT_LIMIT bytes to the original file and counts the rest,
+              so a writer never blocks and no log grows past the limit."""
+              sys.stdout.flush()
+              sys.stderr.flush()
+              state = {}
+              for fd, name in ((1, "out"), (2, "err")):
+                  target = os.dup(fd)
+                  read_end, write_end = os.pipe()
+                  os.dup2(write_end, fd)
+                  os.close(write_end)
+                  counts = [0, 0]
+
+                  def drain(read_end=read_end, target=target, counts=counts):
+                      while True:
+                          try:
+                              chunk = os.read(read_end, 65536)
+                          except OSError:
+                              break
+                          if not chunk:
+                              break
+                          keep = memoryview(chunk)[:max(TEXT_LIMIT - counts[0], 0)]
+                          counts[0] += len(keep)
+                          counts[1] += len(chunk) - len(keep)
+                          while keep:
+                              try:
+                                  keep = keep[os.write(target, keep):]
+                              except OSError:
+                                  break
+                      os.close(read_end)
+
+                  thread = threading.Thread(target=drain, daemon=True)
+                  thread.start()
+                  state[name] = (fd, target, counts, thread)
+              return state
+
+
+          def close_streams(state):
+              """Flush, give the original files back, and wait at most 2 seconds for each
+              drain. Returns the kept and dropped byte counts of the two streams."""
+              for stream in (sys.stdout, sys.stderr):
+                  try:
+                      stream.flush()
+                  except Exception:
+                      pass
+              result = {}
+              for name in ("out", "err"):
+                  fd, target, counts, thread = state[name]
+                  os.dup2(target, fd)
+                  os.close(target)
+                  thread.join(2.0)
+                  if thread.is_alive():
+                      counts[1] += 1
+                  result[name + "_kept"], result[name + "_dropped"] = counts
+              return result
+
+
+          def read_text(path, limit=TEXT_LIMIT):
+              st = os.lstat(path)
+              if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                  raise Gap("NOT_VERIFIED", "%s is not a regular file of at most %d bytes" % (os.path.basename(path), limit))
+              with open(path, "rb") as f:
+                  data = f.read(limit + 1)
+              try:
+                  return data.decode("utf-8")
+              except UnicodeDecodeError:
+                  raise Gap("FAIL", "%s is not UTF-8 text" % os.path.basename(path))
+
+
+          def write_record(path, text):
+              """Write one record, with at most TEXT_LIMIT bytes, through no link."""
+              data = text.encode("utf-8", "replace")
+              if len(data) > TEXT_LIMIT:
+                  raise Gap("NOT_VERIFIED", "%s would hold %d bytes, above the %d-byte record limit"
+                            % (os.path.basename(path), len(data), TEXT_LIMIT))
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+              try:
+                  view = memoryview(data)
+                  while view:
+                      view = view[os.write(fd, view):]
+              finally:
+                  os.close(fd)
+
+
+          def write_env(path, values):
+              """KEY=value lines in insertion order, then WORK_FINISH as the last line."""
+              values.pop("WORK_FINISH", None)
+              lines = ["%s=%s" % (key, one_line(value, 4000)) for key, value in values.items()]
+              lines.append("WORK_FINISH=%d" % int(time.time() * 1000))
+              write_record(path, "\n".join(lines) + "\n")
+
+
+          def tsv(rows):
+              return "".join("\t".join(one_line(cell, 1000) for cell in row) + "\n" for row in rows)
+
+
+          def check_root(root, empty=()):
+              """The task root: an absolute owned directory of mode 700 with no link,
+              and the five named directories. The directories in <empty> are empty."""
+              if not os.path.isabs(root) or os.path.realpath(root) != root:
+                  raise Gap("NOT_VERIFIED", "the task root %s is not an absolute path without links" % root)
+              st = os.lstat(root)
+              if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                  raise Gap("NOT_VERIFIED", "the task root %s is not a directory of this user" % root)
+              if stat.S_IMODE(st.st_mode) != 0o700:
+                  raise Gap("NOT_VERIFIED", "the task root has mode %o, not mode 700" % stat.S_IMODE(st.st_mode))
+              for sub in ("installer", "wheels", "site", "tmp", "records"):
+                  path = os.path.join(root, sub)
+                  try:
+                      st = os.lstat(path)
+                  except OSError:
+                      raise Gap("NOT_VERIFIED", "the task root has no %s directory" % sub)
+                  if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not a directory of this user" % sub)
+                  if sub in empty and os.listdir(path):
+                      raise Gap("NOT_VERIFIED", "%s in the task root is not empty" % sub)
+
+
+          def task_bytes(root):
+              """The regular-file bytes below the task root, without following links."""
+              total = 0
+              for base, dirs, files in os.walk(root):
+                  for name in files:
+                      try:
+                          st = os.lstat(os.path.join(base, name))
+                      except OSError:
+                          continue
+                      if stat.S_ISREG(st.st_mode):
+                          total += st.st_size
+              return total
+
+
+          def stdlib_paths():
+              paths = {sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib")}
+              paths.add(os.path.join(sysconfig.get_path("stdlib"), "lib-dynload"))
+              paths.add(os.path.join(sys.base_prefix, "lib", "python%d%d.zip" % sys.version_info[:2]))
+              return paths
+
+
+          def normal_name(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def stem(name, version):
+              return re.sub(r"[-_.]+", "_", name) + "-" + version
+
+
+          def read_manifest(root):
+              text = read_text(os.path.join(root, "manifest.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "\t".join(MANIFEST_FIELDS):
+                  raise Gap("FAIL", "manifest.tsv does not have the fixed header and line ends")
+              rows, names, total = [], set(), 0
+              for number, line in enumerate(lines[1:-1], 2):
+                  cells = line.split("\t")
+                  if len(cells) != len(MANIFEST_FIELDS):
+                      raise Gap("FAIL", "manifest.tsv line %d does not have %d fields" % (number, len(MANIFEST_FIELDS)))
+                  role, name, version, file, url, size, sha, meta_size, meta_sha = cells
+                  match = URL_RE.fullmatch(url)
+                  if role not in ("runtime", "installer") or not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", name) \
+                          or not re.fullmatch(r"[0-9][0-9A-Za-z.+!]*", version) \
+                          or not re.fullmatch(r"[1-9][0-9]*", size) or not re.fullmatch(r"[1-9][0-9]*", meta_size) \
+                          or not re.fullmatch(r"[0-9a-f]{64}", sha) or not re.fullmatch(r"[0-9a-f]{64}", meta_sha):
+                      raise Gap("FAIL", "manifest.tsv line %d is not a valid artifact row" % number)
+                  if not match or match.group(1) != file or not file.startswith(stem(name, version) + "-"):
+                      raise Gap("FAIL", "manifest.tsv line %d: the URL %s is not the exact files.pythonhosted.org URL of %s"
+                                % (number, url, file))
+                  if name in names:
+                      raise Gap("FAIL", "manifest.tsv names %s twice" % name)
+                  names.add(name)
+                  rows.append(Row(cells))
+                  total += int(size)
+              installers = [row for row in rows if row.role == "installer"]
+              if len(installers) != 1 or installers[0].name != "pip" or not any(row.role == "runtime" for row in rows):
+                  raise Gap("FAIL", "manifest.tsv must name one pip installer and at least one runtime artifact")
+              if total > ARCHIVE_LIMIT:
+                  raise Gap("FAIL", "the manifest archives have %d bytes, above the %d-byte limit" % (total, ARCHIVE_LIMIT))
+              return rows
+
+
+          def read_requires(root, rows):
+              text = read_text(os.path.join(root, "requires.tsv"))
+              lines = text.split("\n")
+              if lines[-1] != "" or lines[0] != "declaring\trequirement":
+                  raise Gap("FAIL", "requires.tsv does not have the fixed header and line ends")
+              runtime = {row.name for row in rows if row.role == "runtime"}
+              requires = {}
+              for number, line in enumerate(lines[1:-1], 2):
+                  declaring, sep, requirement = line.partition("\t")
+                  if not sep or declaring not in runtime or not requirement or "\t" in requirement:
+                      raise Gap("FAIL", "requires.tsv line %d is not a requirement of a runtime distribution" % number)
+                  requires.setdefault(declaring, []).append(requirement)
+              return requires
+
+
+          def release(version):
+              """The release tuple of a simple version, with an optional .postN."""
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)(?:\.post[0-9]+)?", version)
+              if not match:
+                  raise Gap("NOT_VERIFIED", "the version %s has an unsupported form" % version)
+              return tuple(int(part) for part in match.group(1).split("."))
+
+
+          def satisfies(version, specifier):
+              """Status of <version> for a comma-separated specifier of the forms >=,
+              >, <=, <, ==, and !=, with an optional .* on == and !=."""
+              for clause in specifier.split(","):
+                  clause = clause.strip()
+                  match = re.fullmatch(r"(>=|<=|==|!=|>|<)\s*([0-9][0-9.]*?)(\.\*)?", clause)
+                  if not match or (match.group(3) and match.group(1) not in ("==", "!=")):
+                      raise Gap("NOT_VERIFIED", "the version specifier %s has an unsupported form" % clause)
+                  op, want, wild = match.groups()
+                  have, want = release(version), release(want)
+                  if wild:
+                      equal = have[:len(want)] == want
+                      ok = equal if op == "==" else not equal
+                  else:
+                      width = max(len(have), len(want))
+                      a, b = have + (0,) * (width - len(have)), want + (0,) * (width - len(want))
+                      ok = {">=": a >= b, "<=": a <= b, "==": a == b, "!=": a != b, ">": a > b, "<": a < b}[op]
+                  if not ok:
+                      return False
+              return True
+
+
+          def mandatory_requirements(meta):
+              """The Requires-Dist values of the METADATA bytes that have no extra
+              marker. A value with another marker is not supported."""
+              headers = email.parser.BytesHeaderParser().parsebytes(meta)
+              result = []
+              for value in headers.get_all("Requires-Dist") or []:
+                  value = " ".join(str(value).split())
+                  requirement, sep, marker = value.partition(";")
+                  if sep and re.search(r"\bextra\s*==", marker):
+                      continue
+                  if sep:
+                      raise Gap("NOT_VERIFIED", "the requirement %s has an environment marker, which is not supported" % value)
+                  result.append(value)
+              return headers, result
+
+
+          def check_requirements(name, found, requires, rows):
+              """The mandatory requirements of one distribution are exactly the approved
+              ones, and the selected versions satisfy them."""
+              approved = requires.get(name, [])
+              if sorted(found) != sorted(approved):
+                  raise Gap("FAIL", "the mandatory requirements of %s [%s] are not the approved requirements [%s]"
+                            % (name, "; ".join(found), "; ".join(approved)))
+              versions = {normal_name(row.name): row.version for row in rows if row.role == "runtime"}
+              for requirement in found:
+                  match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)", requirement)
+                  if not match or normal_name(match.group(1)) not in versions:
+                      raise Gap("FAIL", "the requirement %s of %s is not a selected distribution" % (requirement, name))
+                  if match.group(2) and not satisfies(versions[normal_name(match.group(1))], match.group(2)):
+                      raise Gap("FAIL", "the requirement %s of %s is not satisfied by %s %s"
+                                % (requirement, name, match.group(1), versions[normal_name(match.group(1))]))
+
+
+          def file_sha(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1048576), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def finish(env_path, counts, result_key, reason_key, status):
+              """Add the stream counts to the env record. A stream past its limit, or
+              text on standard error after a PASS, is NOT_VERIFIED."""
+              values = {}
+              try:
+                  for line in read_text(env_path).splitlines():
+                      key, sep, value = line.partition("=")
+                      if sep:
+                          values[key] = value
+              except (OSError, Gap):
+                  return status or 2
+              values.update({"STDOUT_KEPT": counts["out_kept"], "STDOUT_DROPPED": counts["out_dropped"],
+                             "STDERR_KEPT": counts["err_kept"], "STDERR_DROPPED": counts["err_dropped"]})
+              if counts["out_dropped"] or counts["err_dropped"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the output passed the %d-byte stream limit: %d and %d bytes were not kept" % (
+                      TEXT_LIMIT, counts["out_dropped"], counts["err_dropped"])
+                  status = 2
+              elif values.get(result_key) == "PASS" and counts["err_kept"]:
+                  values[result_key] = "NOT_VERIFIED"
+                  values[reason_key] = "the operation wrote %d bytes of unexplained standard-error text" % counts["err_kept"]
+                  status = 2
+              try:
+                  write_env(env_path, values)
+              except (OSError, Gap):
+                  return 2
+              return status
+
+
+          import base64, warnings
+
+
+          def record_path(name, path):
+              """A RECORD path relative to the site. pip --target installs into a
+              temporary home and moves it to the target. RECORD keeps each path of the
+              home data scheme (scripts in bin/, headers in include/, and data files)
+              relative to the lib directory home/lib/python, as ../../<path>."""
+              if path.startswith("../../"):
+                  path = path[len("../../"):]
+              if not path or path.startswith("/") or ".." in path.split("/") or "\\" in path:
+                  raise Gap("FAIL", "the RECORD of %s has the unexpected path %s" % (name, path))
+              return path
+
+
+          def inventory(site, rows, requires):
+              """The installed layout, distributions, METADATA, and RECORD files."""
+              files = {}
+              for base, dirs, names in os.walk(site):
+                  for name in dirs + names:
+                      path = os.path.join(base, name)
+                      st = os.lstat(path)
+                      rel = os.path.relpath(path, site)
+                      if stat.S_ISLNK(st.st_mode):
+                          raise Gap("FAIL", "site/%s is a link" % rel)
+                      if name in names and not stat.S_ISREG(st.st_mode):
+                          raise Gap("FAIL", "site/%s is not a regular file" % rel)
+                      if name in names:
+                          files[rel] = st.st_size
+              runtime = [row for row in rows if row.role == "runtime"]
+              expected = {stem(row.name, row.version) + ".dist-info": row for row in runtime}
+              found = {name for name in os.listdir(site) if name.endswith(".dist-info")}
+              for name in sorted(set(expected) - found):
+                  raise Gap("FAIL", "the installed distribution %s is missing" % name)
+              for name in sorted(found - set(expected)):
+                  raise Gap("FAIL", "the installed distribution %s is not in the manifest" % name)
+              covered, table, lines = {}, [], []
+              for info, row in expected.items():
+                  meta = open(os.path.join(site, info, "METADATA"), "rb").read()
+                  if len(meta) != row.meta_bytes or hashlib.sha256(meta).hexdigest() != row.meta_sha:
+                      raise Gap("FAIL", "the installed METADATA of %s is not the published core metadata" % row.name)
+                  headers, found_requires = mandatory_requirements(meta)
+                  check_requirements(row.name, found_requires, requires, rows)
+                  count = size = 0
+                  text = read_text(os.path.join(site, info, "RECORD"), 16 * TEXT_LIMIT)
+                  for cells in csv.reader(io.StringIO(text)):
+                      if not cells:
+                          continue
+                      if len(cells) != 3:
+                          raise Gap("FAIL", "the RECORD of %s has a row without three fields" % row.name)
+                      path = record_path(row.name, cells[0])
+                      if path in covered:
+                          raise Gap("FAIL", "site/%s is listed in the RECORD of %s and %s" % (path, covered[path], row.name))
+                      if path not in files:
+                          raise Gap("FAIL", "the RECORD of %s lists the missing file site/%s" % (row.name, path))
+                      covered[path] = row.name
+                      if path == info + "/RECORD":
+                          continue
+                      if not cells[1].startswith("sha256=") or cells[2] != str(files[path]):
+                          raise Gap("FAIL", "the RECORD row of site/%s has no SHA-256 and size" % path)
+                      digest = file_sha(os.path.join(site, path))
+                      wanted = base64.urlsafe_b64decode(cells[1][len("sha256="):] + "==").hex()
+                      if digest != wanted:
+                          raise Gap("FAIL", "the SHA-256 of site/%s differs from its RECORD" % path)
+                      lines.append("%s\t%d\t%s\n" % (path, files[path], digest))
+                      count, size = count + 1, size + files[path]
+                  table.append([row.name, row.version, row.meta_sha, count, size, "PASS", "-"])
+              for path in sorted(set(files) - set(covered)):
+                  raise Gap("FAIL", "site/%s is not listed in a RECORD" % path)
+              digest = hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
+              return table, len(files), sum(files.values()), digest
+
+
+          def loaded_libraries(site):
+              """The shared libraries that this process has mapped, with their bytes and
+              SHA-256; at most 400 of them."""
+              paths = set()
+              with open("/proc/self/maps") as maps:
+                  for line in maps:
+                      path = line.split(None, 5)[5].strip() if len(line.split(None, 5)) == 6 else ""
+                      if path.startswith("/") and re.search(r"\.so(\.[0-9]+)*$", path):
+                          paths.add(path)
+              rows = []
+              for path in sorted(paths)[:400]:
+                  real = os.path.realpath(path)
+                  origin = "site" if real.startswith(site + "/") else "system"
+                  try:
+                      rows.append([real, origin, os.lstat(real).st_size, file_sha(real)])
+                  except OSError as error:
+                      rows.append([real, origin, "-", "UNAVAILABLE: %s" % error.strerror])
+              return rows
+
+
+          def native_check(site, values):
+              """A bounded import of the pinned consumer from the task site only: the
+              standard library paths and the validated site, no other package origin,
+              no bytecode, and no warning."""
+              sys.path[:] = [path for path in sys.path if path in stdlib_paths()] + [site]
+              sys.dont_write_bytecode = True
+              with warnings.catch_warnings(record=True) as caught:
+                  warnings.simplefilter("always")
+                  try:
+                      import vtkmodules
+                      from vtkmodules import vtkCommonCore, vtkIOXML
+                      vtkIOXML.vtkXMLUnstructuredGridReader
+                  except Exception as error:
+                      raise Gap("NOT_VERIFIED", "the consumer vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader cannot be imported from the task site: %s: %s"
+                                % (type(error).__name__, error))
+              for module in (vtkmodules, vtkCommonCore, vtkIOXML):
+                  origin = os.path.realpath(getattr(module, "__file__", None) or "-")
+                  if not origin.startswith(site + "/"):
+                      raise Gap("NOT_VERIFIED", "the module %s comes from %s, not from the task site" % (module.__name__, origin))
+              values["VTK_VERSION"] = vtkCommonCore.vtkVersion.GetVTKVersion()
+              values["VTK_MODULE"] = os.path.realpath(vtkCommonCore.__file__)
+              if values["VTK_VERSION"] != "9.5.2":
+                  raise Gap("NOT_VERIFIED", "the consumer VTK version is %s, not 9.5.2" % values["VTK_VERSION"])
+              for module in (vtkCommonCore, vtkIOXML):
+                  if not re.search(r"\.cpython-312-x86_64-linux-gnu\.so$", module.__file__):
+                      raise Gap("NOT_VERIFIED", "the module %s is not a native cp312 extension module" % module.__name__)
+              if caught:
+                  raise Gap("NOT_VERIFIED", "the import gave the warning: %s" % caught[0].message)
+
+
+          def run(site, values):
+              root = os.path.dirname(site)
+              check_root(root)
+              if site != os.path.join(root, "site"):
+                  raise Gap("NOT_VERIFIED", "the argument %s is not the site directory of a task root" % site)
+              rows = read_manifest(root)
+              requires = read_requires(root, rows)
+              table, values["INSTALLED_FILES"], values["INSTALLED_BYTES"], values["INSTALLED_INVENTORY_SHA256"] = \
+                  inventory(site, rows, requires)
+              values["DISTRIBUTIONS"] = " ".join("%s==%s" % (row.name, row.version) for row in rows if row.role == "runtime")
+              write_record(os.path.join(root, "records", "installed.tsv"), tsv(
+                  [["distribution", "version", "metadata_sha256", "record_files", "record_bytes", "result", "reason"]] + table))
+              values["TASK_BYTES"] = task_bytes(root)
+              if values["TASK_BYTES"] > TASK_LIMIT:
+                  raise Gap("NOT_VERIFIED", "the task root holds %d bytes, above the %d-byte checkpoint limit"
+                            % (values["TASK_BYTES"], TASK_LIMIT))
+              native_check(site, values)
+              libraries = loaded_libraries(site)
+              values["LOADED_LIBRARIES"] = len(libraries)
+              write_record(os.path.join(root, "records", "libraries.tsv"), tsv([["path", "origin", "bytes", "sha256"]] + libraries))
+              values["LIBRARIES_SHA256"] = hashlib.sha256(tsv(libraries).encode("utf-8")).hexdigest()
+              return "PASS", "the locked closure is installed with complete RECORD files, and the native VTK 9.5.2 consumer imports from the task site"
+
+
+          def main(argv):
+              set_limits(TEXT_LIMIT)
+              state = bound_streams()
+              values = {"VERIFY_RESULT": "NOT_VERIFIED", "VERIFY_REASON": "the check did not reach its end"}
+              try:
+                  try:
+                      if len(argv) != 1:
+                          raise Gap("FAIL", "the check needs exactly the site argument")
+                      result, reason = run(argv[0], values)
+                  except Gap as gap:
+                      result, reason = gap.result, gap.reason
+                  except Exception as error:
+                      result, reason = "NOT_VERIFIED", "the check stopped: %s: %s" % (type(error).__name__, error)
+              finally:
+                  counts = close_streams(state)
+              values["VERIFY_RESULT"], values["VERIFY_REASON"] = result, reason
+              status = {"PASS": 0, "FAIL": 1}.get(result, 2)
+              if len(argv) != 1 or not os.path.isdir(os.path.join(os.path.dirname(argv[0]), "records")):
+                  return status or 2
+              env = os.path.join(os.path.dirname(argv[0]), "records", "verify.env")
+              try:
+                  write_env(env, values)
+              except (OSError, Gap):
+                  return 2
+              return finish(env, counts, "VERIFY_RESULT", "VERIFY_REASON", status)
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
+          VP_VERIFY_PY
+          # ---- M3 VTU provision: end ----
+          vp_provision
+          if [[ "$VP_RESULT" != PROVISION_AVAILABLE ]]; then
+              echo "M3 VTU provision: ${VP_RESULT}: ${VP_REASON}" >&2
+              exit 1
+          fi
 
       - name: Run the v4 contract tests
         run: bash tests/run_contract_tests.sh

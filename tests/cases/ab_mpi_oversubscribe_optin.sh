@@ -169,6 +169,50 @@
 # log) that changes between its hashes; R3 (S98), a result.env that cannot be
 # written, and a partial result.env.
 #
+# Checks S100 to S103 cover the fixed provision of the pinned VTU reader (Issue
+# #80, admission 6160693923 of dependency addendum 6158946927 and Owner decision
+# 6160428682). S100 checks that both workflows embed the same provision block,
+# with the thirteen approved artifacts, the exact lock and closure, the approved
+# limits and vectors, and that the contract-tests step and the Orchestrator gate
+# are the only changes of those steps. S101 runs the extracted block, the
+# contract-tests step, and the Orchestrator step with no network access: no
+# time, an unsafe RUNNER_TEMP, a failed step, a bounded operation, and the stop
+# check. S102 runs the three fixed Python programs with controlled fakes only: a
+# fake HTTPS connection and small wheels for the downloader, a fake pip wheel
+# for the installer bootstrap, and a fake site for the import check. S103 reads
+# the receipt of the real provision of the contract-tests job. Without that task
+# root, S103 fails; no test installs a package. A controlled provision is
+# capability evidence only.
+#
+# Checks S104 to S107 cover the focused readback of the two Case 7 flow VTU
+# files (Issue #80, approved proposal 6136150842, Sections 2 to 6, and the
+# same admission). S104 runs the extracted reader functions with the real
+# pinned consumer of the contract-tests provision on controlled VTU files:
+# inline ASCII and base64, appended raw and base64, zlib, a polyhedron, and one
+# file for each failure: a truncated appended payload, a corrupt compressed
+# block, missing or CellData-only U, wrong components, a short array, missing
+# Points or cell offsets, bad XML, polyhedron cells without faces, a missing
+# wallDistance, two pieces, another data set type, and a reader warning. S105
+# runs the extracted readback after the receipt of the S94 fixture with the
+# real consumer: two-file PASS, one-file FAIL, a source change during or before
+# the read, a failed product run, no provision, a missing file, and a mixed
+# time. S106 runs the same readback with controlled fake roots and sites for the
+# guards only: timeout, output, memory, version, native, module, receipt,
+# root, time, source-size, link, combined-evidence, and stop limits. S107 checks
+# the frozen blocks, the call order, the limits, the fixed vector, the reader
+# boundary, and the published result. A fake site never proves native decoding,
+# and a controlled PASS is capability evidence only, never F4 or M3 acceptance.
+#
+# Checks S108 and S109 cover the review corrections R1 and R2 of PR #103 (Issue
+# #80, correction 6166142012). A fake site writes one complete reader record to
+# file descriptor 3 and then ends the native command; the record drives the
+# outcome and record guards only and is never a native read. S108: after a
+# complete PASS record, an unexpected exit status or a signal gives no PASS,
+# and a FAIL record stays FAIL. S109: a result.env that cannot be written, an
+# inventory.tsv that cannot be written, and a missing final SHA-256 give no
+# retained, side, or published PASS; the publication of the capture step gives
+# no PASS without the complete inventory of the retained records.
+#
 # Every observation runs in its own child process, so one failure cannot hide a
 # later failure and no observation can see the workspace of another observation.
 # The scenario reports every failing observation and then fails.
@@ -176,6 +220,15 @@ set -euo pipefail
 CASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${CASE_DIR}/../lib/harness.sh"
 source "${CASE_DIR}/../lib/assert.sh"
+
+# The contract-tests job provisions the pinned VTU reader before the suite
+# (S100 to S103). Only the native observations use that task root, so the
+# earlier observations run without it, as before.
+if [[ -n "${M3_VTU_DEP_ROOT:-}" ]]; then
+    AB_VTU_DEP_ROOT="$M3_VTU_DEP_ROOT"
+fi
+export AB_VTU_DEP_ROOT="${AB_VTU_DEP_ROOT:-}"
+unset M3_VTU_DEP_ROOT M3_VTU_PROVISION_RESULT
 
 STAGE_LIBRARY="${MASTER_SRC_DIR}/lib_batch_stage.sh"
 WORKFLOW="${REPO_ROOT}/.github/workflows/openfoam-evidence.yml"
@@ -7132,12 +7185,20 @@ s81_collect_keeps_the_workflow_interface() {
     workspace="$(new_workspace s81_interface)"
     ab_collect_fixture "$workspace"
     body="$(cat "${workspace}/capture_step.sh")"
-    assert_eq $'on:\n  workflow_dispatch:' \
+    assert_eq $'on:\n  workflow_dispatch:\n    inputs:\n      validation_only:\n        description: Validate workflow only. Run no product job.\n        type: boolean\n        required: false\n        default: false' \
         "$(awk '/^on:/ { on = 1; print; next } on && /^[^ ]/ { exit } on && NF { print }' "$WORKFLOW")" \
-        "S81: workflow_dispatch without inputs is the only trigger"
+        "S81: workflow_dispatch with only the optional Boolean validation_only input (default false) is the only trigger"
     assert_contains "$(cat "$WORKFLOW")" $'permissions:\n  contents: read' "S81: the token can only read contents"
     assert_contains "$(cat "$WORKFLOW")" $'  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120' \
         "S81: the job, runner, and 120-minute setting stay"
+    # evidence is the only job. Its one job-level condition makes it ineligible
+    # for a true validation_only input, before runner assignment.
+    assert_eq "  evidence:" "$(awk '/^jobs:/ { jobs = 1; next } jobs && /^[^ ]/ { exit } jobs && /^  [^ #]/ { print }' "$WORKFLOW")" \
+        "S81: evidence is the only job"
+    assert_contains "$(cat "$WORKFLOW")" $'\njobs:\n  evidence:\n    name: OpenFOAM v2512 four-Stage evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120\n    if: ${{ !inputs.validation_only }}\n    defaults:\n' \
+        "S81: the job-level validation_only condition follows the 120-minute setting in the evidence job header"
+    assert_eq $'      validation_only:\n    if: ${{ !inputs.validation_only }}' "$(grep -F -- 'validation_only' "$WORKFLOW")" \
+        "S81: only the input and the one job-level condition name validation_only"
     assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
         "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S81: the step list stays"
     assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
@@ -9119,10 +9180,2037 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
         "S99: the Orchestrator vector stays"
     assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
         "S99: the capture step guard stays 10 minutes"
-    assert_eq "10 15" "$(awk '/^    timeout-minutes:/ { print $2 }' "${REPO_ROOT}/.github/workflows/batch-contract.yml" | sort -n | paste -sd ' ' -)" \
-        "S99: the ShellCheck and contract jobs keep their 10-minute and 15-minute limits"
+    assert_eq "10 18" "$(awk '/^    timeout-minutes:/ { print $2 }' "${REPO_ROOT}/.github/workflows/batch-contract.yml" | sort -n | paste -sd ' ' -)" \
+        "S99: the ShellCheck job keeps its 10-minute limit, and the contract-tests job has its 18-minute limit (Owner decision 6170198169)"
     assert_contains "$text" "include-hidden-files: true" "S99: the upload keeps the hidden files"
     assert_contains "$text" 'path: ${{ runner.temp }}/evidence' "S99: the upload keeps the evidence directory"
+}
+
+# ---- S100 to S103: the M3 VTU reader provision (Issue #80) -----------------
+
+# The controlled provision step of the contract-tests job.
+AB_VP_STEP="Provision the M3 VTU reader dependencies"
+
+# ab_vp_expected_manifest - the header and the thirteen fixed artifact rows of
+# dependency addendum 6158946927, Section 2: role, distribution, version, file,
+# HTTPS URL, registered bytes, registered SHA-256, and the bytes and SHA-256 of
+# the exact-wheel core metadata.
+ab_vp_expected_manifest() {
+    local p='https://files.pythonhosted.org/packages'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        role distribution version file url bytes sha256 metadata_bytes metadata_sha256 \
+        runtime vtk 9.5.2 vtk-9.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+        "${p}/c5/6c/e5544c77b568bfbcc3592fb5e23a5dee8e84df9ee316230509362fb6d432/vtk-9.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" \
+        112292112 454711c51038824ddc75f955e1064c4e214b452c2e67083f01a8b43fc0ed62cb \
+        5560 94f35aa687ac84fb560902a2d5bcc2d38d8ab00f3bef2a18295014d808d5ef48 \
+        runtime matplotlib 3.10.7 matplotlib-3.10.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+        "${p}/7d/18/95ae2e242d4a5c98bd6e90e36e128d71cf1c7e39b0874feaed3ef782e789/matplotlib-3.10.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" \
+        8696996 d5f256d49fea31f40f166a5e3131235a5d2f4b7f44520b1cf0baf1ce568ccff0 \
+        11264 fd8befb2181fe3d11f6477c359d8f452b4fbc90f6969a6893e09046d935e1677 \
+        runtime contourpy 1.3.3 contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+        "${p}/cc/8f/ec6289987824b29529d0dfda0d74a07cec60e54b9c92f3c9da4c0ac732de/contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" \
+        362601 4d00e655fcef08aba35ec9610536bfe90267d7ab5ba944f7032549c55a146da1 \
+        5461 c43cef86baef09cff9c77975e578fa8cca0c9454df40dc176938b499a63de54a \
+        runtime cycler 0.12.1 cycler-0.12.1-py3-none-any.whl \
+        "${p}/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl" \
+        8321 85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30 \
+        3779 23289e19b76f1e01394227696e6af2b6cd1ce79e89731209bf9195148b18ed36 \
+        runtime fonttools 4.60.1 fonttools-4.60.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl \
+        "${p}/c0/ca/4bb48a26ed95a1e7eba175535fe5805887682140ee0a0d10a88e1de84208/fonttools-4.60.1-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl" \
+        4923716 8177ec9676ea6e1793c8a084a90b65a9f778771998eb919d05db6d4b1c0b114c \
+        112334 0886770f170aaa482341521aebc9dd59b7a8e073fecab90194e2eef9d999ca03 \
+        runtime kiwisolver 1.4.9 kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+        "${p}/70/90/6d240beb0f24b74371762873e9b7f499f1e02166a2d9c5801f4dbf8fa12e/kiwisolver-1.4.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" \
+        1474756 f6008a4919fdbc0b0097089f67a1eb55d950ed7e90ce2cc3e640abadd2757a04 \
+        6260 cad34a37b5cb66cfa1b9676f33721037ae2d850b9b0c71377478a1d6bf0c7d40 \
+        runtime numpy 2.3.4 numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+        "${p}/f9/58/30a85127bfee6f108282107caf8e06a1f0cc997cb6b52cdee699276fcce4/numpy-2.3.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" \
+        16641271 4121c5beb58a7f9e6dfdee612cb24f4df5cd4db6e8261d7f4d7450a997a65d6a \
+        62117 02d05671e1cb75fe80fda9cfd9e7210872ba35b5d54be6e295493ef22a8080a8 \
+        runtime packaging 25.0 packaging-25.0-py3-none-any.whl \
+        "${p}/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl" \
+        66469 29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484 \
+        3281 5b611a609c38fefc3d616bf45d20aec98fb7d53f245daca9e2c30fc85c7ac282 \
+        runtime pillow 11.3.0 pillow-11.3.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl \
+        "${p}/8d/33/e9200d2bd7ba00dc3ddb78df1198a6e80d7669cce6c2bdbeb2530a74ec58/pillow-11.3.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" \
+        7644652 67172f2944ebba3d4a7b54f2e95c786a3a50c21b88456329314caaa28cda70f6 \
+        9023 d53d4d78f8a8efe182396711ef76840386d2ba4ccdad421f58cc00c3b3401f73 \
+        runtime pyparsing 3.2.5 pyparsing-3.2.5-py3-none-any.whl \
+        "${p}/10/5e/1aa9a93198c6b64513c9d7752de7422c06402de6600a8767da1524f9570b/pyparsing-3.2.5-py3-none-any.whl" \
+        113890 e38a4f02064cf41fe6593d328d0512495ad1f3d8a91c4f73fc401b3079a59a5e \
+        5030 cd543f26f0f59ac7b446f57cc91e8def7a3eb735fdd5e91c4e402b8725696eba \
+        runtime python-dateutil 2.9.0.post0 python_dateutil-2.9.0.post0-py2.py3-none-any.whl \
+        "${p}/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl" \
+        229892 a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427 \
+        8354 a9d436da322be808332f98d88325998e87cb693a678a9969feb4cfad729a6e93 \
+        runtime six 1.17.0 six-1.17.0-py2.py3-none-any.whl \
+        "${p}/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl" \
+        11050 4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
+        1658 562042078c2752549f6d8a7c86dbc5dd708088a7be6d80672ec7b07100b72468 \
+        installer pip 25.2 pip-25.2-py3-none-any.whl \
+        "${p}/b7/3f/945ef7ab14dc4f9d7f40288d2df998d1837ee0888ec3659c813487572faa/pip-25.2-py3-none-any.whl" \
+        1752557 6d67a2b4e7f14d8b31b8b52648866fa717f45a1eb70e83002f4331d07e953717 \
+        4744 97a3ad14d71fd8914a38f24af5b31a1f9faeb05aea66a4af40d979d6d7ad229f
+}
+
+# ab_vp_expected_lock - the exact twelve-line runtime lock of the addendum,
+# Section 4.
+ab_vp_expected_lock() {
+    printf '%s\n' \
+        'vtk==9.5.2 --hash=sha256:454711c51038824ddc75f955e1064c4e214b452c2e67083f01a8b43fc0ed62cb' \
+        'matplotlib==3.10.7 --hash=sha256:d5f256d49fea31f40f166a5e3131235a5d2f4b7f44520b1cf0baf1ce568ccff0' \
+        'contourpy==1.3.3 --hash=sha256:4d00e655fcef08aba35ec9610536bfe90267d7ab5ba944f7032549c55a146da1' \
+        'cycler==0.12.1 --hash=sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30' \
+        'fonttools==4.60.1 --hash=sha256:8177ec9676ea6e1793c8a084a90b65a9f778771998eb919d05db6d4b1c0b114c' \
+        'kiwisolver==1.4.9 --hash=sha256:f6008a4919fdbc0b0097089f67a1eb55d950ed7e90ce2cc3e640abadd2757a04' \
+        'numpy==2.3.4 --hash=sha256:4121c5beb58a7f9e6dfdee612cb24f4df5cd4db6e8261d7f4d7450a997a65d6a' \
+        'packaging==25.0 --hash=sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484' \
+        'pillow==11.3.0 --hash=sha256:67172f2944ebba3d4a7b54f2e95c786a3a50c21b88456329314caaa28cda70f6' \
+        'pyparsing==3.2.5 --hash=sha256:e38a4f02064cf41fe6593d328d0512495ad1f3d8a91c4f73fc401b3079a59a5e' \
+        'python-dateutil==2.9.0.post0 --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427' \
+        'six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274'
+}
+
+# ab_vp_expected_requires - the mandatory default requirement of each declaring
+# distribution, as the exact embedded core metadata states it (addendum,
+# Section 2). No other selected distribution has a mandatory requirement.
+ab_vp_expected_requires() {
+    printf '%s\t%s\n' declaring requirement \
+        vtk 'matplotlib>=2.0.0' \
+        matplotlib 'contourpy>=1.0.1' matplotlib 'cycler>=0.10' matplotlib 'fonttools>=4.22.0' \
+        matplotlib 'kiwisolver>=1.3.1' matplotlib 'numpy>=1.23' matplotlib 'packaging>=20.0' \
+        matplotlib 'pillow>=8' matplotlib 'pyparsing>=3' matplotlib 'python-dateutil>=2.7' \
+        contourpy 'numpy>=1.25' \
+        python-dateutil 'six >=1.5'
+}
+
+# ab_vp_block <workflow> <step> - the provision block of one step, as the step
+# runs it: from the begin marker line through the end marker line and its line
+# end. The awk program reads to the end, so pipefail sees no SIGPIPE.
+ab_vp_block() {
+    ab_step_run_body "$2" "$1" | awk '
+        done { next }
+        $0 == "# ---- M3 VTU provision: begin ----" { inside = 1 }
+        inside { print }
+        inside && $0 == "# ---- M3 VTU provision: end ----" { inside = 0; done = 1 }'
+}
+
+# ab_vp_heredoc <file> <name> - the body of the quoted here-document <name>,
+# which the block reads into the variable <name>.
+ab_vp_heredoc() {
+    awk -v start="IFS= read -r -d '' ${2} <<'${2}' || true" -v end="$2" '
+        $0 == start { inside = 1; next }
+        inside && $0 == end { exit }
+        inside { print }' "$1"
+}
+
+# ab_vp_code <workspace> - write the provision block of the contract-tests step
+# to block.sh, and its three fixed Python programs to fetch.py, install.py,
+# and verify.py.
+ab_vp_code() {
+    local name
+    ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${1}/block.sh"
+    [[ -s "${1}/block.sh" ]] || _fail "the contract-tests step must hold the provision block"
+    for name in fetch install verify; do
+        ab_vp_heredoc "${1}/block.sh" "VP_${name^^}_PY" > "${1}/${name}.py"
+        [[ -s "${1}/${name}.py" ]] || _fail "the provision block must hold VP_${name^^}_PY"
+    done
+}
+
+# ab_vp_script <workspace> <file> - a script that holds the provision block
+# and then the lines on standard input. The block identity comes from the
+# script file itself, as in the workflow step.
+ab_vp_script() {
+    {
+        printf 'set -euo pipefail\n'
+        ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP"
+        cat
+    } > "${1}/${2}"
+}
+
+# ab_vp_step_without <workflow> <step> <first> <last> - the YAML text of one
+# step without the lines from <first> through <last>, which must exist.
+ab_vp_step_without() {
+    awk -v want="      - name: $2" -v first="$3" -v last="$4" '
+        $0 == want { inside = 1; print; next }
+        inside && /^      - name: / { exit }
+        !inside { next }
+        skip == 0 && $0 == first { skip = 1; next }
+        skip == 1 { if ($0 == last) skip = 2; next }
+        { print }' "$1"
+}
+
+# The contract-tests job cap of S100 (Owner decision 6170198169, contract
+# 6170722644, Section 4). The job must hold exactly one job-level cap line,
+# "    timeout-minutes: 18", before its steps. Only that validated line goes
+# back to 15 for the comparison with the admitted base file; S100 normalizes
+# no other byte.
+
+# ab_vc_guard <workflow> <base> - the cap guard of S100. Print one result:
+# "REJECT_BEFORE_NORMALIZATION: <reason>" when the workflow does not end with
+# an LF (AWK would add that byte, Owner decision 6173182935) or the
+# contract-tests job does not hold the one authorized cap line. Else write
+# <base>, the workflow with that line set back to 15 and without the provision
+# step, and print "ACCEPT" when <base> is the admitted base file or
+# "REJECT_AT_BASE_HASH" when it is not. A missing workflow or a tool error
+# prints no result and returns 1, so it is never an expected rejection. A cap
+# line is a contract-tests line with "timeout-minutes" and less than 8 leading
+# spaces, that is, not a step line.
+ab_vc_guard() {
+    local workflow="$1" base="$2" verdict hash last
+    rm -f -- "$base" || { _fail "S100: the cap guard cannot remove ${base}"; return 1; }
+    [[ -f "$workflow" ]] || { _fail "S100: the cap guard has no workflow file ${workflow}"; return 1; }
+    last="$(tail -c 1 -- "$workflow" | od -An -tx1 | tr -d ' \n')" ||
+        { _fail "S100: the cap guard cannot read the last byte of ${workflow}"; return 1; }
+    if [[ "$last" != 0a ]]; then
+        printf 'REJECT_BEFORE_NORMALIZATION: the workflow has no final LF\n'
+        return 0
+    fi
+    verdict="$(awk '
+        /^[^ #]/ { jobs = ($0 == "jobs:"); job = "" }
+        jobs && /^  [^ #]/ { job = $0; steps = 0; if (job == "  contract-tests:") count++ }
+        job != "  contract-tests:" { next }
+        $0 == "    steps:" { steps = 1 }
+        /timeout-minutes/ { match($0, /^ */); if (RLENGTH < 8) { n++; line = NR; text = $0; late = steps } }
+        END {
+            if (count != 1) print "REJECT the workflow has " count + 0 " contract-tests jobs"
+            else if (n == 0) print "REJECT the contract-tests job has no job-level cap line"
+            else if (n > 1) print "REJECT the contract-tests job has " n " job-level cap lines"
+            else if (text != "    timeout-minutes: 18") print "REJECT the job-level cap line of contract-tests is [" text "], not [    timeout-minutes: 18]"
+            else if (late) print "REJECT the job-level cap line of contract-tests comes after its steps"
+            else print "LINE " line
+        }' "$workflow")" || { _fail "S100: the cap guard cannot read ${workflow}"; return 1; }
+    case "$verdict" in
+        "REJECT "*) printf 'REJECT_BEFORE_NORMALIZATION: %s\n' "${verdict#REJECT }"; return 0 ;;
+        "LINE "*) ;;
+        *) _fail "S100: the cap guard gives no result for ${workflow}" "$verdict"; return 1 ;;
+    esac
+    awk -v cap="${verdict#LINE }" 'NR == cap { print "    timeout-minutes: 15"; next } { print }' "$workflow" |
+        awk -v want="      - name: ${AB_VP_STEP}" '
+        $0 == want { skip = 1; next }
+        skip && /^      - name: / { skip = 0 }
+        !skip { print }' > "$base" || { _fail "S100: the cap guard cannot write ${base}"; return 1; }
+    hash="$(sha256sum < "$base" | cut -d ' ' -f 1)" || { _fail "S100: the cap guard cannot hash ${base}"; return 1; }
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { _fail "S100: the cap guard has no SHA-256 of ${base}" "$hash"; return 1; }
+    if [[ "$hash" == 307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766 ]]; then
+        printf 'ACCEPT\n'
+    else
+        printf 'REJECT_AT_BASE_HASH\n'
+    fi
+}
+
+# ab_vc_input <mode> - one focused input of S100: batch-contract.yml with its
+# job-level contract-tests cap line changed for <mode>, and no other change.
+# legal: "    timeout-minutes: 18"; old_15; missing; duplicate: two 18-minute
+# lines; step: the 18-minute line moves to the step "Run the v4 contract
+# tests"; shellcheck: it moves to the ShellCheck job, in place of the 10-minute
+# line; cap_19; job_name: the legal line and a changed contract-tests job name.
+# Returns 1 when the workflow has no single such line or the edit has no place.
+ab_vc_input() {
+    awk -v mode="$1" '
+        BEGIN {
+            bad = (mode !~ /^(legal|old_15|missing|duplicate|step|shellcheck|cap_19|job_name)$/)
+            need = (mode == "step" || mode == "shellcheck" || mode == "job_name")
+        }
+        /^[^ #]/ { jobs = ($0 == "jobs:"); job = "" }
+        jobs && /^  [^ #]/ { job = $0; steps = 0 }
+        job == "  contract-tests:" && $0 == "    steps:" { steps = 1 }
+        job == "  contract-tests:" && !steps && /^    timeout-minutes: / {
+            caps++
+            if (mode == "legal" || mode == "job_name") print "    timeout-minutes: 18"
+            else if (mode == "old_15") print "    timeout-minutes: 15"
+            else if (mode == "cap_19") print "    timeout-minutes: 19"
+            else if (mode == "duplicate") { print "    timeout-minutes: 18"; print "    timeout-minutes: 18" }
+            next
+        }
+        mode == "step" && job == "  contract-tests:" && $0 == "      - name: Run the v4 contract tests" {
+            print; print "        timeout-minutes: 18"; edits++; next
+        }
+        mode == "shellcheck" && job == "  shellcheck:" && /^    timeout-minutes: / {
+            print "    timeout-minutes: 18"; edits++; next
+        }
+        mode == "job_name" && job == "  contract-tests:" && $0 == "    name: v4 batch-runner contract tests" {
+            print "    name: v4 batch-runner contract tests, changed"; edits++; next
+        }
+        { print }
+        END { exit (bad || caps != 1 || edits != need) }' "$CONTRACT_WORKFLOW"
+}
+
+s100_provision_block_is_identical_in_both_workflows() {
+    local workspace constant vector name pattern mode result base actual
+    workspace="$(new_workspace s100_provision)"
+    ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${workspace}/contract.block"
+    ab_vp_block "$WORKFLOW" "Run the Orchestrator" > "${workspace}/evidence.block"
+    [[ -s "${workspace}/contract.block" ]] ||
+        _fail "S100: the contract-tests provision step holds the provision block"
+    [[ -s "${workspace}/evidence.block" ]] ||
+        _fail "S100: the Orchestrator step of the evidence workflow holds the provision block"
+    assert_eq "$(tail -n 1 "${workspace}/contract.block")" "# ---- M3 VTU provision: end ----" \
+        "S100: the contract-tests block is complete"
+    assert_eq "$(sha256sum < "${workspace}/contract.block")" "$(sha256sum < "${workspace}/evidence.block")" \
+        "S100: both workflows embed the same provision block, so the manifest and the provision code have the same SHA-256"
+    assert_eq "1 1" "$(grep -cx '          # ---- M3 VTU provision: begin ----' "$CONTRACT_WORKFLOW") $(grep -cx '          # ---- M3 VTU provision: begin ----' "$WORKFLOW")" \
+        "S100: each workflow holds the block once"
+
+    # The fixed artifact set, lock, and mandatory closure.
+    ab_vp_heredoc "${workspace}/contract.block" VP_MANIFEST > "${workspace}/manifest.tsv"
+    assert_eq "$(ab_vp_expected_manifest)" "$(cat "${workspace}/manifest.tsv")" \
+        "S100: the manifest holds exactly the thirteen approved artifacts"
+    assert_eq "152465726 154218283" \
+        "$(awk -F '\t' 'NR > 1 { all += $6; if ($1 == "runtime") run += $6 } END { print run, all }' "${workspace}/manifest.tsv")" \
+        "S100: the runtime archives have 152465726 bytes, and all archives 154218283 bytes"
+    assert_eq "$(ab_vp_expected_lock)" "$(ab_vp_heredoc "${workspace}/contract.block" VP_LOCK)" \
+        "S100: the requirement lock is the exact twelve-line runtime lock"
+    assert_eq "$(ab_vp_expected_requires)" "$(ab_vp_heredoc "${workspace}/contract.block" VP_REQUIRES)" \
+        "S100: the mandatory default closure is the approved one"
+
+    # The approved limits.
+    for constant in VP_TOTAL_MS=90000 VP_FETCH_MS=30000 VP_INSTALL_MS=35000 VP_VERIFY_MS=10000 VP_RESERVE_MS=15000 \
+                    VP_KILL_GRACE_MS=5000 VP_ARCHIVE_LIMIT=154218283 VP_EXPANDED_LIMIT=1073741824 \
+                    VP_TASK_LIMIT=3221225472 VP_AS_LIMIT=4294967296 VP_CPU_SECONDS=60 VP_TEXT_LIMIT=65536 \
+                    VP_PYTHON=/usr/bin/python3.12; do
+        assert_eq "1" "$(grep -cx -- "$constant" "${workspace}/contract.block")" "S100: the block sets ${constant}"
+    done
+    # The three fixed vectors of the addendum, Section 4.
+    for vector in \
+        'timeout --signal=TERM --kill-after=5s "${DEP_FETCH_SECONDS}s" \' \
+        '/usr/bin/python3.12 -I - "$M3_VTU_DEP_ROOT"' \
+        'PIP_CONFIG_FILE=/dev/null TMPDIR="${M3_VTU_DEP_ROOT}/tmp" \' \
+        'timeout --signal=TERM --kill-after=5s "${DEP_INSTALL_SECONDS}s" \' \
+        '/usr/bin/python3.12 -I - \' \
+        '"${M3_VTU_DEP_ROOT}/installer/pip-25.2-py3-none-any.whl" \' \
+        '--isolated --disable-pip-version-check install --no-index \' \
+        '--find-links="${M3_VTU_DEP_ROOT}/wheels" --require-hashes \' \
+        '--only-binary=:all: --no-cache-dir --no-compile \' \
+        '--target="${M3_VTU_DEP_ROOT}/site" \' \
+        '--requirement="${M3_VTU_DEP_ROOT}/requirements.lock"' \
+        'timeout --signal=TERM --kill-after=5s "${DEP_VERIFY_SECONDS}s" \' \
+        '/usr/bin/python3.12 -I - "${M3_VTU_DEP_ROOT}/site"'; do
+        assert_eq "1" "$(grep -cxF -- "$vector" <(sed -e 's/^[[:space:]]*//' "${workspace}/contract.block"))" \
+            "S100: the block holds the fixed vector line [${vector}] once"
+    done
+    # No privilege, system package, resolver, source build, or fallback.
+    for pattern in 'sudo' 'apt-get' 'apt ' 'curl ' 'wget ' '--no-deps' '--ignore-requires-python' '--break-system-packages' \
+                   '--index-url' '--extra-index-url' '--user' '--editable' 'setup.py' 'addsitedir' 'PYTHONPATH' \
+                   'LD_LIBRARY_PATH' 'urllib.request' 'getproxies' 'ssl._create_unverified_context' 'CERT_NONE'; do
+        assert_eq "0" "$(grep -cF -- "$pattern" "${workspace}/contract.block")" \
+            "S100: the block holds no [${pattern}]"
+    done
+
+    # The contract-tests job: one explicit provision step before the suite, the
+    # one authorized cap line, and no other change.
+    assert_eq "Check out the repository|Report the runner environment|Check the contract-test harness syntax|${AB_VP_STEP}|Run the v4 contract tests|Confirm that the working tree is unchanged|Check out the repository|Install ShellCheck|Run the ShellCheck baseline gate" \
+        "$(sed -n -e 's/^      - name: //p' "$CONTRACT_WORKFLOW" | paste -sd '|' -)" \
+        "S100: the provision step comes before the suite, and the other steps stay"
+    # The cap guard on nine focused copies of this workflow text, each with one
+    # change, and then on the workflow itself. A rejected copy passes only with
+    # its expected reason. Before normalization, the guard writes no base file.
+    actual=''
+    for mode in legal old_15 missing duplicate step shellcheck cap_19 job_name; do
+        ab_vc_input "$mode" > "${workspace}/cap.${mode}.yml" ||
+            _fail "S100: the focused input ${mode} has the one job-level contract-tests cap line to change"
+        result="$(ab_vc_guard "${workspace}/cap.${mode}.yml" "${workspace}/cap.${mode}.base.yml")"
+        base='-'
+        [[ ! -e "${workspace}/cap.${mode}.base.yml" ]] || base='base'
+        actual+="${mode} ${result} ${base}|"
+    done
+    assert_eq "legal ACCEPT base|old_15 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 15], not [    timeout-minutes: 18] -|missing REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|duplicate REJECT_BEFORE_NORMALIZATION: the contract-tests job has 2 job-level cap lines -|step REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|shellcheck REJECT_BEFORE_NORMALIZATION: the contract-tests job has no job-level cap line -|cap_19 REJECT_BEFORE_NORMALIZATION: the job-level cap line of contract-tests is [    timeout-minutes: 19], not [    timeout-minutes: 18] -|job_name REJECT_AT_BASE_HASH base|" \
+        "$actual" \
+        "S100: the cap guard accepts only the one authorized 18-minute cap line of the contract-tests job, and rejects each changed copy for its reason"
+    # The ninth copy (Owner decision 6173182935): a byte copy of the legal input
+    # without its final LF, and no other change. The guard normalizes no other
+    # byte, so it rejects this copy before normalization.
+    cp -- "${workspace}/cap.legal.yml" "${workspace}/cap.no_final_lf.yml" ||
+        _fail "S100: the focused input no_final_lf is a byte copy of the legal input"
+    truncate -s -1 -- "${workspace}/cap.no_final_lf.yml" ||
+        _fail "S100: the focused input no_final_lf loses its last byte"
+    { cat -- "${workspace}/cap.no_final_lf.yml" && printf '\n'; } | cmp -s -- - "${workspace}/cap.legal.yml" ||
+        _fail "S100: the legal input ends with its final LF, and the focused input no_final_lf is the legal input without only that byte"
+    result="$(ab_vc_guard "${workspace}/cap.no_final_lf.yml" "${workspace}/cap.no_final_lf.base.yml")"
+    base='-'
+    [[ ! -e "${workspace}/cap.no_final_lf.base.yml" ]] || base='base'
+    assert_eq "no_final_lf REJECT_BEFORE_NORMALIZATION: the workflow has no final LF -" "no_final_lf ${result} ${base}" \
+        "S100: the cap guard rejects the legal copy without its final LF before normalization, and writes no base file"
+    result="$(ab_vc_guard "$CONTRACT_WORKFLOW" "${workspace}/batch-contract-base.yml")"
+    [[ "$result" != REJECT_BEFORE_NORMALIZATION* ]] ||
+        _fail "S100: the contract-tests job holds the one authorized cap line, [    timeout-minutes: 18], before its steps" "$result"
+    assert_eq "307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766" \
+        "$(sha256sum < "${workspace}/batch-contract-base.yml" | cut -d ' ' -f 1)" \
+        "S100: with that cap line set back to 15 and without the provision step, batch-contract.yml is the admitted base file"
+    assert_eq "ACCEPT" "$result" "S100: the cap guard accepts batch-contract.yml"
+    assert_eq "$(printf '        timeout-minutes: 2\n        run: |\n          set -euo pipefail\n          # ---- M3 VTU provision: begin ----')" \
+        "$(awk -v want="      - name: ${AB_VP_STEP}" '$0 == want { inside = 1; next } inside { print; if (++n == 4) exit }' "$CONTRACT_WORKFLOW")" \
+        "S100: the provision step has no condition, a 2-minute guard, and starts with the block"
+    assert_eq "$(printf '%s\n' '# ---- M3 VTU provision: end ----' 'vp_provision' \
+                  'if [[ "$VP_RESULT" != PROVISION_AVAILABLE ]]; then' \
+                  '    echo "M3 VTU provision: ${VP_RESULT}: ${VP_REASON}" >&2' '    exit 1' 'fi')" \
+        "$(ab_step_run_body "$AB_VP_STEP" "$CONTRACT_WORKFLOW" | sed -n -e '/^# ---- M3 VTU provision: end ----$/,$p')" \
+        "S100: a provision that is not PROVISION_AVAILABLE fails the step"
+
+    # The evidence workflow: the block and its gate come first in the
+    # Orchestrator step, before the OpenFOAM environment; the step is otherwise
+    # the admitted step, with the unchanged Orchestrator vector.
+    ab_vp_step_without "$WORKFLOW" "Run the Orchestrator" '          # ---- M3 VTU provision: begin ----' \
+        '          # ---- M3 VTU provision gate: end ----' > "${workspace}/orchestrator-base.yml"
+    assert_eq "7e0297ba4c57e6f3c4a42b8970258c958a4d388f1592d51c36d84b59eb3629bc" \
+        "$(sha256sum < "${workspace}/orchestrator-base.yml" | cut -d ' ' -f 1)" \
+        "S100: without the provision block and gate, the Orchestrator step is the admitted step"
+    assert_eq "$(printf '%s\n' '# ---- M3 VTU provision: end ----' \
+                  '# The provision-success gate: the Orchestrator never starts after a failed' \
+                  '# provision, and the Stage results stay NOT_ATTEMPTED.' \
+                  'vp_provision "$(( ${CAPTURE_DEADLINE:-0} - ${CAPTURE_START_GUARD_SECONDS:-60} - 60 ))"' \
+                  'if [[ "$VP_RESULT" != PROVISION_AVAILABLE ]]; then' \
+                  '    echo "M3 VTU provision: ${VP_RESULT}: ${VP_REASON}" >&2' '    exit 1' 'fi' \
+                  '# ---- M3 VTU provision gate: end ----' 'source "$LIB"')" \
+        "$(ab_step_run_body "Run the Orchestrator" | sed -n -e '/^# ---- M3 VTU provision: end ----$/,/^source "\$LIB"$/p')" \
+        "S100: the gate comes after the block and before the bounded-runner library and the OpenFOAM environment"
+    assert_eq "set -euo pipefail" "$(ab_step_run_body "Run the Orchestrator" | head -n 1)" \
+        "S100: the Orchestrator step starts with the strict shell options"
+    assert_eq "2" "$(ab_step_run_body "Run the Orchestrator" | grep -n -m 1 -x '# ---- M3 VTU provision: begin ----' | cut -d : -f 1)" \
+        "S100: the provision block is the first work of the Orchestrator step"
+    assert_eq "always() && env.PREPARE_RESULT == 'SUCCEEDED'" \
+        "$(ab_workflow_step_block "Run the Orchestrator" | sed -n -e 's/^        if: //p')" \
+        "S100: the Orchestrator step condition stays"
+    # The job summary shows the provision result.
+    assert_eq "1" "$(grep -cF -- '| VTU provision | \`${M3_VTU_PROVISION_RESULT:-NOT_ATTEMPTED}\` |' "$WORKFLOW")" \
+        "S100: the job summary shows the provision result"
+    for name in "Start the evidence clock" "Check out the repository" "Prepare the one-Case DOE Batch CSV" "Capture the evidence"; do
+        assert_eq "0" "$(ab_workflow_step_block "$name" | grep -c 'M3 VTU provision: begin')" \
+            "S100: the step '${name}' holds no provision block"
+    done
+}
+
+# ab_vp_foreign_group - print one live process group that the test user may
+# not signal: kill -0 gives EPERM and sends no signal. Fails when the host has
+# none, for example when the tests run as root.
+ab_vp_foreign_group() {
+    local group text
+    while read -r group; do
+        [[ "$group" =~ ^[0-9]+$ ]] && (( group > 1 )) || continue
+        text="$(LC_ALL=C kill -0 -- "-${group}" 2>&1)" || true
+        if [[ "$text" == *"Operation not permitted"* ]]; then
+            printf '%s\n' "$group"
+            return 0
+        fi
+    done < <(ps -eo pgid=,stat= | awk '$2 !~ /^Z/ { print $1 }' | sort -un)
+    _fail "the host must have a process group of another user for the stop check"
+}
+
+s101_provision_gate_and_bounded_operations() {
+    local workspace out status start elapsed group pids line
+    workspace="$(new_workspace s101_gate)"
+    mkdir -p "${workspace}/runner_temp" "${workspace}/real_temp"
+    ln -s "${workspace}/real_temp" "${workspace}/linked_temp"
+
+    # No provision time: no task root, no command, and NOT_ATTEMPTED in GITHUB_ENV.
+    ab_vp_script "$workspace" no_time.sh <<'EOF'
+vp_provision "$(( EPOCHSECONDS - 1 ))"
+printf 'result=%s\nroot=%s\nreason=%s\n' "$VP_RESULT" "${VP_ROOT:-}" "$VP_REASON"
+EOF
+    : > "${workspace}/github_env"
+    out="$(env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/no_time.sh" 2>&1)" || _fail "S101: vp_provision returns 0 without time" "$out"
+    assert_contains "$out" "result=NOT_ATTEMPTED" "S101: no provision time gives NOT_ATTEMPTED"
+    assert_contains "$out" $'root=\n' "S101: no provision time makes no task root"
+    assert_eq "" "$(ls -A "${workspace}/runner_temp")" "S101: no provision time writes nothing below RUNNER_TEMP"
+    assert_eq "M3_VTU_PROVISION_RESULT=NOT_ATTEMPTED" "$(cat "${workspace}/github_env")" \
+        "S101: GITHUB_ENV gets only the result, and no root path"
+
+    # An unsafe RUNNER_TEMP: no task root and NOT_VERIFIED, before any network
+    # access.
+    ab_vp_script "$workspace" linked.sh <<'EOF'
+vp_provision
+printf 'result=%s\nroot=%s\nreason=%s\n' "$VP_RESULT" "${VP_ROOT:-}" "$VP_REASON"
+EOF
+    : > "${workspace}/github_env"
+    out="$(env RUNNER_TEMP="${workspace}/linked_temp" GITHUB_ENV="${workspace}/github_env" \
+        bash "${workspace}/linked.sh" 2>&1)" || _fail "S101: vp_provision returns 0 with a linked RUNNER_TEMP" "$out"
+    assert_contains "$out" "result=NOT_VERIFIED" "S101: a linked RUNNER_TEMP gives NOT_VERIFIED"
+    assert_contains "$out" "RUNNER_TEMP" "S101: the reason names RUNNER_TEMP"
+    assert_eq "" "$(ls -A "${workspace}/real_temp")" "S101: a linked RUNNER_TEMP gets no task root"
+    assert_eq "M3_VTU_PROVISION_RESULT=NOT_VERIFIED" "$(cat "${workspace}/github_env")" \
+        "S101: GITHUB_ENV gets NOT_VERIFIED and no root path"
+
+    # The contract-tests step fails on a failed provision, so the suite and the
+    # required check fail.
+    ab_step_run_body "$AB_VP_STEP" "$CONTRACT_WORKFLOW" > "${workspace}/contract_step.sh"
+    : > "${workspace}/github_env"
+    env RUNNER_TEMP="${workspace}/linked_temp" GITHUB_ENV="${workspace}/github_env" \
+        bash -eo pipefail "${workspace}/contract_step.sh" > "${workspace}/contract_step.out" 2>&1 && status=0 || status=$?
+    assert_eq "1" "$status" "S101: the contract-tests provision step fails after a failed provision"
+    assert_contains "$(cat "${workspace}/contract_step.out")" "M3 VTU provision: NOT_VERIFIED: " \
+        "S101: the failed step names the result and the reason"
+
+    # The evidence workflow: a failed provision fails the Orchestrator step
+    # before the bounded-runner library, the OpenFOAM environment, and the
+    # Orchestrator. ORCHESTRATOR_STARTED, OVERALL_RESULT, and the Stage results
+    # keep the values of the clock step.
+    ab_step_run_body "Run the Orchestrator" > "${workspace}/orchestrator_step.sh"
+    printf 'printf "sourced\\n" > %q\n' "${workspace}/lib_sourced" > "${workspace}/lib.sh"
+    : > "${workspace}/github_env"
+    env RUNNER_TEMP="${workspace}/runner_temp" GITHUB_ENV="${workspace}/github_env" LIB="${workspace}/lib.sh" \
+        EVIDENCE_DIR="${workspace}/runner_temp/evidence" CAPTURE_DEADLINE="$(( EPOCHSECONDS + 60 ))" \
+        CAPTURE_START_GUARD_SECONDS=60 OPENFOAM_BASHRC="${workspace}/no_bashrc" \
+        bash -eo pipefail "${workspace}/orchestrator_step.sh" > "${workspace}/orchestrator_step.out" 2>&1 && status=0 || status=$?
+    assert_eq "1" "$status" "S101: the Orchestrator step fails when no provision time is left"
+    assert_eq "M3_VTU_PROVISION_RESULT=NOT_ATTEMPTED" "$(cat "${workspace}/github_env")" \
+        "S101: the step writes only the provision result: no ORCHESTRATOR_STARTED, OVERALL_RESULT, or Stage line"
+    assert_file_missing "${workspace}/lib_sourced" "S101: the step stops before the bounded-runner library"
+    assert_contains "$(cat "${workspace}/orchestrator_step.out")" "M3 VTU provision: NOT_ATTEMPTED: " \
+        "S101: the failed gate names the result and the reason"
+
+    # The job summary shows the provision result.
+    ab_step_run_body "Write the job summary" > "${workspace}/summary_step.sh"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" M3_VTU_PROVISION_RESULT=NOT_VERIFIED \
+        bash -eo pipefail "${workspace}/summary_step.sh" > /dev/null 2>&1 || _fail "S101: the summary step succeeds"
+    assert_contains "$(cat "${workspace}/step_summary")" "| VTU provision | \`NOT_VERIFIED\` |" \
+        "S101: the summary row shows the provision result"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" bash -eo pipefail "${workspace}/summary_step.sh" > /dev/null 2>&1 ||
+        _fail "S101: the summary step succeeds without a provision"
+    assert_contains "$(cat "${workspace}/step_summary")" "| VTU provision | \`NOT_ATTEMPTED\` |" \
+        "S101: a missing provision result is NOT_ATTEMPTED in the summary"
+
+    # vp_op: a command that does not end in its limit gets SIGTERM at the
+    # limit, and its process group is empty before vp_op returns.
+    mkdir -p "${workspace}/op_root/records"
+    ab_vp_script "$workspace" op.sh <<'EOF'
+VP_ROOT="$1"
+VP_END_MS=$(( $(vp_now_ms) + 30000 ))
+start=$(vp_now_ms)
+VP_OP_STDIN=""
+vp_op slow 1000 bash -c 'sleep 30 & printf "%s\n" "$!" > "$1/child"; wait' _ "$VP_ROOT"
+printf 'outcome=%s status=%s stop=%s limit=%s elapsed=%s group=%s\n' "$VP_OP_OUTCOME" "$VP_OP_STATUS" "$VP_STOP" \
+    "$VP_OP_LIMIT_MS" "$(( $(vp_now_ms) - start ))" "$VP_OP_GROUP"
+# No time: the command never starts.
+VP_END_MS=$(( $(vp_now_ms) + VP_RESERVE_MS ))
+vp_op late 1000 bash -c ': > "$1/late"' _ "$VP_ROOT"
+printf 'late=%s status=%s\n' "$VP_OP_OUTCOME" "$VP_OP_STATUS"
+EOF
+    out="$(bash "${workspace}/op.sh" "${workspace}/op_root" 2>&1)" || _fail "S101: the operation script runs" "$out"
+    assert_contains "$out" "outcome=TIMEOUT status=124" "S101: a command past its limit is a TIMEOUT"
+    [[ "$out" =~ elapsed=([0-9]+) ]] && (( BASH_REMATCH[1] < 3000 )) ||
+        _fail "S101: the operation ends shortly after its 1-second limit" "$out"
+    assert_contains "$out" "limit=1000 " "S101: the operation limit is the phase limit when the provision end is later"
+    if kill -0 "$(cat "${workspace}/op_root/child")" 2>/dev/null; then
+        kill -KILL "$(cat "${workspace}/op_root/child")" 2>/dev/null || true
+        _fail "S101: the child of the stopped command is gone" "$out"
+    fi
+    assert_contains "$out" "late=NOT_STARTED status=124" "S101: without time before the reserve, no command starts"
+    assert_file_missing "${workspace}/op_root/late" "S101: the late command never ran"
+    line="$(awk -F '\t' '$2 == "slow"' "${workspace}/op_root/records/commands.tsv")"
+    assert_contains "$line" $'\tTIMEOUT\t' "S101: commands.tsv records the outcome"
+    assert_contains "$line" "bash -c" "S101: commands.tsv records the vector"
+
+    # vp_stop_group: a TERM-ignoring process gets SIGKILL before the deadline;
+    # a group that the user may not signal stays NOT_STOPPED, by the deadline.
+    ab_vp_script "$workspace" stop.sh <<'EOF'
+setsid bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+leader=$!
+sleep 0.2
+start=$(vp_now_ms)
+vp_stop_group "$leader" $(( start + 1500 )) && status=0 || status=$?
+printf 'own=%s status=%s elapsed=%s\n' "$VP_STOP" "$status" "$(( $(vp_now_ms) - start ))"
+wait "$leader" 2>/dev/null || true
+kill -0 "$leader" 2>/dev/null && printf 'own_alive\n'
+start=$(vp_now_ms)
+vp_stop_group "$1" $(( start + 1500 )) && status=0 || status=$?
+printf 'foreign=%s status=%s elapsed=%s\n' "$VP_STOP" "$status" "$(( $(vp_now_ms) - start ))"
+vp_stop_group 1 $(( $(vp_now_ms) + 1500 )) && status=0 || status=$?
+printf 'one=%s status=%s\n' "$VP_STOP" "$status"
+EOF
+    group="$(ab_vp_foreign_group)"
+    out="$(bash "${workspace}/stop.sh" "$group" 2>&1)" || _fail "S101: the stop script runs" "$out"
+    assert_contains "$out" "own=STOPPED status=0" "S101: a TERM-ignoring group is stopped"
+    assert_not_contains "$out" "own_alive" "S101: the TERM-ignoring process is gone"
+    assert_contains "$out" "foreign=NOT_STOPPED status=1" "S101: a group that cannot be signaled is NOT_STOPPED"
+    [[ "$out" =~ foreign=NOT_STOPPED\ status=1\ elapsed=([0-9]+) ]] && (( BASH_REMATCH[1] <= 1700 )) ||
+        _fail "S101: the stop check ends by its deadline" "$out"
+    assert_contains "$out" "one=NOT_STOPPED status=1" "S101: a group ID below 2 is refused"
+}
+
+# ab_vp_fakes_py <file> - the shared Python test helpers of S102: small
+# controlled wheels, a controlled task root with its own manifest, and a
+# controlled site directory. They never reach a network or the real artifacts.
+ab_vp_fakes_py() {
+    cat > "$1" <<'PY'
+import base64, csv, hashlib, io, os, stat, zipfile
+
+URL = "https://files.pythonhosted.org/packages/aa/bb/" + "c" * 60 + "/"
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def record_hash(data):
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+def metadata(name, version, requires=()):
+    lines = ["Metadata-Version: 2.1", "Name: " + name, "Version: " + version]
+    lines += ["Requires-Dist: " + r for r in requires]
+    lines += ["Requires-Dist: unused>=1; extra == \"docs\""]
+    return ("\n".join(lines) + "\n").encode()
+
+def wheel(name, version, requires=(), files=None, tag="py3-none-any", bad=None, meta=None):
+    """One small wheel: (file name, bytes, METADATA bytes). bad selects one unsafe member."""
+    stem = name.replace("-", "_") + "-" + version
+    info = stem + ".dist-info/"
+    files = dict(files if files is not None else {name.replace("-", "_") + "/__init__.py": b"VALUE = 1\n"})
+    meta = meta if meta is not None else metadata(name, version, requires)
+    wheel_text = ("Wheel-Version: 1.0\nGenerator: ab-test\nRoot-Is-Purelib: true\nTag: " + tag + "\n").encode()
+    members = list(files.items()) + [(info + "METADATA", meta), (info + "WHEEL", wheel_text)]
+    extra = []
+    if bad == "escape":
+        extra = [("../escape.py", b"x = 1\n")]
+    elif bad == "absolute":
+        extra = [("/absolute.py", b"x = 1\n")]
+    elif bad == "duplicate":
+        extra = [(members[0][0], b"VALUE = 2\n")]
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for member, data in members + extra:
+        writer.writerow([member, record_hash(data), len(data)])
+    writer.writerow([info + "RECORD", "", ""])
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        for member, data in members + extra + [(info + "RECORD", record.getvalue().encode())]:
+            entry = zipfile.ZipInfo(member, (2020, 1, 1, 0, 0, 0))
+            entry.external_attr = (stat.S_IFREG | 0o644) << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, data)
+        if bad == "link":
+            entry = zipfile.ZipInfo(name.replace("-", "_") + "/link.py", (2020, 1, 1, 0, 0, 0))
+            entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(entry, b"/etc/passwd")
+    return "%s-%s.whl" % (stem, tag), out.getvalue(), meta
+
+def task_root(base, rows, lock=None, requires=None, mode=0o700):
+    """A task root with the given manifest rows: (role, name, version, file, data, meta)."""
+    os.makedirs(base, mode=0o700)
+    for sub in ("installer", "wheels", "site", "tmp", "records"):
+        os.mkdir(os.path.join(base, sub), 0o700)
+    lines = ["role\tdistribution\tversion\tfile\turl\tbytes\tsha256\tmetadata_bytes\tmetadata_sha256"]
+    locks = []
+    for role, name, version, file, data, meta in rows:
+        lines.append("\t".join([role, name, version, file, URL + file, str(len(data)), sha(data), str(len(meta)), sha(meta)]))
+        if role == "runtime":
+            locks.append("%s==%s --hash=sha256:%s" % (name, version, sha(data)))
+    with open(os.path.join(base, "manifest.tsv"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    with open(os.path.join(base, "requirements.lock"), "w") as f:
+        f.write((lock if lock is not None else "\n".join(locks)) + "\n")
+    with open(os.path.join(base, "requires.tsv"), "w") as f:
+        f.write("declaring\trequirement\n" + "".join("%s\t%s\n" % pair for pair in (requires or [])))
+    os.chmod(base, mode)
+    return base
+
+def env_file(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.rstrip("\n").partition("=")
+                if sep:
+                    values[key] = value
+    except OSError:
+        pass
+    return values
+PY
+}
+
+# ab_vp_fetch_driver <file> - the in-process downloader cases. Each case loads
+# the fixed downloader of the workflow, replaces only its HTTPS connection class
+# (and, in two cases, its interpreter facts or its expanded-byte limit), and
+# runs it on a new controlled task root. Prints one line for each case:
+# case, FETCH_RESULT, FETCH_REASON, and the number of requests.
+ab_vp_fetch_driver() {
+    cat > "$1" <<'PY'
+import errno, os, ssl, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+from vp_fakes import wheel, task_root, env_file, URL, metadata
+
+code = compile(open(sys.argv[1], encoding="utf-8").read(), "vp-fetch", "exec")
+work = sys.argv[2]
+
+class Response:
+    def __init__(self, status, headers, body):
+        self.status, self.headers, self.body, self.offset = status, headers, body, 0
+    def getheader(self, name, default=None):
+        for key, value in self.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return default
+    def read(self, amount=None):
+        end = len(self.body) if amount is None else min(len(self.body), self.offset + amount)
+        chunk = self.body[self.offset:end]
+        self.offset = end
+        return chunk
+    def close(self):
+        pass
+
+class Connection:
+    served = {}
+    calls = []
+    def __init__(self, host, port=None, timeout=None, context=None, **extra):
+        Connection.calls.append(("connect", host, port, getattr(context, "verify_mode", None),
+                                 getattr(context, "check_hostname", None), sorted(extra)))
+    def request(self, method, path, body=None, headers=None):
+        Connection.calls.append((method, path, sorted((headers or {}).items())))
+        self.path = path
+        entry = Connection.served.get(path)
+        if isinstance(entry, BaseException):
+            raise entry
+    def getresponse(self):
+        status, headers, body = Connection.served[self.path]
+        return Response(status, headers, body)
+    def close(self):
+        pass
+
+NS = {"__name__": "vp_unit"}
+exec(code, NS)
+NS["HTTPSConnection"] = Connection
+
+def run_case(label, rows, serve=None, lock=None, requires=None, mode=0o700, patch=None, prepare=None):
+    ns = NS
+    saved = dict(ns)
+    if patch:
+        patch(ns)
+    root = task_root(os.path.join(work, label), rows, lock=lock, requires=requires, mode=mode)
+    if prepare:
+        prepare(root)
+    Connection.calls = []
+    Connection.served = {}
+    for role, name, version, file, data, meta in rows:
+        Connection.served["/packages/aa/bb/" + "c" * 60 + "/" + file] = (200, {"Content-Length": str(len(data))}, data)
+    if serve:
+        serve(Connection.served, rows)
+    status = ns["run"](root)
+    ns.clear()
+    ns.update(saved)
+    values = env_file(os.path.join(root, "records", "fetch.env"))
+    requests = [c for c in Connection.calls if c[0] == "GET"]
+    print("\t".join([label, values.get("FETCH_RESULT", "MISSING"), values.get("FETCH_REASON", "MISSING"),
+                     str(len(requests)), str(status)]))
+    return root, Connection.calls
+
+def path_of(file):
+    return "/packages/aa/bb/" + "c" * 60 + "/" + file
+
+def base_rows(**changes):
+    alpha = wheel("alpha", "1.0", **dict({"requires": ["beta>=1.5"]}, **changes.get("alpha", {})))
+    beta = wheel("beta", "2.0", **changes.get("beta", {}))
+    pip = wheel("pip", "25.2", files={"pip/__init__.py": b"", "pip/__main__.py": b""})
+    return [("runtime", "alpha", "1.0") + alpha, ("runtime", "beta", "2.0") + beta, ("installer", "pip", "25.2") + pip]
+
+REQUIRES = [("alpha", "beta>=1.5")]
+
+# A complete controlled set: three requests, TLS verification, exact paths.
+root, calls = run_case("ok", base_rows(), requires=REQUIRES)
+connects = [c for c in calls if c[0] == "connect"]
+print("ok-connect\t" + ";".join(sorted({"%s:%s:%s:%s:%s" % (c[1], c[2], int(c[3]), c[4], ",".join(c[5])) for c in connects})))
+print("ok-paths\t" + ";".join(c[1] for c in calls if c[0] == "GET"))
+print("ok-headers\t" + ";".join(",".join(k for k, v in c[2]) for c in calls if c[0] == "GET"))
+print("ok-files\t" + ";".join(sorted(os.listdir(os.path.join(root, "wheels")))) + "|" +
+      ";".join(sorted(os.listdir(os.path.join(root, "installer")))))
+print("ok-tsv\t%d\t%d" % (sum(1 for line in open(os.path.join(root, "records", "fetch.tsv")) if "\tPASS\t" in line),
+                          sum(1 for line in open(os.path.join(root, "records", "wheels.tsv")) if "\tPASS\t" in line)))
+
+def serve_body(change):
+    def serve(served, rows):
+        status, headers, body = served[path_of(rows[0][3])]
+        served[path_of(rows[0][3])] = change(status, headers, body)
+    return serve
+
+run_case("long_body", base_rows(), requires=REQUIRES,
+         serve=serve_body(lambda s, h, b: (s, {}, b + b"x")))
+run_case("short_body", base_rows(), requires=REQUIRES,
+         serve=serve_body(lambda s, h, b: (s, {}, b[:-1])))
+run_case("changed_bytes", base_rows(), requires=REQUIRES,
+         serve=serve_body(lambda s, h, b: (s, h, bytes([b[0] ^ 1]) + b[1:])))
+run_case("redirect", base_rows(), requires=REQUIRES,
+         serve=serve_body(lambda s, h, b: (302, {"Location": "https://mirror.example/x.whl", "Content-Length": "0"}, b"")))
+def deny(served, rows):
+    served[path_of(rows[0][3])] = OSError(errno.ENETUNREACH, "Network is unreachable")
+run_case("network_denied", base_rows(), requires=REQUIRES, serve=deny)
+run_case("content_encoding", base_rows(), requires=REQUIRES,
+         serve=serve_body(lambda s, h, b: (s, dict(h, **{"Content-Encoding": "gzip"}), b)))
+
+def foreign_url(root):
+    path = os.path.join(root, "manifest.tsv")
+    os.chmod(root, 0o700)
+    text = open(path).read().replace("https://files.pythonhosted.org/", "https://mirror.example/", 1)
+    open(path, "w").write(text)
+run_case("foreign_url", base_rows(), requires=REQUIRES, prepare=foreign_url)
+run_case("lock_mismatch", base_rows(), requires=REQUIRES, lock="alpha==1.0 --hash=sha256:" + "0" * 64 + "\nbeta==2.0 --hash=sha256:" + "0" * 64)
+run_case("escape_member", base_rows(alpha={"bad": "escape"}), requires=REQUIRES)
+run_case("absolute_member", base_rows(alpha={"bad": "absolute"}), requires=REQUIRES)
+run_case("link_member", base_rows(alpha={"bad": "link"}), requires=REQUIRES)
+run_case("duplicate_member", base_rows(alpha={"bad": "duplicate"}), requires=REQUIRES)
+rows = base_rows()
+rows[0] = rows[0][:5] + (metadata("alpha", "1.0", ["beta>=1.6"]),)
+run_case("metadata_differs", rows, requires=REQUIRES)
+run_case("unlisted_requirement", base_rows(alpha={"requires": ["beta>=1.5", "gamma>=1"]}), requires=REQUIRES)
+run_case("missing_requirement", base_rows(alpha={"requires": []}), requires=REQUIRES)
+run_case("unsatisfied_requirement", base_rows(alpha={"requires": ["beta>=3"]}), requires=[("alpha", "beta>=3")])
+run_case("marker_requirement", base_rows(alpha={"requires": ["beta>=1.5; python_version < \"3.9\""]}),
+         requires=[("alpha", "beta>=1.5; python_version < \"3.9\"")])
+run_case("path_collision", base_rows(alpha={"files": {"shared/x.py": b"a = 1\n"}}, beta={"files": {"shared/x.py": b"b = 1\n"}}),
+         requires=REQUIRES)
+run_case("name_differs", base_rows(alpha={"meta": metadata("alpha-other", "1.0", ["beta>=1.5"])}), requires=REQUIRES)
+run_case("unsupported_tag", base_rows(beta={"tag": "cp311-cp311-manylinux_2_17_aarch64"}), requires=REQUIRES)
+def small_limit(ns):
+    ns["EXPANDED_LIMIT"] = 10
+run_case("expanded_limit", base_rows(), requires=REQUIRES, patch=small_limit)
+def old_interpreter(ns):
+    facts = ns["interpreter_facts"]()
+    facts["version"] = "3.11.9"
+    ns["interpreter_facts"] = lambda: dict(facts)
+run_case("interpreter", base_rows(), requires=REQUIRES, patch=old_interpreter)
+def busy(root):
+    os.chmod(root, 0o700)
+    open(os.path.join(root, "wheels", "left.whl"), "wb").close()
+run_case("root_not_empty", base_rows(), requires=REQUIRES, prepare=busy)
+run_case("root_mode", base_rows(), requires=REQUIRES, mode=0o755)
+PY
+}
+
+# ab_vp_fake_site <python-file> - write a script that builds controlled task
+# roots with a pip-style --target site of two distributions, alpha and beta,
+# and a pure-Python vtkmodules of alpha. Arguments: <directory> <case>...; each
+# root is <directory>/verify_<case>.
+ab_vp_fake_site() {
+    cat > "$1" <<'PY'
+import csv, io, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+from vp_fakes import task_root, metadata, record_hash, wheel
+
+def make(root, case):
+    alpha_meta = metadata("alpha", "1.0", ["beta>=1.5"])
+    beta_meta = metadata("beta", "2.0")
+    manifest_alpha = metadata("alpha", "1.0", ["beta>=1.6"]) if case == "metadata" else alpha_meta
+    rows = [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", manifest_alpha),
+            ("runtime", "beta", "2.0", "beta-2.0-py3-none-any.whl", b"b", beta_meta),
+            ("installer", "pip", "25.2", "pip-25.2-py3-none-any.whl", b"p", metadata("pip", "25.2"))]
+    task_root(root, rows, requires=[("alpha", "beta>=1.5")])
+    site = os.path.join(root, "site")
+    core = (b"import os\n"
+            b"limits = os.environ.get('AB_FAKE_LIMITS')\n"
+            b"if limits:\n"
+            b"    open(limits, 'w').write(open('/proc/self/limits').read())\n"
+            b"class vtkVersion:\n"
+            b"    @staticmethod\n"
+            b"    def GetVTKVersion():\n"
+            b"        return os.environ.get('AB_FAKE_VTK_VERSION', '9.5.2')\n")
+    alpha_files = {"alpha/__init__.py": b"VALUE = 1\n", "../../bin/alpha-tool": b"#!/bin/sh\n"}
+    if case != "no_module":
+        alpha_files.update({"vtkmodules/__init__.py": b"", "vtkmodules/vtkCommonCore.py": core,
+                            "vtkmodules/vtkIOXML.py": b"class vtkXMLUnstructuredGridReader:\n    pass\n"})
+    dists = [("alpha", "1.0", alpha_meta, alpha_files), ("beta", "2.0", beta_meta, {"beta/__init__.py": b"VALUE = 2\n"})]
+    if case == "no_dist":
+        dists = dists[:1]
+    for name, version, meta, files in dists:
+        info = "%s-%s.dist-info/" % (name, version)
+        files = dict(files, **{info + "METADATA": meta, info + "INSTALLER": b"pip\n"})
+        record = io.StringIO()
+        writer = csv.writer(record, lineterminator="\n")
+        for rel, data in files.items():
+            path = os.path.join(site, rel[len("../../"):] if rel.startswith("../../") else rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            writer.writerow([rel, record_hash(data), len(data)])
+        writer.writerow([info + "RECORD", "", ""])
+        with open(os.path.join(site, info + "RECORD"), "w") as f:
+            f.write(record.getvalue())
+    if case == "link":
+        os.symlink("/etc/hostname", os.path.join(site, "alpha", "link.py"))
+    elif case == "unlisted":
+        open(os.path.join(site, "alpha", "extra.py"), "w").write("x = 1\n")
+    elif case == "changed":
+        open(os.path.join(site, "alpha", "__init__.py"), "w").write("VALUE = 3\n")
+
+for case in sys.argv[2:]:
+    make(os.path.join(sys.argv[1], "verify_" + case), case)
+PY
+}
+
+s102_provision_programs_fail_closed() {
+    local workspace out line label result reason requests status kind root pip args case_result case_reason case_requests case_status
+    workspace="$(new_workspace s102_programs)"
+    ab_vp_code "$workspace"
+    ab_vp_fakes_py "${workspace}/vp_fakes.py"
+    ab_vp_fetch_driver "${workspace}/fetch_driver.py"
+    out="$(/usr/bin/python3.12 -I "${workspace}/fetch_driver.py" "${workspace}/fetch.py" "${workspace}/fetch_cases" 2>&1)" ||
+        _fail "S102: the downloader cases run" "$out"
+    printf '%s\n' "$out" > "${workspace}/fetch_cases.txt"
+
+    # case, expected result, reason keyword, and expected requests
+    while read -r label result reason requests; do
+        line="$(awk -F '\t' -v want="$label" '$1 == want' "${workspace}/fetch_cases.txt")"
+        [[ -n "$line" ]] || _fail "S102: the downloader case ${label} ran" "$out"
+        IFS=$'\t' read -r _ case_result case_reason case_requests case_status <<< "$line"
+        assert_eq "$result" "$case_result" "S102: ${label} gives ${result} (${case_reason})"
+        [[ "${case_reason,,}" == *"${reason//_/ }"* ]] ||
+            _fail "S102: the ${label} reason names '${reason//_/ }'" "$line"
+        [[ "$requests" == "-" ]] || assert_eq "$requests" "$case_requests" "S102: ${label} makes ${requests} requests"
+        if [[ "$result" == PASS ]]; then
+            assert_eq "0" "$case_status" "S102: ${label} returns status 0"
+        else
+            assert_ne "0" "$case_status" "S102: ${label} returns a non-zero status"
+        fi
+    done <<'EOF'
+ok PASS - 3
+long_body FAIL longer -
+short_body NOT_VERIFIED ended -
+changed_bytes FAIL sha-256 -
+redirect NOT_VERIFIED 302 1
+network_denied NOT_VERIFIED network 1
+content_encoding NOT_VERIFIED content-encoding 1
+foreign_url FAIL url 0
+lock_mismatch FAIL lock 0
+escape_member FAIL unsafe_member -
+absolute_member FAIL unsafe_member -
+link_member FAIL link -
+duplicate_member FAIL duplicate -
+metadata_differs FAIL metadata -
+unlisted_requirement FAIL requirement -
+missing_requirement FAIL requirement -
+unsatisfied_requirement FAIL requirement -
+marker_requirement NOT_VERIFIED marker -
+path_collision FAIL installed_path -
+name_differs FAIL name -
+unsupported_tag NOT_VERIFIED tag -
+expanded_limit NOT_VERIFIED expanded -
+interpreter NOT_VERIFIED interpreter 0
+root_not_empty NOT_VERIFIED not_empty 0
+root_mode NOT_VERIFIED mode 0
+EOF
+    assert_eq "files.pythonhosted.org:443:2:True:" "$(awk -F '\t' '$1 == "ok-connect" { print $2 }' <<< "$out")" \
+        "S102: each request uses files.pythonhosted.org on port 443 with certificate and host-name verification"
+    assert_contains "$out" $'ok-paths\t/packages/aa/bb/' "S102: the requests use the exact manifest paths"
+    assert_not_contains "$(grep '^ok-headers' <<< "$out")" "Authorization" "S102: no request sends a credential"
+    assert_contains "$out" $'ok-files\talpha-1.0-py3-none-any.whl;beta-2.0-py3-none-any.whl|pip-25.2-py3-none-any.whl' \
+        "S102: the verified wheels and the installer are in their two directories, with no partial file"
+    assert_contains "$out" $'ok-tsv\t3\t3' "S102: fetch.tsv and wheels.tsv record PASS for each artifact"
+
+    # The bounded streams: 65536 bytes are kept on each stream and the rest is
+    # counted, so a producer never blocks and no record grows past the limit.
+    cat > "${workspace}/streams.py" <<'PY'
+import os, sys
+ns = {"__name__": "vp_unit"}
+exec(compile(open(sys.argv[1]).read(), "vp-fetch", "exec"), ns)
+state = ns["bound_streams"]()
+sys.stdout.write("o" * 200000)
+sys.stderr.write("e" * 100000)
+counts = ns["close_streams"](state)
+open(sys.argv[2], "w").write("%(out_kept)d %(out_dropped)d %(err_kept)d %(err_dropped)d" % counts)
+PY
+    /usr/bin/python3.12 -I "${workspace}/streams.py" "${workspace}/fetch.py" "${workspace}/streams.counts" \
+        > "${workspace}/streams.out" 2> "${workspace}/streams.err" || _fail "S102: the stream check runs"
+    assert_eq "65536 134464 65536 34464" "$(cat "${workspace}/streams.counts")" "S102: each stream keeps 65536 bytes"
+    assert_eq "65536 65536" "$(wc -c < "${workspace}/streams.out") $(wc -c < "${workspace}/streams.err")" \
+        "S102: the two log files hold 65536 bytes each"
+
+    # The installer bootstrap, with the exact vector and a controlled pip wheel
+    # that records what it gets. The bootstrap checks the wheel and the vector
+    # before pip runs.
+    cat > "${workspace}/fake_pip.py" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+from vp_fakes import task_root, wheel, metadata
+def make(root, kind):
+  main = (b"import json, os, resource, sys\n"
+        b"target = [a for a in sys.argv if a.startswith('--target=')][0][len('--target='):]\n"
+        b"limits = {n: resource.getrlimit(getattr(resource, n))[0] for n in ('RLIMIT_AS', 'RLIMIT_CPU', 'RLIMIT_CORE', 'RLIMIT_FSIZE')}\n"
+        b"json.dump({'argv': sys.argv[1:], 'config': os.environ.get('PIP_CONFIG_FILE'), 'tmpdir': os.environ.get('TMPDIR'),\n"
+        b"           'limits': limits, 'path': sys.path, 'bytecode': sys.dont_write_bytecode},\n"
+        b"          open(os.path.join(target, 'fake-pip.json'), 'w'))\n"
+        b"if os.environ.get('AB_FAKE_PIP_FLOOD'):\n"
+        b"    sys.stdout.write('p' * 100000)\n"
+        b"sys.exit(0)\n")
+  file, data, meta = wheel("pip", "25.2", files={"pip/__init__.py": b"", "pip/__main__.py": main})
+  pip_row = ("installer", "pip", "25.2", file, b"wrong" if kind == "hash" else data, meta)
+  task_root(root, [("runtime", "alpha", "1.0", "alpha-1.0-py3-none-any.whl", b"a", metadata("alpha", "1.0")), pip_row])
+  open(os.path.join(root, "installer", file), "wb").write(data)
+for kind in sys.argv[2:]:
+  make(os.path.join(sys.argv[1], "install_" + kind), kind)
+PY
+    /usr/bin/python3.12 -I "${workspace}/fake_pip.py" "$workspace" ok flood hash vector config ||
+        _fail "S102: the installer roots are made"
+    for kind in ok flood hash vector config; do
+        root="${workspace}/install_${kind}"
+        pip="${root}/installer/pip-25.2-py3-none-any.whl"
+        args=(--isolated --disable-pip-version-check install --no-index "--find-links=${root}/wheels" --require-hashes
+              --only-binary=:all: --no-cache-dir --no-compile "--target=${root}/site" "--requirement=${root}/requirements.lock")
+        [[ "$kind" != vector ]] || args+=(--no-deps)
+        if [[ "$kind" == config ]]; then
+            env -u PIP_CONFIG_FILE TMPDIR="${root}/tmp" /usr/bin/python3.12 -I - "$pip" "${args[@]}" \
+                < "${workspace}/install.py" > "${root}/records/install.out" 2> "${root}/records/install.err" && status=0 || status=$?
+        else
+            env PIP_CONFIG_FILE=/dev/null TMPDIR="${root}/tmp" AB_FAKE_PIP_FLOOD="$([[ "$kind" == flood ]] && echo 1)" \
+                /usr/bin/python3.12 -I - "$pip" "${args[@]}" \
+                < "${workspace}/install.py" > "${root}/records/install.out" 2> "${root}/records/install.err" && status=0 || status=$?
+        fi
+        result="$(ab_file_value "${root}/records/install.env" INSTALL_RESULT)"
+        case "$kind" in
+            ok)
+                assert_eq "0 PASS" "${status} ${result}" "S102: the controlled install passes"
+                assert_eq "0" "$(ab_file_value "${root}/records/install.env" PIP_EXIT)" "S102: install.env records the pip status"
+                /usr/bin/python3.12 -I - "${root}/site/fake-pip.json" "$root" > "${workspace}/pip_seen.txt" <<'PY' ||
+import json, sys
+seen = json.load(open(sys.argv[1]))
+root = sys.argv[2]
+print("argv=" + " ".join(seen["argv"]))
+print("config=%s tmpdir=%s" % (seen["config"], seen["tmpdir"]))
+print("limits=%(RLIMIT_AS)s %(RLIMIT_CPU)s %(RLIMIT_CORE)s %(RLIMIT_FSIZE)s" % seen["limits"])
+print("first=" + seen["path"][0])
+print("third_party=" + str(sum(1 for p in seen["path"] if "packages" in p)))
+print("bytecode=%s" % seen["bytecode"])
+PY
+                    _fail "S102: the fake pip record is readable"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "argv=${args[*]}" "S102: pip gets the exact approved vector"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "config=/dev/null tmpdir=${root}/tmp" \
+                    "S102: pip gets PIP_CONFIG_FILE=/dev/null and the task TMPDIR"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "limits=4294967296 60 0 1073741824" \
+                    "S102: the installer has the address-space, CPU, core, and file-size limits"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "first=${pip}" "S102: the verified pip wheel is first on the path"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "third_party=0" "S102: no third-party path is on the installer path"
+                assert_contains "$(cat "${workspace}/pip_seen.txt")" "bytecode=True" "S102: the installer writes no bytecode"
+                ;;
+            flood)
+                assert_eq "NOT_VERIFIED" "$result" "S102: installer output past the stream limit is NOT_VERIFIED"
+                assert_eq "65536" "$(wc -c < "${root}/records/install.out")" "S102: the installer log keeps 65536 bytes"
+                ;;
+            hash|vector|config)
+                assert_ne "0" "$status" "S102: the ${kind} install fails"
+                assert_eq "FAIL" "$result" "S102: the ${kind} install is FAIL"
+                assert_file_missing "${root}/site/fake-pip.json" "S102: pip never runs after the ${kind} check"
+                ;;
+        esac
+    done
+
+    # The distribution and import check, with the exact vector on a controlled
+    # site. A pure-Python vtkmodules is not the native consumer.
+    ab_vp_fake_site "${workspace}/fake_site.py"
+    /usr/bin/python3.12 -I "${workspace}/fake_site.py" "$workspace" native version no_module link unlisted changed no_dist metadata ||
+        _fail "S102: the controlled sites are made"
+    while read -r kind result reason; do
+        root="${workspace}/verify_${kind}"
+        env AB_FAKE_LIMITS="${workspace}/limits_${kind}" AB_FAKE_VTK_VERSION="$([[ "$kind" == version ]] && echo 9.4.0 || echo 9.5.2)" \
+            /usr/bin/python3.12 -I - "${root}/site" < "${workspace}/verify.py" \
+            > "${root}/records/verify.out" 2> "${root}/records/verify.err" && status=0 || status=$?
+        assert_eq "$result" "$(ab_file_value "${root}/records/verify.env" VERIFY_RESULT)" \
+            "S102: the ${kind} site gives ${result} ($(ab_file_value "${root}/records/verify.env" VERIFY_REASON))"
+        line="$(ab_file_value "${root}/records/verify.env" VERIFY_REASON)"
+        [[ "${line,,}" == *"${reason//_/ }"* ]] || _fail "S102: the ${kind} reason names '${reason//_/ }'" "$line"
+        assert_ne "0" "$status" "S102: the ${kind} check returns a non-zero status"
+    done <<'EOF'
+native NOT_VERIFIED native
+version NOT_VERIFIED 9.4.0
+no_module NOT_VERIFIED vtkmodules
+link FAIL link
+unlisted FAIL not_listed
+changed FAIL sha-256
+no_dist FAIL beta
+metadata FAIL metadata
+EOF
+    assert_contains "$(cat "${workspace}/limits_native")" "Max address space         4294967296" \
+        "S102: the import check has the address-space limit"
+    assert_contains "$(cat "${workspace}/limits_native")" "Max cpu time              60" "S102: the import check has the CPU limit"
+    assert_contains "$(cat "${workspace}/limits_native")" "Max core file size        0" "S102: the import check writes no core file"
+    assert_not_contains "$(ab_file_value "${workspace}/verify_no_module/records/verify.env" VERIFY_REASON)" "/usr/lib/python3" \
+        "S102: a system vtkmodules is never a fallback"
+}
+
+# ab_vp_value <file> <key> - the one value of <key>, or DUPLICATE or MISSING.
+ab_vp_value() {
+    awk -v key="$2" 'index($0, key "=") == 1 { n++; value = substr($0, length(key) + 2) }
+                     END { if (n == 1) print value; else if (n > 1) print "DUPLICATE"; else print "MISSING" }' "$1"
+}
+
+s103_provision_ci_consumer_is_available() {
+    local root workspace records file key bytes name value row
+    root="${AB_VTU_DEP_ROOT:-}"
+    [[ -n "$root" ]] || _fail "S103: the native tests need the task root of the contract-tests provision step in M3_VTU_DEP_ROOT, and none is set. A local run needs a separately authorized pre-provisioned environment with the same manifest; no test installs a package."
+    workspace="$(new_workspace s103_ci_root)"
+    records="${root}/records"
+    assert_dir_exists "$records" "S103: the provision records exist"
+    for file in "$records"/*; do
+        bytes="$(wc -c < "$file")"
+        (( bytes <= 65536 )) || _fail "S103: the record ${file##*/} holds at most 65536 bytes" "bytes: ${bytes}"
+    done
+
+    # The receipt binds the root, the block, the manifest, and the result.
+    ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${workspace}/block.sh"
+    ab_vp_expected_manifest > "${workspace}/manifest.tsv"
+    ab_vp_expected_lock > "${workspace}/requirements.lock"
+    ab_vp_expected_requires > "${workspace}/requires.tsv"
+    for key in PROVISION_SCHEMA=m3-vtu-provision/1 PROVISION_RESULT=PROVISION_AVAILABLE "PROVISION_ROOT=${root}" \
+               "PROVISION_PARENT=${root%/*}" PROVISION_FETCH_RESULT=PASS PROVISION_INSTALL_RESULT=PASS \
+               PROVISION_VERIFY_RESULT=PASS PROVISION_CLEANUP=REMOVED PROVISION_PYTHON=/usr/bin/python3.12 \
+               "PROVISION_BLOCK_SHA256=$(sha256sum < "${workspace}/block.sh" | cut -d ' ' -f 1)" \
+               "PROVISION_MANIFEST_SHA256=$(sha256sum < "${workspace}/manifest.tsv" | cut -d ' ' -f 1)" \
+               "PROVISION_LOCK_SHA256=$(sha256sum < "${workspace}/requirements.lock" | cut -d ' ' -f 1)" \
+               "PROVISION_REQUIRES_SHA256=$(sha256sum < "${workspace}/requires.tsv" | cut -d ' ' -f 1)"; do
+        assert_eq "${key#*=}" "$(ab_vp_value "${records}/result.env" "${key%%=*}")" "S103: result.env has ${key}"
+    done
+    [[ "$(tail -n 1 "${records}/result.env")" =~ ^WORK_FINISH=[0-9]+$ ]] || _fail "S103: result.env ends with WORK_FINISH"
+    (( $(ab_vp_value "${records}/result.env" PROVISION_FINISH_MS) - $(ab_vp_value "${records}/result.env" PROVISION_START_MS) <= 90000 )) ||
+        _fail "S103: the provision ended within 90 seconds"
+    assert_eq "" "$(cmp "${workspace}/manifest.tsv" "${root}/manifest.tsv" 2>&1)" "S103: the task manifest is the approved manifest"
+    assert_eq "" "$(cmp "${workspace}/requirements.lock" "${root}/requirements.lock" 2>&1)" "S103: the task lock is the approved lock"
+
+    # Each of the thirteen archives has the registered bytes and SHA-256, and
+    # its embedded METADATA is the published core metadata.
+    assert_eq "13" "$(awk -F '\t' 'NR > 1 && $11 == "PASS" && $6 == $8 && $7 == $9 && $10 == 200' "${records}/fetch.tsv" | wc -l)" \
+        "S103: all thirteen downloads have the registered bytes and SHA-256"
+    assert_eq "$(cut -f 2-7 "${workspace}/manifest.tsv" | tail -n +2)" \
+        "$(awk -F '\t' 'NR > 1 { print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 }' "${records}/fetch.tsv")" \
+        "S103: fetch.tsv covers exactly the manifest rows"
+    assert_eq "13" "$(awk -F '\t' 'NR > 1 && $8 == "PASS"' "${records}/wheels.tsv" | wc -l)" \
+        "S103: all thirteen archives pass the ZIP, METADATA, tag, and closure checks"
+    assert_eq "$(cut -f 8,9 "${workspace}/manifest.tsv" | tail -n +2)" \
+        "$(awk -F '\t' 'NR > 1 { print $4 "\t" $5 }' "${records}/wheels.tsv")" \
+        "S103: each embedded METADATA has the published bytes and SHA-256"
+    for key in FETCH_RESULT=PASS ARCHIVES=13 ARCHIVE_BYTES=154218283 PYTHON_EXECUTABLE=/usr/bin/python3.12 \
+               PYTHON_IMPLEMENTATION=cpython PYTHON_SOABI=cpython-312-x86_64-linux-gnu PYTHON_MACHINE=x86_64; do
+        assert_eq "${key#*=}" "$(ab_vp_value "${records}/fetch.env" "${key%%=*}")" "S103: fetch.env has ${key}"
+    done
+    (( $(ab_vp_value "${records}/fetch.env" EXPANDED_BYTES) <= 1073741824 )) || _fail "S103: the declared expanded bytes are in the limit"
+    [[ "$(ab_vp_value "${records}/fetch.env" PYTHON_VERSION)" == 3.12.* ]] || _fail "S103: the interpreter is CPython 3.12"
+    assert_eq "PASS 0" "$(ab_vp_value "${records}/install.env" INSTALL_RESULT) $(ab_vp_value "${records}/install.env" PIP_EXIT)" \
+        "S103: the offline install passed"
+
+    # The installed closure and the native consumer.
+    for key in VERIFY_RESULT=PASS VTK_VERSION=9.5.2 \
+               "DISTRIBUTIONS=$(awk -F '\t' 'NR > 1 && $1 == "runtime" { printf "%s%s==%s", sep, $2, $3; sep = " " }' "${workspace}/manifest.tsv")"; do
+        assert_eq "${key#*=}" "$(ab_vp_value "${records}/verify.env" "${key%%=*}")" "S103: verify.env has ${key}"
+    done
+    assert_eq "12" "$(awk -F '\t' 'NR > 1 && $6 == "PASS"' "${records}/installed.tsv" | wc -l)" \
+        "S103: all twelve distributions have a complete RECORD"
+    [[ "$(ab_vp_value "${records}/verify.env" VTK_MODULE)" == "${root}/site/vtkmodules/"* ]] ||
+        _fail "S103: the consumer module comes from the task site"
+    assert_ne "0" "$(awk -F '\t' 'NR > 1 && $2 == "site" && $1 ~ /libvtkCommonCore/' "${records}/libraries.tsv" | wc -l)" \
+        "S103: libraries.tsv records the loaded native VTK library"
+    (( $(ab_vp_value "${records}/verify.env" TASK_BYTES) <= 3221225472 )) || _fail "S103: the task bytes are in the checkpoint limit"
+
+    # The commands: the three fixed vectors, each in its limit, each group
+    # stopped.
+    assert_eq "fetch install verify" "$(awk -F '\t' 'NR > 1 && $7 == "COMPLETED" && $6 == 0 && $9 != "NOT_STOPPED" { printf "%s%s", sep, $2; sep = " " }' "${records}/commands.tsv")" \
+        "S103: the fetch, install, and verify operations completed with status 0"
+    while IFS=$'\t' read -r name value; do
+        assert_eq "1" "$(awk -F '\t' -v n="$name" -v l="$value" 'NR > 1 && $2 == n && $3 <= l' "${records}/commands.tsv" | wc -l)" \
+            "S103: the ${name} limit is at most ${value} ms"
+    done <<'EOF'
+fetch	30000
+install	35000
+verify	10000
+EOF
+    assert_contains "$(awk -F '\t' '$2 == "install" { print $11 }' "${records}/commands.tsv")" \
+        "PIP_CONFIG_FILE=/dev/null TMPDIR=${root}/tmp timeout --signal=TERM --kill-after=5s" \
+        "S103: commands.tsv records the expanded install vector"
+
+    # The cleanup: the archives and the installer data are gone; the site stays.
+    assert_eq "installer manifest.tsv records requirements.lock requires.tsv site tmp wheels" "$(ls "$root" | paste -sd ' ' -)" \
+        "S103: the task root holds only the named paths"
+    assert_eq "" "$(ls -A "${root}/wheels" "${root}/installer" "${root}/tmp" | grep -v -e '^$' -e ':$' || true)" \
+        "S103: the verified archives and the installer data are removed"
+    assert_ne "" "$(ls -A "${root}/site")" "S103: the site directory stays for the consumer"
+}
+
+
+# ---- S104 to S107: the focused VTU readback (Issue #80) --------------------
+
+# ab_vr_block - the readback block of the capture work, from the begin marker
+# line through the end marker line and its line end. The awk program reads to
+# the end, so pipefail sees no SIGPIPE.
+ab_vr_block() {
+    ab_step_run_body "Capture the evidence" | awk '
+        done { next }
+        $0 == "# ---- VTU readback: begin ----" { inside = 1 }
+        inside { print }
+        inside && $0 == "# ---- VTU readback: end ----" { inside = 0; done = 1 }'
+}
+
+# ab_vr_constant <name> - the value of the one VR_<name>= line of the block.
+ab_vr_constant() {
+    ab_vr_block | awk -v key="VR_${1}=" 'index($0, key) == 1 { n++; value = substr($0, length(key) + 1) }
+                                        END { if (n == 1) print value }'
+}
+
+# ab_vr_reader <file> - write the fixed reader program VR_READER_PY.
+ab_vr_reader() {
+    ab_vr_block > "${1}.block"
+    ab_vp_heredoc "${1}.block" VR_READER_PY > "$1"
+    [[ -s "$1" ]] || _fail "the capture work must hold the reader program VR_READER_PY"
+}
+
+# ab_vr_need_root <label> - the provisioned task root of the contract-tests job.
+ab_vr_need_root() {
+    [[ -n "${AB_VTU_DEP_ROOT:-}" ]] ||
+        _fail "${1}: the native readback tests need the task root of the contract-tests provision step in M3_VTU_DEP_ROOT, and none is set. A local run needs a separately authorized pre-provisioned environment with the same manifest; no test installs a package."
+}
+
+# ab_vr_vtus <directory> - write the controlled VTU files and cases.tsv (label,
+# role, file). One hexahedron of 8 points (a VTK_POLYHEDRON cube in poly) with
+# PointData U (3 components), p, and, for time 0, wallDistance, and CellData
+# cellId. The writer uses only the Python standard library and the VTK 9.5.2
+# XML layout: inline ASCII, inline base64 binary, appended raw and base64 with
+# a UInt64 header, zlib compression, and the legacy faces and faceoffsets
+# arrays. The bad files each change one thing.
+ab_vr_vtus() {
+    mkdir -p "$1"
+    cat > "${1}/make.py" <<'PY'
+import base64, os, struct, sys, zlib
+
+out = sys.argv[1]
+CODE = {"Float32": "f", "Int32": "i", "Int64": "q", "UInt8": "B"}
+POINTS = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+FACES = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+
+def arrays(time_zero=True, poly=False, drop=(), cell_u=False, u_components=3, p_values=8):
+    stream = [len(FACES)] + [v for f in FACES for v in [len(f)] + f]
+    a = [("Points", "Points", "Float32", 3, [float(c) for p in POINTS for c in p]),
+         ("Cells", "connectivity", "Int64", 1, list(range(8))), ("Cells", "offsets", "Int64", 1, [8]),
+         ("Cells", "types", "UInt8", 1, [42 if poly else 12])]
+    if poly:
+        a += [("Cells", "faces", "Int64", 1, stream), ("Cells", "faceoffsets", "Int64", 1, [len(stream)])]
+    a += [("CellData", "cellId", "Int32", 1, [7])]
+    if cell_u:
+        a += [("CellData", "U", "Float32", 3, [1.0, 2.0, 3.0])]
+    else:
+        u = [float(i % 5) for i in range(8 * u_components)]
+        a += [("PointData", "U", "Float32", u_components, u)]
+    a += [("PointData", "p", "Float32", 1, [float(i) for i in range(p_values)])]
+    if time_zero:
+        a += [("PointData", "wallDistance", "Float32", 1, [0.5] * 8)]
+    return [x for x in a if x[1] not in drop]
+
+def vtu(arrs, fmt="appended", encoding="raw", compress=False, pieces=1, kind="UnstructuredGrid", marker=True):
+    hs, hcode = 8, "Q"
+    chunks, offset = [], 0
+    def block(raw):
+        if compress:
+            packed = zlib.compress(raw)
+            return struct.pack("<4" + hcode, 1, 32768, len(raw), len(packed)), packed
+        return struct.pack("<" + hcode, len(raw)), raw
+    lines = ['<?xml version="1.0"?>',
+             '<VTKFile type="%s" version="1.0" byte_order="LittleEndian" header_type="UInt64"%s>'
+             % (kind, ' compressor="vtkZLibDataCompressor"' if compress else ""), "<%s>" % kind]
+    for _ in range(pieces):
+        lines.append('<Piece NumberOfPoints="8" NumberOfCells="1">')
+        for group in ("Points", "Cells", "CellData", "PointData"):
+            members = [x for x in arrs if x[0] == group]
+            if not members:
+                continue
+            lines.append("<%s>" % group)
+            for _, name, typ, comps, values in members:
+                head = 'type="%s" Name="%s" NumberOfComponents="%d"' % (typ, name, comps)
+                raw = struct.pack("<%d%s" % (len(values), CODE[typ]), *values)
+                if fmt == "ascii":
+                    text = " ".join(repr(v) if isinstance(v, float) else str(v) for v in values)
+                    lines.append('<DataArray %s format="ascii">%s</DataArray>' % (head, text))
+                elif fmt == "binary":
+                    header, data = block(raw)
+                    lines.append('<DataArray %s format="binary">%s</DataArray>' % (head, base64.b64encode(header + data).decode()))
+                else:
+                    header, data = block(raw)
+                    if encoding == "raw":
+                        chunk = header + data
+                    else:
+                        chunk = (base64.b64encode(header) + base64.b64encode(data)) if compress else base64.b64encode(header + data)
+                    lines.append('<DataArray %s format="appended" offset="%d"/>' % (head, offset))
+                    chunks.append(chunk)
+                    offset += len(chunk)
+            lines.append("</%s>" % group)
+        lines.append("</Piece>")
+    lines.append("</%s>" % kind)
+    text = ("\n".join(lines) + "\n").encode()
+    payload = b"".join(chunks)
+    if fmt == "appended":
+        text += ('<AppendedData encoding="%s">\n' % encoding).encode() + (b"_" if marker else b"") + payload
+        text += b"\n</AppendedData>\n"
+    return text + b"</VTKFile>\n"
+
+def write(name, data):
+    with open(os.path.join(out, name), "wb") as f:
+        f.write(data)
+
+cases = []
+def case(label, role, data):
+    write(label + ".vtu", data)
+    cases.append("%s\t%s\t%s.vtu" % (label, role, label))
+
+case("valid_ascii", "time0", vtu(arrays(), fmt="ascii"))
+case("valid_binary", "time0", vtu(arrays(), fmt="binary"))
+case("valid_raw", "time0", vtu(arrays()))
+case("valid_base64", "time0", vtu(arrays(), encoding="base64"))
+case("valid_zlib", "time0", vtu(arrays(), compress=True))
+case("valid_poly", "time0", vtu(arrays(poly=True)))
+case("latest_raw", "latest", vtu(arrays(time_zero=False)))
+whole = vtu(arrays())
+end = whole.index(b"\n</AppendedData>")
+case("truncated_raw", "time0", whole[:end - 10])
+zipped = vtu(arrays(), compress=True)
+start = zipped.index(b"_", zipped.index(b"<AppendedData")) + 1 + 8 * 4 + 2
+case("corrupt_zlib", "time0", zipped[:start] + bytes([zipped[start] ^ 0xFF]) + zipped[start + 1:])
+case("missing_u", "time0", vtu(arrays(drop=("U",)), fmt="ascii"))
+case("celldata_u", "time0", vtu(arrays(cell_u=True), fmt="ascii"))
+case("wrong_components", "time0", vtu(arrays(u_components=1), fmt="ascii"))
+case("short_p", "time0", vtu(arrays(p_values=7), fmt="ascii"))
+case("no_points", "time0", vtu(arrays(drop=("Points",)), fmt="ascii"))
+case("incomplete_cells", "time0", vtu(arrays(drop=("offsets",)), fmt="ascii"))
+text = vtu(arrays(), fmt="ascii")
+case("bad_xml", "time0", text.replace(b"</Piece>", b"</Piec>"))
+case("poly_no_faces", "time0", vtu([x for x in arrays(poly=True) if x[1] not in ("faces", "faceoffsets")], fmt="ascii"))
+case("no_wall_distance", "time0", vtu(arrays(time_zero=False), fmt="ascii"))
+case("multi_piece", "time0", vtu(arrays(), fmt="ascii", pieces=2))
+case("not_unstructured", "time0", vtu(arrays(), fmt="ascii", kind="PolyData"))
+case("no_marker", "time0", vtu(arrays(), marker=False))
+with open(os.path.join(out, "cases.tsv"), "w") as f:
+    f.write("\n".join(cases) + "\n")
+PY
+    /usr/bin/python3.12 -I "${1}/make.py" "$1" || _fail "the controlled VTU files must be written"
+}
+
+# ab_vr_env <root> - print the environment of a reader run with <root>.
+ab_vr_env() {
+    printf '%s\n' "M3_VTU_DEP_ROOT=$1" "RUNNER_TEMP=${1%/*}" \
+        "VR_PROVISION_BLOCK_SHA256=$(ab_vr_constant PROVISION_BLOCK_SHA256)" \
+        "VR_MANIFEST_SHA256=$(ab_vr_constant MANIFEST_SHA256)"
+}
+
+s104_readback_native_reads_controlled_vtus() {
+    local workspace out line label result reason keyword expected
+    ab_vr_need_root S104
+    workspace="$(new_workspace s104_native)"
+    ab_vr_reader "${workspace}/reader.py"
+    ab_vr_vtus "${workspace}/vtus"
+    cat > "${workspace}/driver.py" <<'PY'
+import os, sys
+ns = {"__name__": "vr_unit"}
+exec(compile(open(sys.argv[1]).read(), "vr-reader", "exec"), ns)
+identity = ns["consumer"]()
+print("identity\t" + "\t".join("%s=%s" % pair for pair in sorted(identity.items())))
+vtus = sys.argv[2]
+for line in open(os.path.join(vtus, "cases.tsv")):
+    label, role, file = line.rstrip("\n").split("\t")
+    r = ns["read_one"](os.path.join(vtus, file), role)
+    print("\t".join([label, r["result"], r["reason"], str(r["points"]), str(r["cells"]), str(len(r["messages"])), r["extent"]]))
+    print("arrays\t%s\t%s" % (label, ";".join("%(association)s:%(name)s:%(components)s:%(tuples)s" % a for a in r["arrays"])))
+# A diagnostic only: the plain native consumer on the truncated payload.
+from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
+from vtkmodules.vtkCommonCore import vtkCommand
+reader, events = vtkXMLUnstructuredGridReader(), []
+reader.AddObserver(vtkCommand.ErrorEvent, lambda *a: events.append(1))
+reader.SetFileName(os.path.join(vtus, "truncated_raw.vtu"))
+reader.Update()
+print("diagnostic\ttruncated_raw\tnative_error_events=%d\terror_code=%d\tpoints=%d" % (
+    len(events), reader.GetErrorCode(), reader.GetOutput().GetNumberOfPoints()))
+PY
+    out="$(env $(ab_vr_env "$AB_VTU_DEP_ROOT") /usr/bin/python3.12 -I "${workspace}/driver.py" \
+        "${workspace}/reader.py" "${workspace}/vtus" 2> "${workspace}/driver.err")" ||
+        _fail "S104: the reader functions run with the provisioned consumer" "$out" "$(tail -n 20 "${workspace}/driver.err")"
+    printf '%s\n' "$out" > "${workspace}/results.tsv"
+    printf '%s\n' "$out" | grep -E '^(identity|diagnostic)' || true
+    assert_contains "$(grep '^identity' <<< "$out")" "VTK_VERSION=9.5.2" "S104: the consumer is VTK 9.5.2"
+    assert_contains "$(grep '^identity' <<< "$out")" "CONSUMER=vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader" \
+        "S104: the consumer is the native XML unstructured-grid reader"
+    assert_contains "$(grep '^identity' <<< "$out")" "VTK_MODULE=${AB_VTU_DEP_ROOT}/site/vtkmodules/" \
+        "S104: the consumer comes from the provisioned site"
+
+    while read -r label expected keyword; do
+        line="$(awk -F '\t' -v want="$label" '$1 == want' <<< "$out")"
+        [[ -n "$line" ]] || _fail "S104: the case ${label} ran" "$out"
+        IFS=$'\t' read -r _ result reason _ <<< "$line"
+        assert_eq "$expected" "$result" "S104: ${label} gives ${expected} (${reason})"
+        [[ "$keyword" == - || "${reason,,}" == *"${keyword//_/ }"* ]] ||
+            _fail "S104: the ${label} reason names '${keyword//_/ }'" "$line"
+    done <<'EOF'
+valid_ascii PASS -
+valid_binary PASS -
+valid_raw PASS -
+valid_base64 PASS -
+valid_zlib PASS -
+valid_poly PASS -
+latest_raw PASS -
+truncated_raw FAIL appended
+corrupt_zlib FAIL error
+missing_u FAIL required_pointdata_u
+celldata_u FAIL celldata
+wrong_components FAIL components
+short_p FAIL error
+no_points FAIL error
+incomplete_cells FAIL error
+bad_xml FAIL xml
+poly_no_faces FAIL polyhedron
+no_wall_distance FAIL walldistance
+multi_piece NOT_VERIFIED piece
+not_unstructured NOT_VERIFIED unstructuredgrid
+no_marker NOT_VERIFIED warning
+EOF
+    # Complete loaded-array evidence of a full read.
+    assert_eq "POINTS:Points:3:8;CELLS:connectivity:1:8;CELLS:offsets:1:1;CELLS:types:1:1;CELL_DATA:cellId:1:1;POINT_DATA:U:3:8;POINT_DATA:p:1:8;POINT_DATA:wallDistance:1:8" \
+        "$(awk -F '\t' '$1 == "arrays" && $2 == "valid_raw" { print $3 }' <<< "$out")" \
+        "S104: the full read records the geometry and each array with its components and tuples"
+    assert_contains "$(awk -F '\t' '$1 == "arrays" && $2 == "valid_poly" { print $3 }' <<< "$out")" \
+        "POLYHEDRON:faces:1:" "S104: the polyhedron read records the loaded face data"
+    assert_eq "8 1 CHECKED" "$(awk -F '\t' '$1 == "valid_raw" { print $4, $5, $7 }' <<< "$out")" \
+        "S104: the appended raw read has 8 points, 1 cell, and a checked appended extent"
+    assert_eq "NATIVE" "$(awk -F '\t' '$1 == "valid_zlib" { print $7 }' <<< "$out")" \
+        "S104: a compressed payload is checked by the native block sizes"
+}
+
+# ab_vr_library <workspace> - the capture work helpers before the VTU reader,
+# the functional-receipt block, and the readback block, from the extracted
+# capture step.
+ab_vr_library() {
+    local step="${1}/capture_step.sh"
+    ab_fr_library "$1"
+    awk '/^# ---- VTU readback: begin ----$/ { inside = 1 } inside && !done { print }
+         /^# ---- VTU readback: end ----$/ { done = 1 }' "$step"
+}
+
+# ab_vr_template <workspace> <time0-vtu> <latest-vtu> - the controlled receipt
+# fixture of S94 with the two given flow VTU files of time 2, their scanner
+# evidence, and one receipt run. Each readback case copies this template.
+ab_vr_template() {
+    local workspace="$1" vtk run
+    ab_fr_fixture "$workspace"
+    vtk="${workspace}/checkout/src/batch_9/case_7/vtk"
+    cp -- "$2" "${vtk}/flow_0.vtu"
+    cp -- "$3" "${vtk}/flow_latest_2.vtu"
+    ab_fr_scanner_evidence "$workspace"
+    run="$(ab_fr_unit "$workspace")"
+    assert_contains "$run" "status=0" "the template receipt run ends with status 0"
+    assert_eq "PASS PASS" "$(ab_fr_check "$workspace" F2) $(ab_fr_check "$workspace" F3)" \
+        "the template receipt binds the latest time 2"
+}
+
+# ab_vr_unit <workspace> [NAME=value ...] - run the extracted readback alone,
+# as the capture work calls it after the receipt, with a far capture work end,
+# the product result SUCCEEDED, and the producer of the receipt template. The
+# arguments override the environment. The library is a script file, because
+# it is longer than one command-line argument can be. Prints status=.
+ab_vr_unit() {
+    local workspace="$1" status
+    shift
+    { ab_vr_library "$workspace"; printf '\nvr_capture\n'; } > "${workspace}/vr_unit.sh"
+    grep -qx '# ---- VTU readback: end ----' "${workspace}/vr_unit.sh" ||
+        { _fail "the readback block of the capture work must be extracted"; return 1; }
+    env PATH="${workspace}/fakebin:${PATH}" TMPDIR="${workspace}/tmp" \
+        RUNNER_TEMP="${workspace}/runner_temp" EVIDENCE_DIR="${workspace}/runner_temp/evidence" \
+        GITHUB_WORKSPACE="${workspace}/checkout" CAPTURE_WORK_END="$(( $(date +%s) + 1000 ))" \
+        GITHUB_SHA="$AB_COLLECT_SHA" GITHUB_RUN_ID=4545 GITHUB_RUN_ATTEMPT=1 \
+        GITHUB_REPOSITORY=derek-thl/ucfd_run_batch GITHUB_WORKFLOW=openfoam-evidence GITHUB_JOB=evidence \
+        PREPARE_RESULT=SUCCEEDED OVERALL_RESULT=SUCCEEDED M3_VTU_PROVISION_RESULT=PROVISION_AVAILABLE \
+        "$@" "${AB_STEP_BASH[@]}" "${workspace}/vr_unit.sh" > "${workspace}/vr_unit.out" 2>&1 && status=0 || status=$?
+    printf 'status=%s\n' "$status"
+}
+
+# ab_vr_dir <workspace> - the readback subtree.
+ab_vr_dir() {
+    printf '%s\n' "${1}/runner_temp/evidence/vtu-readback"
+}
+
+# ab_vr_value <workspace> <key> - the one value of vtu-readback/result.env.
+ab_vr_value() {
+    ab_vp_value "$(ab_vr_dir "$1")/result.env" "$2"
+}
+
+# ab_vr_case <template> <label> - a new workspace with a copy of the template.
+ab_vr_case() {
+    local workspace
+    workspace="$(new_workspace "s10x_${2}")"
+    cp -a -- "${1}/." "${workspace}/"
+    printf '%s\n' "$workspace"
+}
+
+# ab_vr_native_rows <workspace> - the readback rows of commands.tsv.
+ab_vr_native_rows() {
+    awk -F '\t' '$1 == "readback"' "$(ab_vr_dir "$1")/commands.tsv" 2>/dev/null || true
+}
+
+# ab_vr_assert_records <workspace> <label> - the seven bounded text records,
+# an inventory of the other six with their bytes and SHA-256, and no capture
+# note.
+ab_vr_assert_records() {
+    local dir name bytes total=0 line
+    dir="$(ab_vr_dir "$1")"
+    assert_eq "arrays.tsv commands.tsv errors.txt files.tsv identity.env inventory.tsv result.env" \
+        "$(ls "$dir" | paste -sd ' ' -)" "${2}: the readback keeps exactly the seven text records"
+    for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env inventory.tsv result.env; do
+        bytes="$(wc -c < "${dir}/${name}")"
+        (( bytes <= 65536 )) || _fail "${2}: ${name} holds at most 65536 bytes" "bytes: ${bytes}"
+        total=$(( total + bytes ))
+    done
+    (( total <= 262144 )) || _fail "${2}: the readback subtree holds at most 262144 bytes" "bytes: ${total}"
+    for name in arrays.tsv commands.tsv errors.txt files.tsv identity.env result.env; do
+        line="$(awk -F '\t' -v n="$name" '$1 == n { print $2 "\t" $3 }' "${dir}/inventory.tsv")"
+        assert_eq "$(wc -c < "${dir}/${name}" | tr -d ' ')"$'\t'"$(sha256sum < "${dir}/${name}" | cut -d ' ' -f 1)" "$line" \
+            "${2}: inventory.tsv binds ${name}"
+    done
+    [[ "$(tail -n 1 "${dir}/result.env")" =~ ^WORK_FINISH=[0-9]+$ ]] || _fail "${2}: result.env ends with WORK_FINISH"
+    assert_eq "" "$(cat "${1}/runner_temp/evidence/capture-work-notes.txt")" "${2}: a readback result gives no capture note"
+}
+
+s105_readback_capture_binds_the_two_files() {
+    local base vtus template workspace root before after native line
+    ab_vr_need_root S105
+    root="$AB_VTU_DEP_ROOT"
+    base="$(new_workspace s105_base)"
+    vtus="${base}/vtus"
+    ab_vr_vtus "$vtus"
+    template="$(new_workspace s105_template)"
+    ab_vr_template "$template" "${vtus}/valid_raw.vtu" "${vtus}/latest_raw.vtu"
+
+    # Two full native reads of the same producer, time, and sources: PASS.
+    workspace="$(ab_vr_case "$template" pass)"
+    before="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    assert_contains "$(ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}")" "status=0" \
+        "S105: the readback ends with status 0"
+    after="$(ab_fr_tree_sha "${workspace}/checkout/src")"
+    assert_eq "$before" "$after" "S105: the readback writes no source file"
+    assert_eq "PASS PASS PASS 2" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_SELECTED_TIME)" \
+        "S105: both files read completely, so the readback is PASS for time 2 ($(ab_vr_value "$workspace" VTU_READBACK_REASON))"
+    ab_vr_assert_records "$workspace" "S105 pass"
+    line="$(ab_vr_native_rows "$workspace")"
+    assert_eq "1" "$(grep -c . <<< "$line")" "S105: one native command ran"
+    assert_contains "$line" "/usr/bin/python3.12 -I - ${workspace}/checkout/src/batch_9/case_7/vtk/flow_0.vtu ${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu $(ab_vr_dir "$workspace")" \
+        "S105: commands.tsv records the exact native vector with the two sources and the evidence directory"
+    assert_contains "$line" "timeout --signal=TERM --kill-after=5s " "S105: the native command has the 5-second kill grace"
+    ab_vr_reader "${base}/reader.py"
+    assert_contains "$line" $'\t'"$( { cat "${base}/reader.py"; printf '\n'; } | sha256sum | cut -d ' ' -f 1)"$'\t' \
+        "S105: commands.tsv records the SHA-256 of the exact standard input: the reader code and the here-string line end"
+    assert_eq "fetch install verify" "$(awk -F '\t' '$1 == "provision" { printf "%s%s", sep, $3; sep = " " }' "$(ab_vr_dir "$workspace")/commands.tsv")" \
+        "S105: commands.tsv keeps the three provision operations"
+    for line in "VTK_VERSION=9.5.2" "CONSUMER=vtkmodules.vtkIOXML.vtkXMLUnstructuredGridReader" "PROVISION_RESULT=PROVISION_AVAILABLE" \
+                "PROVISION_ROOT=${root}" "PROVISION_BLOCK_SHA256=$(ab_vr_constant PROVISION_BLOCK_SHA256)" "SELECTED_TIME=2" \
+                "EXECUTION_SHA=${AB_COLLECT_SHA}" "CAPABILITY_SHA=${AB_COLLECT_SHA}" "CASE_ID=case_7" "BATCH_ID=9" \
+                "CHECKPOINT=POST_ORCHESTRATOR_CAPTURE"; do
+        assert_eq "${line#*=}" "$(ab_vp_value "$(ab_vr_dir "$workspace")/identity.env" "${line%%=*}")" "S105: identity.env has ${line}"
+    done
+    assert_eq "time0 latest" "$(awk -F '\t' 'NR > 1 && $5 == $10 && $5 == $3 && $6 == $11 && $6 == $4 { printf "%s%s", sep, $1; sep = " " }' "$(ab_vr_dir "$workspace")/files.tsv")" \
+        "S105: each source has the scanner bytes and SHA-256 before and after the native read"
+    assert_contains "$(cat "$(ab_vr_dir "$workspace")/arrays.tsv")" $'time0\tPOINT_DATA\twallDistance\tFloat32\t1\t8\t8\tPASS' \
+        "S105: arrays.tsv records the loaded wallDistance of time 0"
+    assert_eq "" "$(ls -A "${root%/*}" | grep '^m3-vtu-readback\.' || true)" "S105: the readback removes its task directory"
+
+    # One file fails: FAIL with each file result.
+    workspace="$(ab_vr_case "$template" one_file)"
+    cp -- "${vtus}/truncated_raw.vtu" "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    ab_fr_scanner_evidence "$workspace"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL PASS FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT)" \
+        "S105: a truncated latest payload fails, and time 0 keeps its PASS ($(ab_vr_value "$workspace" VTU_READBACK_REASON))"
+    ab_vr_assert_records "$workspace" "S105 one file"
+
+    # A source that changes during the native read: FAIL. The fake sha256sum
+    # appends one byte to the latest file after its first readback hash.
+    workspace="$(ab_vr_case "$template" changed_during)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'real=%q\n' "$(command -v sha256sum)"
+        printf '"$real" "$@" && status=0 || status=$?\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    if [[ "$argument" == *flow_latest_2.vtu && ! -e %q ]]; then\n' "${workspace}/changed"
+        printf '        : > %q\n' "${workspace}/changed"
+        printf '        printf "x" >> "$argument"\n'
+        printf '    fi\n'
+        printf 'done\n'
+        printf 'exit "$status"\n'
+    } > "${workspace}/fakebin/sha256sum"
+    chmod +x "${workspace}/fakebin/sha256sum"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a source change during the read fails"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "changed" "S105: the reason names the changed source"
+    assert_file_exists "${workspace}/changed" "S105: the source changed after its first readback hash"
+
+    # A source that differs from its scanner record: FAIL before the native read.
+    workspace="$(ab_vr_case "$template" changed_before)"
+    printf 'x' >> "${workspace}/checkout/src/batch_9/case_7/vtk/flow_0.vtu"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "FAIL" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a source that differs from the scanner record fails"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "changed" "S105: the reason names the changed source"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs on a changed source"
+
+    # A failed product run: NOT_ATTEMPTED, and no command.
+    workspace="$(ab_vr_case "$template" product)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" OVERALL_RESULT=FAILED_EXIT_1 > /dev/null
+    assert_eq "NOT_ATTEMPTED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a failed product run gives NOT_ATTEMPTED"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs after a failed product run"
+    ab_vr_assert_records "$workspace" "S105 product"
+
+    # No provision: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" no_provision)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT= M3_VTU_PROVISION_RESULT= > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: no provision gives NOT_VERIFIED"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "provision" "S105: the reason names the provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without the provision"
+
+    # A missing latest witness: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" missing)"
+    rm -f -- "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a missing latest file gives NOT_VERIFIED"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without both witnesses"
+
+    # Mixed time: the signature names time 3, so the receipt does not bind the
+    # latest time, and no witness is selected.
+    workspace="$(ab_vr_case "$template" mixed_time)"
+    sed -i -e 's/^flow_latest=2$/flow_latest=3/' "${workspace}/checkout/src/batch_9/case_7/vtk/post_processing.complete"
+    rm -rf -- "$(ab_fr_dir "$workspace")"
+    ab_fr_unit "$workspace" > /dev/null
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${root%/*}" > /dev/null
+    assert_eq "NOT_VERIFIED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" "S105: a mixed latest time gives NOT_VERIFIED"
+    assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "time" "S105: the reason names the time binding"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S105: no native command runs without a bound time"
+}
+
+# ab_vr_fake_root <workspace> <kind> [<parent>] - a controlled provision task
+# root below <parent> (default <workspace>/runner_temp) with a complete receipt
+# that names the approved block and manifest SHA-256, the approved manifest,
+# and a site with a pure-Python fake vtkmodules of <kind>: hang (the import
+# blocks), flood (the import writes 200000 bytes), memory (the import asks for
+# 5 GiB), version (VTK 9.4.0), native (VTK 9.5.2, not native), or none (no
+# vtkmodules). A fake can test the guards only; it is never the consumer.
+# Prints the root.
+ab_vr_fake_root() {
+    local root="${3:-${1}/runner_temp}/m3-vtu-deps.Fake0001" dir
+    mkdir -p "${3:-${1}/runner_temp}"
+    mkdir -m 700 -- "$root"
+    for dir in installer wheels site tmp records; do
+        mkdir -m 700 -- "${root}/${dir}"
+    done
+    ab_vp_expected_manifest > "${root}/manifest.tsv"
+    printf 'seq\tlabel\tlimit_ms\tstart_ms\tend_ms\tstatus\toutcome\tgroup\tstop\tcode_sha256\tvector\n1\tfetch\t30000\t1\t2\t0\tCOMPLETED\t9\tEMPTY\t-\tcontrolled\n' \
+        > "${root}/records/commands.tsv"
+    {
+        printf 'PROVISION_SCHEMA=m3-vtu-provision/1\nPROVISION_RESULT=PROVISION_AVAILABLE\nPROVISION_REASON=controlled\n'
+        printf 'PROVISION_ROOT=%s\nPROVISION_BLOCK_SHA256=%s\nPROVISION_MANIFEST_SHA256=%s\nWORK_FINISH=1\n' \
+            "$root" "$(ab_vr_constant PROVISION_BLOCK_SHA256)" "$(ab_vr_constant MANIFEST_SHA256)"
+    } > "${root}/records/result.env"
+    if [[ "$2" != none ]]; then
+        mkdir -p "${root}/site/vtkmodules"
+        case "$2" in
+            hang) printf 'import time\ntime.sleep(30)\n' ;;
+            flood) printf 'import sys\nsys.stdout.write("v" * 200000)\nsys.stdout.flush()\n' ;;
+            memory) printf 'blob = bytearray(5 * 1024 ** 3)\n' ;;
+            *) printf '' ;;
+        esac > "${root}/site/vtkmodules/__init__.py"
+        printf 'class vtkVersion:\n    @staticmethod\n    def GetVTKVersion():\n        return "%s"\n' \
+            "$([[ "$2" == version ]] && echo 9.4.0 || echo 9.5.2)" > "${root}/site/vtkmodules/vtkCommonCore.py"
+    fi
+    printf '%s\n' "$root"
+}
+
+# ab_vr_guard <template> <label> <kind> [NAME=value ...] - a readback unit run
+# on a copy of the receipt template with a fake root of <kind>. Prints the
+# workspace.
+ab_vr_guard() {
+    local template="$1" label="$2" kind="$3" workspace root
+    shift 3
+    workspace="$(ab_vr_case "$template" "$label")"
+    root="$(ab_vr_fake_root "$workspace" "$kind")"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${workspace}/runner_temp" "$@" > "${workspace}/guard.status"
+    printf '%s\n' "$workspace"
+}
+
+# ab_vr_expect <workspace> <label> <result> <keyword> - the readback result and
+# a keyword of its reason.
+ab_vr_expect() {
+    local reason
+    reason="$(ab_vr_value "$1" VTU_READBACK_REASON)"
+    assert_eq "$3" "$(ab_vr_value "$1" VTU_READBACK_RESULT)" "${2}: the readback is ${3} (${reason})"
+    [[ "${reason,,}" == *"${4//_/ }"* ]] || _fail "${2}: the reason names '${4//_/ }'" "$reason" "$(tail -n 5 "${1}/vr_unit.out")"
+}
+
+s106_readback_guards_fail_closed() {
+    local template workspace start elapsed group out line
+    template="$(new_workspace s106_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S106: the template receipt run ends with status 0"
+
+    # A native command that does not end in its limit: TIMEOUT, NOT_VERIFIED,
+    # and the stopped group. The capture work end leaves at most 4 seconds for
+    # it, less the time of the case setup.
+    start="$(date +%s)"
+    workspace="$(ab_vr_guard "$template" hang hang CAPTURE_WORK_END="$(( $(date +%s) + 29 ))")"
+    elapsed=$(( $(date +%s) - start ))
+    ab_vr_expect "$workspace" "S106 hang" NOT_VERIFIED "did_not_complete"
+    (( elapsed <= 12 )) || _fail "S106: the readback ends shortly after the native limit" "elapsed: ${elapsed} s"
+    line="$(ab_vr_native_rows "$workspace")"
+    assert_contains "$line" $'\tTIMEOUT\t' "S106: commands.tsv records the TIMEOUT"
+    [[ "$(cut -f 4 <<< "$line")" =~ ^[0-9]+$ ]] && (( $(cut -f 4 <<< "$line") <= 4000 )) ||
+        _fail "S106: the native limit shrinks to the time left less the kill and receipt reserves" "$line"
+    if pgrep -f -- "$(ab_vr_dir "$workspace")" > /dev/null 2>&1; then
+        _fail "S106: no reader process of the stopped command remains"
+    fi
+    ab_vr_assert_records "$workspace" "S106 hang"
+
+    workspace="$(ab_vr_guard "$template" flood flood)"
+    ab_vr_expect "$workspace" "S106 flood" NOT_VERIFIED "output"
+    workspace="$(ab_vr_guard "$template" memory memory)"
+    ab_vr_expect "$workspace" "S106 memory" NOT_VERIFIED "memory"
+    workspace="$(ab_vr_guard "$template" version version)"
+    ab_vr_expect "$workspace" "S106 version" NOT_VERIFIED "9.4.0"
+    workspace="$(ab_vr_guard "$template" native native)"
+    ab_vr_expect "$workspace" "S106 native" NOT_VERIFIED "native"
+    workspace="$(ab_vr_guard "$template" none none)"
+    ab_vr_expect "$workspace" "S106 none" NOT_VERIFIED "vtkmodules"
+    assert_not_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "/usr/lib/python3" \
+        "S106: a system vtkmodules is never a fallback"
+
+    # Provision gaps stop the readback before any command.
+    workspace="$(ab_vr_case "$template" receipt)"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    sed -i -e "s/^PROVISION_BLOCK_SHA256=.*/PROVISION_BLOCK_SHA256=$(printf '0%.0s' {1..64})/" "${out}/records/result.env"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 receipt" NOT_VERIFIED "provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command runs with another provision block"
+    workspace="$(ab_vr_case "$template" outside)"
+    out="$(ab_vr_fake_root "$workspace" native "${workspace}/elsewhere")"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 outside" NOT_VERIFIED "provision"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command runs with a root outside RUNNER_TEMP"
+
+    # No time for the native command: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_guard "$template" no_time native CAPTURE_WORK_END="$(( $(date +%s) + 20 ))")"
+    ab_vr_expect "$workspace" "S106 no time" NOT_VERIFIED "time"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command starts without its time and reserves"
+    ab_vr_assert_records "$workspace" "S106 no time"
+
+    # A source above the 268435456-byte limit: NOT_VERIFIED before any hash.
+    workspace="$(ab_vr_case "$template" source_limit)"
+    truncate -s 268435457 "${workspace}/checkout/src/batch_9/case_7/vtk/flow_latest_2.vtu"
+    sed -i -e '/^VTU_PATH=case_7\/vtk\/flow_latest_2.vtu$/,/^VTU_TAG_EVIDENCE=/ s/^VTU_BYTES=.*/VTU_BYTES=268435457/' \
+        "${workspace}/runner_temp/evidence/vtu-point-data.txt"
+    {
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "${workspace}/hash_calls"
+        printf 'exec %q "$@"\n' "$(command -v sha256sum)"
+    } > "${workspace}/fakebin/sha256sum"
+    chmod +x "${workspace}/fakebin/sha256sum"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 source limit" NOT_VERIFIED "268435456"
+    assert_not_contains "$(cat "${workspace}/hash_calls" 2>/dev/null)" "flow_latest_2.vtu" "S106: the oversized source is never hashed"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command reads an oversized source"
+
+    # A linked vtk directory: NOT_VERIFIED, and no command.
+    workspace="$(ab_vr_case "$template" linked)"
+    mv -- "${workspace}/checkout/src/batch_9/case_7/vtk" "${workspace}/checkout/vtk_real"
+    ln -s -- "${workspace}/checkout/vtk_real" "${workspace}/checkout/src/batch_9/case_7/vtk"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    ab_vr_expect "$workspace" "S106 linked" NOT_VERIFIED "link"
+    assert_eq "" "$(ab_vr_native_rows "$workspace")" "S106: no native command reads through a link"
+
+    # The combined added-evidence limit: with the collection evidence at the
+    # 10485760-byte ceiling, no readback record fits, and the gap is a capture
+    # note.
+    workspace="$(ab_vr_case "$template" combined)"
+    truncate -s 10485760 "${workspace}/runner_temp/evidence/m3-mean-speed/big.bin"
+    out="$(ab_vr_fake_root "$workspace" native)"
+    ab_vr_unit "$workspace" M3_VTU_DEP_ROOT="$out" RUNNER_TEMP="${workspace}/runner_temp" > /dev/null
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "VTU readback:" \
+        "S106: a readback record that does not fit the combined ceiling is a capture note"
+    assert_contains "$(cat "${workspace}/runner_temp/evidence/capture-work-notes.txt")" "10485760" \
+        "S106: the note names the combined ceiling"
+    assert_eq "" "$(ls -A "$(ab_vr_dir "$workspace")" 2>/dev/null)" "S106: no readback record is written past the ceiling"
+
+    # The stop check of the readback: a group that cannot be signaled stays
+    # NOT_STOPPED by its deadline.
+    workspace="$(new_workspace s106_stop)"
+    {
+        printf 'set -euo pipefail\n'
+        ab_vr_block
+        printf '%s\n' 'start=$(vr_now_ms)' 'vr_stop_group "$1" $(( start + 1500 )) && status=0 || status=$?' \
+            'printf "stop=%s status=%s elapsed=%s\n" "$VR_STOP" "$status" "$(( $(vr_now_ms) - start ))"'
+    } > "${workspace}/stop.sh"
+    group="$(ab_vp_foreign_group)"
+    out="$(bash "${workspace}/stop.sh" "$group" 2>&1)" || _fail "S106: the stop script runs" "$out"
+    assert_contains "$out" "stop=NOT_STOPPED status=1" "S106: a group that cannot be signaled is NOT_STOPPED"
+    [[ "$out" =~ elapsed=([0-9]+) ]] && (( BASH_REMATCH[1] <= 1700 )) || _fail "S106: the stop check ends by its deadline" "$out"
+}
+
+s107_readback_keeps_the_frozen_blocks_and_interface() {
+    local workspace body block constant vector pattern reader summary deadline bytes
+    workspace="$(new_workspace s107_interface)"
+    assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
+        "S107: the VTU header reader block is unchanged"
+    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+        "S107: the M3 mean-speed block is unchanged"
+    body="$(ab_step_run_body "Capture the evidence")"
+    assert_eq $'metric_collect\nfr_capture\nvr_capture' \
+        "$(grep -xE '[[:space:]]*(metric_collect|fr_capture|vr_capture)' <<< "$body" | tr -d ' ')" \
+        "S107: the readback runs once, after the collection and the receipt"
+    block="$(ab_vr_block)"
+    [[ "$block" == *"# ---- VTU readback: end ----" ]] || _fail "S107: the capture work holds the complete readback block"
+    assert_eq "1" "$(grep -cx '# ---- VTU readback: begin ----' <<< "$body")" "S107: the readback block is in the capture work once"
+    for constant in VR_WORK_SECONDS=90 VR_NATIVE_SECONDS=60 VR_KILL_GRACE_SECONDS=5 VR_RECEIPT_RESERVE_SECONDS=10 \
+                    VR_SOURCE_LIMIT=268435456 VR_SOURCES_LIMIT=536870912 VR_AS_LIMIT=4294967296 VR_CPU_SECONDS=60 \
+                    VR_FILE_LIMIT=65536 VR_TREE_LIMIT=262144 VR_PROVISION_TEXT_LIMIT=65536 VR_COMBINED_LIMIT=10485760 \
+                    VR_PYTHON=/usr/bin/python3.12; do
+        assert_eq "1" "$(grep -cx -- "$constant" <<< "$block")" "S107: the readback sets ${constant}"
+    done
+    ab_vp_block "$CONTRACT_WORKFLOW" "$AB_VP_STEP" > "${workspace}/provision.block"
+    assert_eq "$(sha256sum < "${workspace}/provision.block" | cut -d ' ' -f 1)" "$(ab_vr_constant PROVISION_BLOCK_SHA256)" \
+        "S107: the readback names the SHA-256 of the provision block of both workflows"
+    assert_eq "$(ab_vp_expected_manifest | sha256sum | cut -d ' ' -f 1)" "$(ab_vr_constant MANIFEST_SHA256)" \
+        "S107: the readback names the SHA-256 of the approved manifest"
+    # The fixed native vector of proposal Section 4.
+    for vector in 'timeout --signal=TERM --kill-after=5s "${READBACK_RUN_SECONDS}s" \' '/usr/bin/python3.12 -I - \' \
+                  '"$READBACK_SOURCE_0" "$READBACK_SOURCE_LATEST" "$READBACK_EVIDENCE_DIR"'; do
+        assert_eq "1" "$(sed -e 's/^[[:space:]]*//' <<< "$block" | grep -cxF -- "$vector")" \
+            "S107: the readback holds the fixed vector line [${vector}] once"
+    done
+    # The reader: the one native consumer, no installation, network, process,
+    # writer, or value calculation.
+    ab_vr_reader "${workspace}/reader.py"
+    reader="$(cat "${workspace}/reader.py")"
+    assert_contains "$reader" "vtkXMLUnstructuredGridReader" "S107: the reader uses the native XML unstructured-grid reader"
+    for pattern in subprocess socket http urllib 'import pip' os.system Popen Writer numpy vtkmodules.all \
+                   GetRange GetTuple GetComponent; do
+        assert_eq "0" "$(grep -cF -- "$pattern" <<< "$reader")" "S107: the reader holds no [${pattern}]"
+    done
+    for pattern in 'pip ' 'sudo' 'apt-get' 'curl ' 'wget ' 'PYTHONPATH' 'LD_LIBRARY_PATH'; do
+        assert_eq "0" "$(grep -cF -- "$pattern" <<< "$block")" "S107: the readback block holds no [${pattern}]"
+    done
+    # The job summary and the interface.
+    summary="$(ab_step_run_body "Write the job summary")"
+    assert_contains "$summary" '| VTU readback | \`${VTU_READBACK_RESULT:-UNAVAILABLE}\` ${VTU_READBACK_REASON:-UNAVAILABLE} |' \
+        "S107: the job summary shows the readback result and reason"
+    assert_eq "Start the evidence clock|Create the bounded-runner library|Check out the repository|Record the checkout phase result|Resolve the OpenFOAM baseline|Install OpenFOAM v2512|Record the OpenFOAM version|Prepare the one-Case DOE Batch CSV|Run the Orchestrator|Capture the evidence|Write the job summary|Upload the evidence artifacts" \
+        "$(sed -n -e 's/^      - name: //p' "$WORKFLOW" | paste -sd '|' -)" "S107: the step list stays"
+    assert_eq "1" "$(grep -cF -- "bash -c 'bash src/run_batch.sh --stage setup,mesh,flow,post-processing -j 1 \"\$1\" \\" "$WORKFLOW")" \
+        "S107: the Orchestrator vector stays"
+    assert_eq "10" "$(awk '/^      - name: Capture the evidence$/ { found = 1; next } found && /^        timeout-minutes:/ { print $2; exit }' "$WORKFLOW")" \
+        "S107: the capture step guard stays 10 minutes"
+    # The evidence workflow stays below the GitHub workflow file limit (500 KB):
+    # at most 510000 raw bytes, the ceiling of Owner decision 6173182935.
+    bytes="$(wc -c < "$WORKFLOW")" || _fail "S107: the evidence workflow can be read"
+    bytes="${bytes//[[:space:]]/}"
+    [[ "$bytes" =~ ^(0|[1-9][0-9]*)$ ]] || _fail "S107: the evidence workflow has a valid byte count" "bytes: [${bytes}]"
+    (( bytes <= 510000 )) ||
+        _fail "S107: the evidence workflow has at most 510000 raw bytes" "ceiling: 510000" "actual:  ${bytes}"
+
+    # The capture step publishes the readback result. A failed product run gives
+    # NOT_ATTEMPTED; a capture with no work budget never reaches the readback.
+    ab_capture_fixture "$workspace"
+    deadline=$(( $(date +%s) + 6000 ))
+    ab_run_capture "$workspace" "$deadline" > /dev/null
+    assert_eq "NOT_ATTEMPTED" "$(ab_vr_value "$workspace" VTU_READBACK_RESULT)" \
+        "S107: after a failed product run, the readback result is NOT_ATTEMPTED"
+    assert_eq "NOT_ATTEMPTED" "$(ab_env_last "$workspace" VTU_READBACK_RESULT)" "S107: GITHUB_ENV gets the readback result"
+    : > "${workspace}/step_summary"
+    env GITHUB_STEP_SUMMARY="${workspace}/step_summary" VTU_READBACK_RESULT="$(ab_env_last "$workspace" VTU_READBACK_RESULT)" \
+        VTU_READBACK_REASON="$(ab_env_last "$workspace" VTU_READBACK_REASON)" \
+        bash -eo pipefail "${workspace}/summary_step.sh" > /dev/null 2>&1 || _fail "S107: the summary step succeeds"
+    assert_contains "$(cat "${workspace}/step_summary")" "| VTU readback | \`NOT_ATTEMPTED\` " "S107: the summary shows the readback result"
+    workspace="$(new_workspace s107_no_budget)"
+    ab_capture_fixture "$workspace"
+    ab_run_capture "$workspace" "$(( $(date +%s) + 180 ))" > /dev/null
+    assert_eq "SKIPPED_NO_BUDGET" "$(ab_env_last "$workspace" CAPTURE_RESULT)" "S107: the capture had no work budget"
+    assert_eq "NOT_ATTEMPTED" "$(ab_env_last "$workspace" VTU_READBACK_RESULT)" \
+        "S107: a capture that never reaches the readback publishes NOT_ATTEMPTED"
+    assert_contains "$(ab_env_last "$workspace" VTU_READBACK_REASON)" "SKIPPED_NO_BUDGET" "S107: the reason names the capture result"
+}
+
+# ab_vr_record_run <workspace> <time0> <latest> <end> - one readback unit run
+# with a fake root of the native kind whose vtkmodules import writes one
+# complete reader record to file descriptor 3: the file results <time0> and
+# <latest> (PASS or FAIL), and the reader result PASS when both are PASS, or
+# FAIL. The import then ends the reader with <end>: an exit status, or the name
+# of a signal that the reader sends to itself. The record drives the outcome
+# and record guards only; it never proves a native read.
+ab_vr_record_run() {
+    local root result=PASS
+    root="$(ab_vr_fake_root "$1" native)"
+    [[ "$2 $3" == "PASS PASS" ]] || result=FAIL
+    {
+        printf 'import os, signal\n'
+        printf 'record = "READER_SCHEMA=vtu-readback-reader/1\\nREADER_RESULT=%s\\nREADER_REASON=a controlled record\\n"\n' "$result"
+        printf 'record += "FILE_time0_RESULT=%s\\nFILE_time0_REASON=controlled\\n"\n' "$2"
+        printf 'record += "FILE_latest_RESULT=%s\\nFILE_latest_REASON=controlled\\n"\n' "$3"
+        printf 'os.write(3, (record + "READER_FINISH=1\\n").encode())\n'
+        if [[ "$4" =~ ^[0-9]+$ ]]; then
+            printf 'os._exit(%s)\n' "$4"
+        else
+            printf 'os.kill(os.getpid(), signal.%s)\n' "$4"
+        fi
+    } > "${root}/site/vtkmodules/__init__.py"
+    ab_vr_unit "$1" M3_VTU_DEP_ROOT="$root" RUNNER_TEMP="${1}/runner_temp" > "${1}/guard.status"
+}
+
+# ab_vr_result_of <file> - the VTU_READBACK_RESULT of one result file, or - when
+# it is not a regular file.
+ab_vr_result_of() {
+    if [[ -f "$1" && ! -L "$1" ]]; then
+        ab_vp_value "$1" VTU_READBACK_RESULT
+    else
+        printf -- '-\n'
+    fi
+}
+
+# ab_vr_side <workspace> - the side result file of the readback.
+ab_vr_side() {
+    printf '%s\n' "${1}/runner_temp/vtu-readback-result.env"
+}
+
+# ab_vr_publish <workspace> - run the readback-result publication of the capture
+# step, from its "The VTU readback result." comment through the evidence
+# verdicts that go to GITHUB_ENV, as the capture step runs it after the capture
+# work. Prints the published VTU_READBACK_RESULT.
+ab_vr_publish() {
+    local workspace="$1" out
+    ab_step_run_body "Capture the evidence" | awk '
+        done { next }
+        index($0, "# The VTU readback result. ") == 1 { inside = 1 }
+        inside { print }
+        inside && $0 == "} | tee -a \"$GITHUB_ENV\"" { inside = 0; done = 1 }' > "${workspace}/publish.sh"
+    [[ "$(tail -n 1 "${workspace}/publish.sh")" == '} | tee -a "$GITHUB_ENV"' ]] ||
+        { _fail "the readback-result publication of the capture step must be extracted"; return 1; }
+    : > "${workspace}/github_env"
+    out="$(env EVIDENCE_DIR="${workspace}/runner_temp/evidence" GITHUB_ENV="${workspace}/github_env" \
+        capture_result=COMPLETE capture_reason="a controlled capture" \
+        metric_result="${workspace}/no_metric" receipt_result="${workspace}/no_receipt" \
+        "${AB_STEP_BASH[@]}" "${workspace}/publish.sh" 2>&1)" ||
+        { _fail "the readback-result publication runs" "$out"; return 1; }
+    ab_env_last "$workspace" VTU_READBACK_RESULT
+}
+
+# ab_vr_inventory_gaps <workspace> - each inventory.tsv row with a SHA-256 that
+# does not bind its record: other bytes or SHA-256, or no regular file. A row
+# with - and UNAVAILABLE binds nothing. Prints nothing when every row binds.
+ab_vr_inventory_gaps() {
+    local dir name bytes sha
+    dir="$(ab_vr_dir "$1")"
+    while IFS=$'\t' read -r name bytes sha; do
+        [[ "$name" != name && "$sha" != UNAVAILABLE ]] || continue
+        if [[ ! -f "${dir}/${name}" || -L "${dir}/${name}" ]] ||
+                [[ "$(wc -c < "${dir}/${name}" | tr -d ' ') $(sha256sum < "${dir}/${name}" | cut -d ' ' -f 1)" != "${bytes} ${sha}" ]]; then
+            printf '%s ' "$name"
+        fi
+    done < "${dir}/inventory.tsv"
+}
+
+s108_readback_pass_needs_a_clean_native_exit() {
+    local template workspace case name time0 latest end results="" outcome
+    local -A ws=()
+    template="$(new_workspace s108_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S108: the template receipt run ends with status 0"
+
+    # Each case first, so one comparison shows every outcome: label, result,
+    # time-0 result, latest result.
+    for case in exit_0:PASS:PASS:0 exit_3:PASS:PASS:3 exit_1:PASS:PASS:1 signal:PASS:PASS:SIGUSR1 \
+                fail_signal:PASS:FAIL:SIGUSR1; do
+        IFS=: read -r name time0 latest end <<< "$case"
+        ws[$name]="$(ab_vr_case "$template" "s108_${name}")"
+        ab_vr_record_run "${ws[$name]}" "$time0" "$latest" "$end"
+        workspace="${ws[$name]}"
+        results+="${name} $(ab_vr_value "$workspace" VTU_READBACK_RESULT) $(ab_vr_value "$workspace" VTU_READBACK_TIME0_RESULT)"
+        results+=" $(ab_vr_value "$workspace" VTU_READBACK_LATEST_RESULT)|"
+    done
+    assert_eq "exit_0 PASS PASS PASS|exit_3 NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|exit_1 NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|signal NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|fail_signal FAIL NOT_VERIFIED FAIL|" \
+        "$results" "S108: only a native command that ends with status 0 after a complete PASS record gives PASS, and a FAIL record stays FAIL"
+
+    # The recorded native outcome and the reason of each case.
+    for case in exit_0:0:COMPLETED exit_3:3:FAILED exit_1:1:COMPLETED signal:138:FAILED fail_signal:138:FAILED; do
+        IFS=: read -r name end outcome <<< "$case"
+        workspace="${ws[$name]}"
+        assert_eq "${end} ${outcome}" "$(ab_vr_native_rows "$workspace" | cut -f 7,8 | tr '\t' ' ')" \
+            "S108 ${name}: commands.tsv records the native status and outcome"
+        ab_vr_assert_records "$workspace" "S108 ${name}"
+        [[ "$name" != exit_0 ]] || continue
+        assert_contains "$(ab_vr_value "$workspace" VTU_READBACK_REASON)" "status ${end}" \
+            "S108 ${name}: the reason names the native status"
+        assert_eq "NOT_VERIFIED" "$(awk -F '\t' '$1 == "time0" { print $18 }' "$(ab_vr_dir "$workspace")/files.tsv")" \
+            "S108 ${name}: files.tsv keeps no time-0 PASS of the failed native command"
+    done
+    assert_contains "$(ab_vr_value "${ws[fail_signal]}" VTU_READBACK_REASON)" "a controlled record" \
+        "S108: the FAIL keeps the reason of its reader record"
+}
+
+s109_readback_pass_needs_the_final_records() {
+    local template complete workspace name results="" real notes
+    local -A ws=()
+    template="$(new_workspace s109_template)"
+    ab_fr_fixture "$template"
+    assert_contains "$(ab_fr_unit "$template")" "status=0" "S109: the template receipt run ends with status 0"
+
+    # complete: a status-0 PASS record and every final record.
+    complete="$(ab_vr_case "$template" s109_complete)"
+    ab_vr_record_run "$complete" PASS PASS 0
+    ws[complete]="$complete"
+    # result_write: result.env cannot be written.
+    ws[result_write]="$(ab_vr_case "$template" s109_result_write)"
+    mkdir -p -- "$(ab_vr_dir "${ws[result_write]}")/result.env"
+    ab_vr_record_run "${ws[result_write]}" PASS PASS 0
+    # inventory_write: inventory.tsv cannot be written.
+    ws[inventory_write]="$(ab_vr_case "$template" s109_inventory_write)"
+    mkdir -p -- "$(ab_vr_dir "${ws[inventory_write]}")/inventory.tsv"
+    ab_vr_record_run "${ws[inventory_write]}" PASS PASS 0
+    # final_hash: the fake sha256sum gives the inventory no SHA-256 of result.env.
+    ws[final_hash]="$(ab_vr_case "$template" s109_final_hash)"
+    real="$(command -v sha256sum)"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for argument in "$@"; do\n'
+        printf '    if [[ "$argument" == result.env ]]; then\n'
+        printf '        : > %q\n' "${ws[final_hash]}/hash_dropped"
+        printf '        %q "$@" | grep -v -- %q\n' "$real" '  result[.]env$'
+        printf '        exit 0\n'
+        printf '    fi\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$real"
+    } > "${ws[final_hash]}/fakebin/sha256sum"
+    chmod +x "${ws[final_hash]}/fakebin/sha256sum"
+    ab_vr_record_run "${ws[final_hash]}" PASS PASS 0
+    # stopped: the capture work stopped after a complete PASS result.env and
+    # before inventory.tsv, so the side result keeps its first text.
+    ws[stopped]="$(ab_vr_case "$complete" s109_stopped)"
+    rm -f -- "$(ab_vr_dir "${ws[stopped]}")/inventory.tsv"
+    printf 'VTU_READBACK_RESULT=INCOMPLETE\nVTU_READBACK_REASON=the readback work did not reach its end\nWORK_START=1\n' \
+        > "$(ab_vr_side "${ws[stopped]}")"
+    # side_only: no result.env, and the side result keeps the PASS text.
+    ws[side_only]="$(ab_vr_case "$complete" s109_side_only)"
+    rm -f -- "$(ab_vr_dir "${ws[side_only]}")/result.env"
+
+    # Each case first, so one comparison shows every outcome: label, retained
+    # result.env and side result after the readback, published result, and
+    # retained result.env after the publication.
+    for name in complete result_write inventory_write final_hash stopped side_only; do
+        results+="${name} $(ab_vr_result_of "$(ab_vr_dir "${ws[$name]}")/result.env") $(ab_vr_result_of "$(ab_vr_side "${ws[$name]}")")"
+        results+=" $(ab_vr_publish "${ws[$name]}") $(ab_vr_result_of "$(ab_vr_dir "${ws[$name]}")/result.env")|"
+    done
+    assert_eq "complete PASS PASS PASS PASS|result_write - NOT_VERIFIED NOT_VERIFIED -|inventory_write NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|final_hash NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED NOT_VERIFIED|stopped PASS INCOMPLETE INCOMPLETE INCOMPLETE|side_only - PASS NOT_VERIFIED NOT_VERIFIED|" \
+        "$results" "S109: a final record failure gives no retained, side, or published PASS"
+
+    # The complete case keeps every record, and the publication keeps it.
+    ab_vr_assert_records "$complete" "S109 complete"
+    # Each final record failure is one exact capture note, and the inventory
+    # binds the retained records.
+    notes="$(cat "${ws[result_write]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: result.env cannot be written completely" "$notes" "S109: a result.env that cannot be written is one capture note"
+    assert_eq $'result.env\t-\tUNAVAILABLE' "$(grep '^result\.env' "$(ab_vr_dir "${ws[result_write]}")/inventory.tsv")" \
+        "S109: the inventory binds no result.env that was not written"
+    notes="$(cat "${ws[inventory_write]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: inventory.tsv cannot be written completely" "$notes" "S109: an inventory.tsv that cannot be written is one capture note"
+    assert_contains "$(ab_vr_value "${ws[inventory_write]}" VTU_READBACK_REASON)" "records are not complete" \
+        "S109: the retained result names the incomplete records"
+    assert_file_exists "${ws[final_hash]}/hash_dropped" "S109: the inventory hash of result.env was dropped"
+    notes="$(cat "${ws[final_hash]}/runner_temp/evidence/capture-work-notes.txt")"
+    assert_eq "VTU readback: inventory.tsv has no SHA-256 of result.env" "$notes" "S109: a missing final SHA-256 is one capture note"
+    for name in result_write final_hash side_only; do
+        assert_eq "" "$(ab_vr_inventory_gaps "${ws[$name]}")" "S109 ${name}: inventory.tsv binds the retained records"
+    done
+    assert_eq "" "$(grep -v '^name' "$(ab_vr_dir "${ws[side_only]}")/inventory.tsv" | grep UNAVAILABLE)" \
+        "S109: after the publication, the inventory binds the retained result.env"
+    assert_contains "$(ab_vr_value "${ws[side_only]}" VTU_READBACK_REASON)" "inventory" \
+        "S109: the published result names the missing inventory binding"
+    assert_eq "MISSING" "$(ab_vr_value "${ws[stopped]}" VTU_READBACK_TIME0_RESULT)" \
+        "S109: a stopped readback keeps no file PASS in the retained result"
 }
 
 # ---- the observation list ---------------------------------------------------
@@ -9242,6 +11330,16 @@ AB_OBSERVATIONS=(
     s97_receipt_setup_entries_fail_closed
     s98_receipt_limits_fail_closed
     s99_receipt_keeps_the_frozen_blocks_and_interface
+    s100_provision_block_is_identical_in_both_workflows
+    s101_provision_gate_and_bounded_operations
+    s102_provision_programs_fail_closed
+    s103_provision_ci_consumer_is_available
+    s104_readback_native_reads_controlled_vtus
+    s105_readback_capture_binds_the_two_files
+    s106_readback_guards_fail_closed
+    s107_readback_keeps_the_frozen_blocks_and_interface
+    s108_readback_pass_needs_a_clean_native_exit
+    s109_readback_pass_needs_the_final_records
 )
 
 # One observation runs in this process when the caller names it. The scenario
