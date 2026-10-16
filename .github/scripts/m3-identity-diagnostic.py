@@ -37,7 +37,6 @@ STREAM, PREFIX, RECORD, PACKET, FILES = 1048576, 65536, 65536, 8388608, 256
 GUARDS = (('success', 'B', ('0', 'COMPLETED', '0', '')), ('stalled', 'T', ('1', 'TIMEOUT', '124', 'TIMEOUT')),
           ('nonzero', 'T', ('1', 'FAILED', '7', 'ENVIRONMENT_MISMATCH')),
           ('overflow', 'B', ('1', 'FILE_LIMIT', '153', 'RESOURCE_LIMIT')))
-INSTALLER = ('sudo', 'apt', 'apt-get', 'dpkg', 'http', 'https', 'gpgv', 'curl', 'bash', 'sh')
 END, KEYS = [0], []  # the work end in ms (T0 + 720 s); the identity keys
 
 DRIVER = r'''# The fixed driver of metric_identity only: definitions, directory, mode, bashrc, seed, end, prelude.
@@ -240,9 +239,7 @@ def listing(root, skip=()):
 def keep(path, limit, dst=None):
     if path.is_symlink() or not path.is_file():
         return (0, 0, sha(b''), 'MISSING')
-    size = path.stat().st_size
-    if dst is None and size > limit:
-        os.truncate(path, limit)
+    size = path.stat().st_size  # the raw source stays untouched
     with open(path, 'rb') as f:
         data = f.read(limit)
     if dst is not None:
@@ -273,7 +270,7 @@ def cleanup(work, temp, stopped):
 def finish(root, work, temp, stopped):
     clean, removed = cleanup(work, temp, stopped)
     (root / 'work-removed.tsv').write_bytes(removed.encode('utf-8', 'replace')[:RECORD])
-    return clean, scrub(files_of(root))
+    return clean, scrub(files_of(root)) if stopped else 0  # no source change without a stop proof
 
 
 def prepare(temp, got):
@@ -298,17 +295,19 @@ def probe(work, pdir, mode, bashrc, seed, env, wait, dst=None):
     with open(pdir / 'driver.out', 'wb') as f:
         p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env,
                              cwd=env['HOME'], start_new_session=True, preexec_fn=limits)
-    stat = read(Path(f'/proc/{p.pid}/stat')).decode('latin-1')
-    r['DRIVER_PID'], r['DRIVER_START_ID'] = p.pid, (stat[stat.rfind(')') + 2:].split()[19:20] or ['UNAVAILABLE'])[0]
-    try:
-        r['DRIVER_EXIT'] = p.wait(timeout=wait)
-    except subprocess.TimeoutExpired:
-        r['DRIVER_EXIT'] = 'LATE'
-    r['DRIVER_GROUP_STOP'] = stop(p.pid)
+    try:  # each exit after the launch stops the known group
+        stat = read(Path(f'/proc/{p.pid}/stat')).decode('latin-1')
+        r['DRIVER_PID'], r['DRIVER_START_ID'] = p.pid, (stat[stat.rfind(')') + 2:].split()[19:20] or ['UNAVAILABLE'])[0]
+        try:
+            r['DRIVER_EXIT'] = p.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            r['DRIVER_EXIT'] = 'LATE'
+    finally:
+        r['DRIVER_GROUP_STOP'] = stop(p.pid)
     p.poll()
     d = r['d'] = kv(pdir / 'driver.env')
     group = d.get('M_GROUP', '')
-    r['OPERATION_GROUP_STOP'] = 'EMPTY' if group == '-' else stop(int(group)) if group.isdigit() else 'NOT_STOPPED'
+    r['OPERATION_GROUP_STOP'] = 'EMPTY' if group == '-' and d.get('DRIVER_END') == 'COMPLETE' else stop(int(group)) if group.isdigit() else 'NOT_STOPPED'
     r['END_MS'], r['out'], r['trace'] = now_ms(), read(pdir / '03-identity.out'), read(pdir / 'trace.txt')
     r['rows'] = [x for x in read(pdir / 'commands.tsv').decode('utf-8', 'replace').split('\n')[1:] if x]
     frames = [x for x in r['trace'].split(b'\n') if x]
@@ -349,7 +348,7 @@ def verdict(b, t):
     if b != 'ORIGINAL_TIMEOUT':
         return 'EVIDENCE_LIMIT', 'NOT_REPRODUCED' if b == 'COMPLETED' else 'DIFFERENT_FAILURE', f'B ended with {b}'
     if t == 'ORIGINAL_TIMEOUT':
-        return 'REVIEW_REQUIRED', 'STOP_LOCATION_OBSERVED', 'a location is no cause'
+        return 'EVIDENCE_LIMIT', 'STOP_LOCATION_OBSERVED', 'a location is no cause'
     if t == 'NOT_RUN':
         return 'EVIDENCE_LIMIT', 'ORIGINAL_TIMEOUT', 'no T: no time or stop proof'
     return 'EVIDENCE_LIMIT', 'TRACE_PERTURBED' if t == 'COMPLETED' else 'TRACE_' + t, f'T ended with {t}'
@@ -479,8 +478,9 @@ def self_test():
         rows += [('SOURCE_RESULT', 'PASS')] + [(f'SOURCE_{n.upper()}', f'{s} {d}') for n, s, d in BLOCKS]
         work = prepare(temp, got)[0]
         for name, mode, expect in GUARDS:
+            stopped = False  # unverified from the launch on
             ok, line, halted = guard(work, gdir, name, mode, expect)
-            cases[name], stopped = ok, stopped and halted
+            cases[name], stopped = ok, halted
             rows += [(f'CASE_{name}', line), (f'CASE_{name}_RESULT', 'PASS' if ok else 'FAIL')]
             if not halted:
                 break
@@ -521,18 +521,19 @@ def binding(gdir):
 
 
 def provision(root, st):
-    # The stop proof of the provision step: an empty run_bounded group and no new root installer.
+    # The stop proof of the provision step: the known group, then a later scan without a new live root process.
     idir = root / 'install'
-    r, rows = kv(idir / 'install.env'), procs()
+    r = kv(idir / 'install.env')
     group, up, result = r.get('CHILD_GROUP', ''), r.get('START_UPTIME', ''), r.get('INSTALL_RESULT', 'UNAVAILABLE')
     child = stop(int(group)) if group.isdigit() else 'NOT_STARTED' if result == 'NOT_ATTEMPTED' else 'NOT_RECORDED'
+    rows = procs()
     ticks = int(float(up) * os.sysconf('SC_CLK_TCK')) if re.fullmatch(r'\d+\.\d+', up) else None
     new = None if rows is None or ticks is None else [
         x for x in rows if x[4] >= ticks and x[5] == 0 and x[1] != 'Z' and 2 not in (x[0], x[2])]
-    stays = None if new is None else [x for x in new if x[6] in INSTALLER]
-    halted = child in ('EMPTY', 'STOPPED', 'NOT_STARTED') and stays == []
-    put(idir / 'stop.env', [('CHILD_GROUP_STOP', child), ('NEW_ROOT_PROCESSES', 'UNREADABLE' if new is None else
-        ' '.join(f'{x[0]}:{x[6]}' for x in new[:200]) or 'NONE'), ('LIB_SHA256', sha(read(idir / 'lib.sh')))]
+    halted = child in ('EMPTY', 'STOPPED', 'NOT_STARTED') and new == []
+    put(idir / 'stop.env', [('CHILD_GROUP_STOP', child), ('NEW_ROOT_PROCESSES', 'UNREADABLE' if rows is None else
+        'NO_START_IDENTITY' if ticks is None else ' '.join(f'{x[0]}:{x[4]}:{x[2]}:{x[6]}' for x in new[:200]) or 'NONE'),
+        ('LIB_SHA256', sha(read(idir / 'lib.sh')))]
         + [(f'FILE_{n[:-4].upper()}', ' '.join(map(str, keep(idir / n, m)))) for n, m in (
             ('install.log', STREAM), ('timeout.log', PREFIX))] + [('INSTALL_STOP', 'VERIFIED' if halted else 'NOT_VERIFIED')])
     if not halted:
@@ -550,9 +551,10 @@ def native_probe(work, root, mode, st):
     pdir = root / ('probe-' + mode)
     env = {'HOME': str(work / f'{mode}-home'), 'TMPDIR': str(work / f'{mode}-tmp'), 'PATH': PATH0,
            'LC_ALL': 'C', 'LANG': 'C'}
+    st['stopped'] = False  # unverified from the launch on
     r = probe(work, pdir, mode, BASHRC, 79, env, LIMIT_MS / 1000 + 10)
     end = outcome(r, mode == 'T')
-    st['stopped'] = st['stopped'] and 'NOT_STOPPED' not in (r['DRIVER_GROUP_STOP'], r['OPERATION_GROUP_STOP'])
+    st['stopped'] = 'NOT_STOPPED' not in (r['DRIVER_GROUP_STOP'], r['OPERATION_GROUP_STOP'])
     keys = [x.partition(b'=')[0].decode('utf-8', 'replace') for x in r['out'].split(b'\n')[:-1]]
     put(pdir / 'probe.env', [('PROBE', mode), ('OUTCOME', end), ('COUNTER_MODEL', 'HISTORICAL_LIMIT_SEED'),
         ('VECTOR', f'bash -c "$METRIC_IDENTITY_SCRIPT" identity openfoam2512-default {BASHRC}'),
@@ -597,8 +599,6 @@ def native():
         st['terminal'], st['limit'] = 'CONTRACT_VIOLATION', f'SECRET_EXPOSURE: {hits} retained files were redacted'
     elif count + 2 > FILES or size + 2 * RECORD > PACKET:
         st['terminal'], st['limit'] = 'EVIDENCE_LIMIT', f'PACKET_LIMIT: {count} files and {size} bytes'
-    elif clean != 'REMOVED' and st['terminal'] == 'REVIEW_REQUIRED':
-        st['terminal'], st['limit'] = 'EVIDENCE_LIMIT', f"CLEANUP_UNVERIFIED after: {st['limit']}"
     put(root / 'result.env', [('DIAGNOSTIC_CONTEXT', 'NO_CASE'), ('M3_ACCEPTANCE_EVIDENCE', 'false')]
         + [(k, st[x]) for k, x in (('TERMINAL_CLASSIFICATION', 'terminal'), ('OBSERVATION', 'observation'),
                                    ('EVIDENCE_LIMIT', 'limit'), ('B_RESULT', 'B'), ('T_RESULT', 'T'))]
@@ -606,7 +606,7 @@ def native():
     text, count, size = listing(root, ('inventory.tsv',))
     (root / 'inventory.tsv').write_text(text + f'TOTAL\t{count}\t{size}\n')
     print(f"m3 identity diagnostic: {st['terminal']} {st['observation']}: {st['limit']}")
-    return 0 if st['terminal'] == 'REVIEW_REQUIRED' and clean == 'REMOVED' else 1
+    return 1  # no class here is a success: no cause detector exists
 
 
 def main(argv):
