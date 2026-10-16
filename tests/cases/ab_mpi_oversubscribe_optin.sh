@@ -11213,6 +11213,197 @@ s109_readback_pass_needs_the_final_records() {
         "S109: a stopped readback keeps no file PASS in the retained result"
 }
 
+# ---- S110: the M3 identity diagnostic carrier (Issue #80) -------------------
+
+# S110 (admission 6209387364, amended by 6213339238, of approved proposal
+# 6207516357): the manual M3 identity diagnostic carrier. Pure checks of the
+# workflow, the closed helper, the two CI path filters, and the frozen source
+# at M; then exactly one --self-test call, which runs the four synthetic
+# identity guards (CONTROL_ONLY) and the pure negative checks. S110 never calls
+# the normal entry, a package provision, a Case, or a Stage. A guard PASS is
+# instrumentation evidence only: it is no reproduction of the historical
+# identity TIMEOUT and no M3 evidence.
+s110_identity_diagnostic_carrier() {
+    local carrier helper workspace temp root guard receipt out status secret key name text bytes driver pattern
+    local observed retained state
+    carrier="${REPO_ROOT}/.github/workflows/m3-identity-diagnostic.yml"
+    helper="${REPO_ROOT}/.github/scripts/m3-identity-diagnostic.py"
+    # Without the carrier, S110 stops here, before any helper call.
+    assert_file_exists "$carrier" "S110: the identity diagnostic workflow exists"
+    assert_file_exists "$helper" "S110: the identity diagnostic helper exists"
+    workspace="$(new_workspace s110_carrier)"
+
+    # The frozen source at M: the evidence workflow, the baseline file, and two
+    # blocks cut here without the helper (ten leading spaces removed).
+    assert_eq "509823 65446acba49eac2b371c6dc8afabceac052a1b9a90fae870f6af6b4b191ecb92" \
+        "$(wc -c < "$WORKFLOW") $(sha256sum < "$WORKFLOW" | cut -d ' ' -f 1)" "S110: the evidence workflow keeps its bytes of M"
+    assert_eq "f45ab757cb0d9b2d18eac5e0208643a6d43a32a634a35ff1d0456857b95129f5" \
+        "$(sha256sum < "${REPO_ROOT}/.openfoam-version" | cut -d ' ' -f 1)" "S110: .openfoam-version keeps v2512"
+    sed -e 's/^ \{10\}//' "$WORKFLOW" > "${workspace}/dedented.yml"
+    awk '$0 == "# ---- M3 mean speed: end ----" { stop = 1 }
+         $0 == "# ---- M3 mean speed: begin ----" { on = 1 }
+         on && !stop' "${workspace}/dedented.yml" > "${workspace}/definitions.sh"
+    awk -v q="'" '$0 == q { on = 0 } on { print } $0 == "METRIC_IDENTITY_SCRIPT=" q { on = 1; print "" }' \
+        "${workspace}/dedented.yml" > "${workspace}/identity.sh"
+    for text in "definitions.sh 88598 2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661" \
+                "identity.sh 956 9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b"; do
+        name="${text%% *}"
+        assert_eq "${text#* }" "$(wc -c < "${workspace}/${name}") $(sha256sum < "${workspace}/${name}" | cut -d ' ' -f 1)" \
+            "S110: the frozen ${name%.sh} block of M has its bytes and SHA-256"
+    done
+
+    # The CI filters: the two new paths in both the push and the pull_request
+    # filter, and no other change of the file of M.
+    assert_eq "2cf81f8299d6c0ae0e9bf2b67692bd593478a3e03a9fa0c61f7188610e0e2f96" \
+        "$(grep -vxF -e "      - '.github/workflows/m3-identity-diagnostic.yml'" \
+            -e "      - '.github/scripts/m3-identity-diagnostic.py'" "$CONTRACT_WORKFLOW" | sha256sum | cut -d ' ' -f 1)" \
+        "S110: without the two new paths, batch-contract.yml is the file of M"
+    assert_eq "push 2 pull_request 2" "$(awk -v a="      - '.github/workflows/m3-identity-diagnostic.yml'" \
+        -v b="      - '.github/scripts/m3-identity-diagnostic.py'" '
+            /^  push:$/ { e = "push" } /^  pull_request:$/ { e = "pull_request" } /^  workflow_dispatch:$/ { e = "" }
+            e != "" && ($0 == a || $0 == b) { n[e]++ }
+            END { printf "push %d pull_request %d", n["push"], n["pull_request"] }' "$CONTRACT_WORKFLOW")" \
+        "S110: the push filter and the pull_request filter each hold the two new paths"
+    assert_eq "121506 d52c15e694af2312bd4e8aa20d4ed15d9c8453559a97f21e609538acde2be647" \
+        "$(wc -c < "$CONTRACT_WORKFLOW") $(sha256sum < "$CONTRACT_WORKFLOW" | cut -d ' ' -f 1)" \
+        "S110: batch-contract.yml is the approved file with the four entries at their places"
+
+    # The workflow: manual only with no input, read-only contents, one 15-minute
+    # job, the fixed steps, the two fixed helper calls, the pinned provision
+    # through the bounded runner of M, and an always eligible summary and upload.
+    bytes="$(wc -c < "$carrier")"
+    (( bytes <= 16384 )) || _fail "S110: the workflow has at most 16384 bytes" "actual: ${bytes}"
+    assert_eq "name on permissions jobs" "$(grep -oE '^[a-z]+:' "$carrier" | tr -d ':' | paste -sd ' ' -)" \
+        "S110: the workflow has only the four top-level keys"
+    assert_eq "$(printf '%s\n' 'on:' '  workflow_dispatch:' '' 'permissions:' '  contents: read' '' 'jobs:' \
+        '  identity-diagnostic:' '    name: M3 identity diagnostic' '    runs-on: ubuntu-24.04' '    timeout-minutes: 15' \
+        '    defaults:' '      run:' '        shell: bash' '    steps:')" \
+        "$(sed -n -e '/^on:$/,/^    steps:$/p' "$carrier")" \
+        "S110: one manual trigger with no input, read-only contents, and one 15-minute job"
+    assert_eq "1" "$(awk '/^jobs:$/ { j = 1; next } j && /^  [^ ]/ { n++ } END { print n + 0 }' "$carrier")" \
+        "S110: the workflow has one job"
+    assert_eq "Start the diagnostic clock|Check out the repository|Run the synthetic identity guards|Provision the pinned OpenFOAM package|Run the identity diagnostic|Write the job summary|Upload the diagnostic evidence" \
+        "$(sed -n -e 's/^      - name: //p' "$carrier" | paste -sd '|' -)" "S110: the fixed step list"
+    for text in \
+        "Check out the repository|        uses: actions/checkout@v5|        with:|          persist-credentials: false|          fetch-depth: 1" \
+        "Run the synthetic identity guards|        id: guards|        run: python3 .github/scripts/m3-identity-diagnostic.py --self-test" \
+        "Run the identity diagnostic|        if: \${{ !cancelled() && steps.guards.outcome == 'success' }}|        run: python3 .github/scripts/m3-identity-diagnostic.py" \
+        "Upload the diagnostic evidence|        if: \${{ always() }}|        uses: actions/upload-artifact@v4|        with:|          name: m3-identity-diagnostic|          path: \${{ runner.temp }}/m3-identity-diagnostic|          include-hidden-files: true|          if-no-files-found: error|          retention-days: 90"; do
+        name="${text%%|*}"
+        assert_eq "      - name: ${text}" \
+            "$(awk -v n="$name" '$0 == "      - name: " n { on = 1; print; next } /^      - name: / { on = 0 } on && NF' "$carrier" |
+                paste -sd '|' -)" "S110: the step [${name}] is exact"
+    done
+    assert_eq "        if: \${{ always() }}" \
+        "$(awk '$0 == "      - name: Write the job summary" { getline; print }' "$carrier")" "S110: the summary is always eligible"
+    for text in "            curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash" \
+                "            sudo apt-get update" "            sudo apt-get install -y --no-install-recommends \"\$1\"" \
+                "          ' _ openfoam2512-default=2512.0-2 > \"\${idir}/install.log\" 2>&1" \
+                "          run_bounded \"\${idir}/status\" \"\${idir}/timeout.log\" 15 \"\$seconds\" bash -c '" \
+                "          (( seconds <= 165 )) || seconds=165" "          source \"\${idir}/lib.sh\""; do
+        assert_eq "1" "$(grep -cxF -- "$text" "$carrier")" "S110: the provision holds the line [${text}] once"
+    done
+    for text in "2 python3" "4 sudo" "1 f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5" \
+                "0 secrets." "0 id-token" "0 : write" "0 inputs" "0 pull_request" "0 push:" "0 schedule" "0 workflow_call" \
+                "0 continue-on-error" "0 token" "0 GITHUB_TOKEN"; do
+        assert_eq "${text%% *}" "$(grep -cF -- "${text#* }" "$carrier")" "S110: the workflow holds [${text#* }] ${text%% *} times"
+    done
+
+    # The helper: at most 32768 bytes, standard-library imports only, the frozen
+    # source hashes, the two fixed entries, no provision vector, and a driver that
+    # calls metric_identity only.
+    bytes="$(wc -c < "$helper")"
+    (( bytes <= 32768 )) || _fail "S110: the helper has at most 32768 bytes" "actual: ${bytes}"
+    assert_eq "import hashlib|import os|import re|import resource|import shlex|import shutil|import signal|import subprocess|import sys|import tempfile|import time|from pathlib import Path" \
+        "$(grep -E '^[[:space:]]*(import|from)[[:space:]]' "$helper" | paste -sd '|' -)" "S110: the helper imports only the standard library"
+    for text in 65446acba49eac2b371c6dc8afabceac052a1b9a90fae870f6af6b4b191ecb92 \
+                f45ab757cb0d9b2d18eac5e0208643a6d43a32a634a35ff1d0456857b95129f5 \
+                2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661 \
+                9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b \
+                8ba5373049732316ad06dacb08ec8ee4081330efa6542b51b4901f0fc06714ba \
+                89214fbad0e5d2d65243562fb87cb551cbeae7bc29111d1af863c55111654612 \
+                2578396818831bd18856bf7735682cf127f1cbfc9709fd5afba6ba37f2ee1b83 \
+                f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5 \
+                "{(): 'native', ('--self-test',): 'self-test'}.get(tuple(argv))"; do
+        assert_eq "1" "$(grep -cF -- "$text" "$helper")" "S110: the helper holds [${text}] once"
+    done
+    for text in shell=True os.system 'eval(' 'exec(' __import__ importlib urllib socket http.client ctypes pickle \
+                add-debian-repo 'apt-get install' postProcess run_batch foamToVTK vtk; do
+        assert_eq "0" "$(grep -ciF -- "$text" "$helper")" "S110: the helper holds no [${text}]"
+    done
+    assert_eq "metric_compare metric_foam_op metric_identity metric_now_ms metric_require metric_source" \
+        "$(grep -oE 'metric_[a-z_]+' "$helper" | sort -u | paste -sd ' ' -)" \
+        "S110: the helper names no other collector function than its fixed source markers"
+    driver="$(awk "/^DRIVER = r'''/ { on = 1 } on { print } on && /^'''\$/ { on = 0 }" "$helper")"
+    assert_eq "metric_identity metric_now_ms" "$(grep -oE 'metric_[a-z_]+' <<< "$driver" | sort -u | paste -sd ' ' -)" \
+        "S110: the driver calls metric_identity only"
+    assert_eq "1 1 1 1" "$(grep -cxF 'source "$1"' <<< "$driver") $(grep -cxF '    export BASH_ENV="$7"' <<< "$driver") $(grep -cxF 'exec 3> "${M_DIR}/trace.txt"' <<< "$driver") $(grep -cxF 'metric_identity || status=$?' <<< "$driver")" \
+        "S110: the driver loads the definitions first, has one trace descriptor, and sets BASH_ENV only for T"
+    assert_eq "1 1" "$(grep -cxF 'BASH_XTRACEFD=3' "$helper") $(grep -cxF "PS4='+IDTRACE \${EPOCHREALTIME} \${BASHPID} \${LINENO} '" "$helper")" \
+        "S110: the trace prelude writes the fixed frames to descriptor 3"
+
+    # The one --self-test call, with a fixture-only token in its environment.
+    temp="${workspace}/runner_temp"
+    mkdir -p -- "$temp"
+    secret="s110-fixture-token-${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+    status=0
+    out="$(cd -- "$REPO_ROOT" && RUNNER_TEMP="$temp" M3D_S110_TOKEN="$secret" \
+        python3 .github/scripts/m3-identity-diagnostic.py --self-test 2>&1)" || status=$?
+    [[ "$status" == 0 ]] || _fail "S110: the one --self-test call ends with status 0" "status: ${status}" "$out"
+    assert_contains "$out" "GUARD_RESULT=PASS" "S110: the self-test reports the guard result"
+    root="${temp}/m3-identity-diagnostic"
+    guard="${root}/guard"
+    receipt="${guard}/receipt.env"
+    assert_eq "m3-identity-diagnostic" "$(ls -A -- "$temp")" "S110: the guards remove their work root"
+    assert_eq "guard" "$(ls -A -- "$root")" "S110: the self-test writes only the guard evidence"
+    assert_eq "RECORD_END=COMPLETE" "$(tail -n 1 -- "$receipt")" "S110: the guard receipt is complete"
+    for key in GUARD_RESULT=PASS GUARD_LABEL=CONTROL_ONLY DIAGNOSTIC_CONTEXT=NO_CASE M3_ACCEPTANCE_EVIDENCE=false \
+               COUNTER_MODEL=CONTROL_7000_MS SOURCE_RESULT=PASS GUARD_CASES=4 NEGATIVE_CHECKS=8 CLEANUP=REMOVED \
+               SECRET_SCAN=CLEAN "CASE_success=0 COMPLETED 0 - B" "CASE_stalled=1 TIMEOUT 124 TIMEOUT T" \
+               "CASE_nonzero=1 FAILED 7 ENVIRONMENT_MISMATCH T" "CASE_overflow=1 FILE_LIMIT 153 RESOURCE_LIMIT B" \
+               "SOURCE_DEFINITIONS=88598 2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661" \
+               "SOURCE_IDENTITY_SCRIPT=956 9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b" \
+               "SOURCE_CLOCK_STOP_OP=7863 8ba5373049732316ad06dacb08ec8ee4081330efa6542b51b4901f0fc06714ba" \
+               "SOURCE_REQUIRE_VALUES=1083 89214fbad0e5d2d65243562fb87cb551cbeae7bc29111d1af863c55111654612" \
+               "SOURCE_IDENTITY_FUNCTION=2521 2578396818831bd18856bf7735682cf127f1cbfc9709fd5afba6ba37f2ee1b83" \
+               "SOURCE_BOUNDED_RUNNER=2722 f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5" \
+               "HELPER_SHA256=$(sha256sum < "$helper" | cut -d ' ' -f 1)"; do
+        assert_eq "1" "$(grep -cxF -- "$key" "$receipt")" "S110: the guard receipt holds [${key}]"
+    done
+    for name in ARGUMENTS SOURCE PATH RECORD CLASSIFY SECRET STOP CLEANUP; do
+        assert_eq "1" "$(grep -cxF -- "NEG_${name}=PASS" "$receipt")" "S110: the pure negative check ${name} passes"
+    done
+    for name in success stalled nonzero overflow; do
+        assert_eq "1 1 0" "$(grep -cxF -- "CASE_${name}_RESULT=PASS" "$receipt") $(grep -cxF RESULT=PASS "${guard}/${name}/case.env") $(grep -c '=FAIL$' "${guard}/${name}/case.env")" \
+            "S110: the ${name} guard passes every check"
+        assert_eq "LABEL=CONTROL_ONLY" "$(grep -x 'LABEL=.*' "${guard}/${name}/case.env")" "S110: the ${name} guard is CONTROL_ONLY"
+        assert_eq $'1 3\tidentity\tWORK\t7000' "$(tail -n +2 "${guard}/${name}/commands.tsv" | wc -l) $(tail -n +2 "${guard}/${name}/commands.tsv" | cut -f 1-4)" \
+            "S110: the ${name} guard runs one identity operation, sequence 3, with the 7000 ms control limit"
+    done
+
+    # The retained guard evidence, independent of the receipt.
+    assert_eq $'PACKAGE=openfoam2512-default\nPACKAGE_VERSION=2512.0-2' "$(cat -- "${guard}/stalled/03-identity.out")" \
+        "S110: the stalled guard keeps its partial output before the stalled query"
+    text="$(tail -n 1 -- "${guard}/stalled/trace.txt")"
+    pattern='^\++IDTRACE [0-9]+\.[0-9]+ [0-9]+ [0-9]+ dpkg-query .* openfoam2512$'
+    [[ "$text" =~ $pattern ]] || _fail "S110: the last trace frame of the stalled guard is the stalled core-package query" "frame: ${text}"
+    assert_eq "0 0" "$(wc -c < "${guard}/success/trace.txt") $(wc -c < "${guard}/overflow/trace.txt")" \
+        "S110: the untraced guards leave the trace descriptor empty"
+    assert_contains "$(cat -- "${guard}/nonzero/trace.txt")" ": M3D_SECRET_PROBE=absent" \
+        "S110: the traced bashrc sees no fixture secret"
+    assert_eq "" "$(cat -- "${guard}/stalled/trace.txt" "${guard}/nonzero/trace.txt" | grep -F M3D_FAKE_TOOL_SENTINEL || true)" \
+        "S110: no fake tool outside the identity Bash is traced"
+    read -r _ observed retained _ state <<< "$(grep '^FILE_STDOUT=' "${guard}/overflow/case.env" | cut -d '=' -f 2-)"
+    (( observed > 1048576 && retained == 65536 )) && [[ "$state" == PARTIAL_PREFIX ]] ||
+        _fail "S110: the overflow guard keeps a bounded prefix and no complete stream" "observed: ${observed}" "retained: ${retained}" "state: ${state}"
+    assert_eq "" "$(grep -rlF -- "$secret" "$temp" || true)" "S110: the fixture token is in no retained file"
+    assert_eq "" "$(find "$temp" \( -type l -o -name '*.csv' -o -name '*.vtu' -o -name '*.vtk' -o -name 'forbidden-ran' \) -print)" \
+        "S110: no link, Case file, or forbidden-command marker is retained"
+    assert_eq "" "$(find "${REPO_ROOT}/.github" -name '__pycache__' -print)" "S110: the self-test writes no bytecode"
+    assert_eq "1" "$(( $(find "$guard" -type f | wc -l) <= 256 && $(find "$guard" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }') <= 524288 ))" \
+        "S110: the guard evidence has at most 256 files and 524288 bytes"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -11340,6 +11531,7 @@ AB_OBSERVATIONS=(
     s107_readback_keeps_the_frozen_blocks_and_interface
     s108_readback_pass_needs_a_clean_native_exit
     s109_readback_pass_needs_the_final_records
+    s110_identity_diagnostic_carrier
 )
 
 # One observation runs in this process when the caller names it. The scenario
