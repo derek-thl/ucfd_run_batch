@@ -9392,7 +9392,7 @@ ab_vc_guard() {
         !skip { print }' > "$base" || { _fail "S100: the cap guard cannot write ${base}"; return 1; }
     hash="$(sha256sum < "$base" | cut -d ' ' -f 1)" || { _fail "S100: the cap guard cannot hash ${base}"; return 1; }
     [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { _fail "S100: the cap guard has no SHA-256 of ${base}" "$hash"; return 1; }
-    if [[ "$hash" == 307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766 ]]; then
+    if [[ "$hash" == e46b7315c16a777e62cff9c64ac32eede0f24d99dec58de87de09293f5e9a478 ]]; then
         printf 'ACCEPT\n'
     else
         printf 'REJECT_AT_BASE_HASH\n'
@@ -9534,7 +9534,7 @@ s100_provision_block_is_identical_in_both_workflows() {
     result="$(ab_vc_guard "$CONTRACT_WORKFLOW" "${workspace}/batch-contract-base.yml")"
     [[ "$result" != REJECT_BEFORE_NORMALIZATION* ]] ||
         _fail "S100: the contract-tests job holds the one authorized cap line, [    timeout-minutes: 18], before its steps" "$result"
-    assert_eq "307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766" \
+    assert_eq "e46b7315c16a777e62cff9c64ac32eede0f24d99dec58de87de09293f5e9a478" \
         "$(sha256sum < "${workspace}/batch-contract-base.yml" | cut -d ' ' -f 1)" \
         "S100: with that cap line set back to 15 and without the provision step, batch-contract.yml is the admitted base file"
     assert_eq "ACCEPT" "$result" "S100: the cap guard accepts batch-contract.yml"

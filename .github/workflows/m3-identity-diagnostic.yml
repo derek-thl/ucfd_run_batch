@@ -1,0 +1,132 @@
+name: m3-identity-diagnostic
+
+# The bounded M3 identity diagnostic carrier (Issue #80, admission 6209387364 of
+# approved proposal 6207516357, Sections 3 to 8). Manual only, with no input.
+#
+# One job, in this order: the clock start T0; the checkout; the four synthetic
+# identity guards (CONTROL_ONLY); one pinned package provision through the
+# bounded runner of M; then the stop proof of the provision, one untraced
+# baseline B of the original metric_identity, and at most one trace T after the
+# original identity TIMEOUT of B. All package and probe work ends by T0 + 720
+# seconds. No Case, Stage, selector, metric calculation, or reader runs, and no
+# result is M3 acceptance evidence. The summary and the text artifact are always
+# eligible; their success never replaces a diagnostic result.
+#
+# This file grants no dispatch. A native run needs a separate human Owner
+# decision after integration.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity-diagnostic:
+    name: M3 identity diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Start the diagnostic clock
+        run: |
+          set -euo pipefail
+          t0="$(date +%s%3N)"
+          echo "M3D_T0_MS=${t0}" >> "$GITHUB_ENV"
+          echo "diagnostic clock start: ${t0} ms; the package and probe work ends by $(( t0 + 720000 )) ms"
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run the synthetic identity guards
+        id: guards
+        run: python3 .github/scripts/m3-identity-diagnostic.py --self-test
+
+      - name: Provision the pinned OpenFOAM package
+        run: |
+          set -euo pipefail
+          idir="${RUNNER_TEMP}/m3-identity-diagnostic/install"
+          mkdir -m 700 -- "$idir"
+          read -r uptime _ < /proc/uptime
+          start="$(date +%s%3N)"
+          seconds=$(( (M3D_T0_MS + 720000 - start) / 1000 - 16 ))
+          (( seconds <= 165 )) || seconds=165
+          {
+            echo "MECHANISM=run_bounded and classify_result of the bounded-runner library of M, 15 s grace"
+            echo "VECTOR=curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash; sudo apt-get update; sudo apt-get install -y --no-install-recommends openfoam2512-default=2512.0-2"
+            echo "LIMITATION=the bootstrap URL and the package repositories are not immutable"
+            echo "START_MS=${start}"
+            echo "START_UPTIME=${uptime}"
+            echo "WORK_SECONDS=${seconds}"
+          } > "${idir}/install.env"
+          # The bounded runner of M: the lines of its library heredoc, ten leading
+          # spaces removed, then the frozen SHA-256 before any use.
+          sed -e 's/^ \{10\}//' .github/workflows/openfoam-evidence.yml |
+            awk -v q="'" '$0 == "EVIDENCE_LIB" { on = 0 } on { print } $0 == "cat > \"$LIB\" <<" q "EVIDENCE_LIB" q { on = 1 }' \
+            > "${idir}/lib.sh"
+          lib="$(sha256sum < "${idir}/lib.sh" | cut -d ' ' -f 1)"
+          if [[ "$lib" != f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5 ]] ||
+             [[ -e /usr/lib/openfoam/openfoam2512 ]] || (( seconds < 30 )); then
+            printf 'INSTALL_RESULT=NOT_ATTEMPTED\nRECORD_END=COMPLETE\n' >> "${idir}/install.env"
+            echo "provision: NOT_ATTEMPTED: runner library ${lib}, ${seconds} s, or an existing openfoam2512 tree" >&2
+            exit 1
+          fi
+          source "${idir}/lib.sh"
+          run_bounded "${idir}/status" "${idir}/timeout.log" 15 "$seconds" bash -c '
+            set -euo pipefail
+            curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "$1"
+          ' _ openfoam2512-default=2512.0-2 > "${idir}/install.log" 2>&1
+          result="$(classify_result "${idir}/status" "${idir}/timeout.log")"
+          {
+            echo "END_MS=$(date +%s%3N)"
+            echo "WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS}"
+            echo "CHILD_GROUP=$(cat -- "${idir}/status.pgid" 2> /dev/null || echo NOT_RECORDED)"
+            echo "INSTALL_RESULT=${result}"
+            echo "RECORD_END=COMPLETE"
+          } >> "${idir}/install.env"
+          echo "provision: ${result}"
+          [[ "$result" == SUCCEEDED ]]
+
+      - name: Run the identity diagnostic
+        if: ${{ !cancelled() && steps.guards.outcome == 'success' }}
+        run: python3 .github/scripts/m3-identity-diagnostic.py
+
+      - name: Write the job summary
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          root="${RUNNER_TEMP}/m3-identity-diagnostic"
+          {
+            echo "## M3 identity diagnostic"
+            echo
+            echo "No Case runs. A guard PASS is CONTROL_ONLY. No result is M3 acceptance evidence."
+            for record in guard/receipt.env install/install.env install/stop.env result.env; do
+              echo
+              echo "### ${record}"
+              echo
+              if [[ -f "${root}/${record}" && ! -L "${root}/${record}" ]]; then
+                echo '```text'
+                { head -c 16384 -- "${root}/${record}"; echo; } | tr -d '`'
+                echo '```'
+              else
+                echo "NOT_AVAILABLE"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-identity-diagnostic
+          path: ${{ runner.temp }}/m3-identity-diagnostic
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
