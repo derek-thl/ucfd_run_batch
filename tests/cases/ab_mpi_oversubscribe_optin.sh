@@ -9392,7 +9392,7 @@ ab_vc_guard() {
         !skip { print }' > "$base" || { _fail "S100: the cap guard cannot write ${base}"; return 1; }
     hash="$(sha256sum < "$base" | cut -d ' ' -f 1)" || { _fail "S100: the cap guard cannot hash ${base}"; return 1; }
     [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { _fail "S100: the cap guard has no SHA-256 of ${base}" "$hash"; return 1; }
-    if [[ "$hash" == 307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766 ]]; then
+    if [[ "$hash" == e46b7315c16a777e62cff9c64ac32eede0f24d99dec58de87de09293f5e9a478 ]]; then
         printf 'ACCEPT\n'
     else
         printf 'REJECT_AT_BASE_HASH\n'
@@ -9534,7 +9534,7 @@ s100_provision_block_is_identical_in_both_workflows() {
     result="$(ab_vc_guard "$CONTRACT_WORKFLOW" "${workspace}/batch-contract-base.yml")"
     [[ "$result" != REJECT_BEFORE_NORMALIZATION* ]] ||
         _fail "S100: the contract-tests job holds the one authorized cap line, [    timeout-minutes: 18], before its steps" "$result"
-    assert_eq "307ea565ad90ae26d4e168da002c0f17f2de5b1f6cfdf13b2e7783ff440d6766" \
+    assert_eq "e46b7315c16a777e62cff9c64ac32eede0f24d99dec58de87de09293f5e9a478" \
         "$(sha256sum < "${workspace}/batch-contract-base.yml" | cut -d ' ' -f 1)" \
         "S100: with that cap line set back to 15 and without the provision step, batch-contract.yml is the admitted base file"
     assert_eq "ACCEPT" "$result" "S100: the cap guard accepts batch-contract.yml"
@@ -11213,6 +11213,520 @@ s109_readback_pass_needs_the_final_records() {
         "S109: a stopped readback keeps no file PASS in the retained result"
 }
 
+# ---- S110: the M3 identity diagnostic carrier (Issue #80) -------------------
+
+# S110 (admission 6209387364, amended by 6213339238, of approved proposal
+# 6207516357): the manual M3 identity diagnostic carrier. Pure checks of the
+# workflow, the closed helper, the two CI path filters, and the frozen source
+# at M; then exactly one --self-test call, which runs the four synthetic
+# identity guards (CONTROL_ONLY) and the pure negative checks. S110 never calls
+# the normal entry, a package provision, a Case, or a Stage. A guard PASS is
+# instrumentation evidence only: it is no reproduction of the historical
+# identity TIMEOUT and no M3 evidence.
+s110_identity_diagnostic_carrier() {
+    local carrier helper workspace temp root guard receipt out status secret key name text bytes driver pattern
+    local observed retained state
+    carrier="${REPO_ROOT}/.github/workflows/m3-identity-diagnostic.yml"
+    helper="${REPO_ROOT}/.github/scripts/m3-identity-diagnostic.py"
+    # Without the carrier, S110 stops here, before any helper call.
+    assert_file_exists "$carrier" "S110: the identity diagnostic workflow exists"
+    assert_file_exists "$helper" "S110: the identity diagnostic helper exists"
+    workspace="$(new_workspace s110_carrier)"
+
+    # The frozen source at M: the evidence workflow, the baseline file, and two
+    # blocks cut here without the helper (ten leading spaces removed).
+    assert_eq "509823 65446acba49eac2b371c6dc8afabceac052a1b9a90fae870f6af6b4b191ecb92" \
+        "$(wc -c < "$WORKFLOW") $(sha256sum < "$WORKFLOW" | cut -d ' ' -f 1)" "S110: the evidence workflow keeps its bytes of M"
+    assert_eq "f45ab757cb0d9b2d18eac5e0208643a6d43a32a634a35ff1d0456857b95129f5" \
+        "$(sha256sum < "${REPO_ROOT}/.openfoam-version" | cut -d ' ' -f 1)" "S110: .openfoam-version keeps v2512"
+    sed -e 's/^ \{10\}//' "$WORKFLOW" > "${workspace}/dedented.yml"
+    awk '$0 == "# ---- M3 mean speed: end ----" { stop = 1 }
+         $0 == "# ---- M3 mean speed: begin ----" { on = 1 }
+         on && !stop' "${workspace}/dedented.yml" > "${workspace}/definitions.sh"
+    awk -v q="'" '$0 == q { on = 0 } on { print } $0 == "METRIC_IDENTITY_SCRIPT=" q { on = 1; print "" }' \
+        "${workspace}/dedented.yml" > "${workspace}/identity.sh"
+    for text in "definitions.sh 88598 2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661" \
+                "identity.sh 956 9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b"; do
+        name="${text%% *}"
+        assert_eq "${text#* }" "$(wc -c < "${workspace}/${name}") $(sha256sum < "${workspace}/${name}" | cut -d ' ' -f 1)" \
+            "S110: the frozen ${name%.sh} block of M has its bytes and SHA-256"
+    done
+
+    # The CI filters: the two new paths in both the push and the pull_request
+    # filter, and no other change of the file of M.
+    assert_eq "2cf81f8299d6c0ae0e9bf2b67692bd593478a3e03a9fa0c61f7188610e0e2f96" \
+        "$(grep -vxF -e "      - '.github/workflows/m3-identity-diagnostic.yml'" \
+            -e "      - '.github/scripts/m3-identity-diagnostic.py'" "$CONTRACT_WORKFLOW" | sha256sum | cut -d ' ' -f 1)" \
+        "S110: without the two new paths, batch-contract.yml is the file of M"
+    assert_eq "push 2 pull_request 2" "$(awk -v a="      - '.github/workflows/m3-identity-diagnostic.yml'" \
+        -v b="      - '.github/scripts/m3-identity-diagnostic.py'" '
+            /^  push:$/ { e = "push" } /^  pull_request:$/ { e = "pull_request" } /^  workflow_dispatch:$/ { e = "" }
+            e != "" && ($0 == a || $0 == b) { n[e]++ }
+            END { printf "push %d pull_request %d", n["push"], n["pull_request"] }' "$CONTRACT_WORKFLOW")" \
+        "S110: the push filter and the pull_request filter each hold the two new paths"
+    assert_eq "121506 d52c15e694af2312bd4e8aa20d4ed15d9c8453559a97f21e609538acde2be647" \
+        "$(wc -c < "$CONTRACT_WORKFLOW") $(sha256sum < "$CONTRACT_WORKFLOW" | cut -d ' ' -f 1)" \
+        "S110: batch-contract.yml is the approved file with the four entries at their places"
+
+    # The SP1 to SP4 correction cases (contract 6219483894, Sections 3 and 4; admission
+    # 6220510488): nineteen pure cases by finding, before the changed expectations and the
+    # self-test. Fakes replace each process start, signal, stop, record, and run binding.
+    cat > "${workspace}/correction.py" <<'PY'
+import contextlib, hashlib, io, os, re, socket, stat, subprocess, sys, tempfile, types
+from pathlib import Path
+
+HELPER, WORKFLOW, BASE = sys.argv[1], sys.argv[2], os.path.realpath(sys.argv[3])
+CODE = compile(open(HELPER, 'rb').read(), 'm3d-helper', 'exec')
+LINES = open(WORKFLOW, encoding='utf-8').read().split('\n')
+S, R = ' ' * 10, 'm3-identity-diagnostic'
+GATE, CALLS, N, BLOCK, TEXT, END = S + 'python3 -I - "$RUNNER_TEMP" <<\'M3D_PACKET\'', [], [0], None, '', 0
+
+def forbidden(*args, **kwargs):
+  CALLS.append(args[:1])
+  raise AssertionError('a real call')
+
+subprocess.Popen = os.killpg = os.kill = os.fork = os.system = socket.socket = forbidden
+
+def step(name):
+  i = LINES.index('      - name: ' + name)
+  return LINES[i:next((k for k in range(i + 1, len(LINES)) if LINES[k].startswith('      - name: ')), len(LINES))]
+
+UPLOAD = next((x[16:] for x in step('Upload the diagnostic evidence') if x.startswith(S + 'path: ')), '')
+SUMMARY = step('Write the job summary')
+if GATE in SUMMARY and S + 'M3D_PACKET' in SUMMARY:
+  END = SUMMARY.index(S + 'M3D_PACKET', SUMMARY.index(GATE))
+  TEXT = ''.join(x[10:] + '\n' for x in SUMMARY[SUMMARY.index(GATE) + 1:END])
+  BLOCK = compile(TEXT, 'm3d-packet', 'exec')
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+def rec(**v): return ''.join(f'{k}={x}\n' for k, x in v.items()) + 'RECORD_END=COMPLETE\n'
+def count(calls, kind): return [c[0] for c in calls].count(kind)
+def visible(temp): return Path(UPLOAD.replace('${{ runner.temp }}', str(temp)))
+
+def write(path, data):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_bytes(data.encode() if isinstance(data, str) else data)
+
+def kvf(path):
+  data = path.read_bytes() if path.is_file() and not path.is_symlink() else b''
+  ok = data.endswith(b'\nRECORD_END=COMPLETE\n')
+  return dict(x.partition('=')[::2] for x in data.decode().split('\n') if ok and '=' in x)
+
+def fresh(name):
+  N[0] += 1
+  temp = Path(BASE, f'{N[0]:02d}-{name}')
+  temp.mkdir(mode=0o700)
+  os.environ['RUNNER_TEMP'] = str(temp)
+  return temp
+
+def helper():
+  h = {'__name__': 'm3d_pure', '__file__': HELPER}
+  exec(CODE, h)
+  return h
+
+def quiet(call):
+  with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    return call()
+
+def throw(value):
+  if isinstance(value, BaseException):
+    raise value
+  return value
+
+LIB = helper()['blocks_of']((Path(HELPER).parents[2] / '.github/workflows/openfoam-evidence.yml').read_bytes())['bounded_runner']
+
+def fakes(h, wait=0, stop='EMPTY', driver=None, stat_fault=False):
+  calls, real = [], h['read']
+  def popen(args, **kwargs):
+    calls.append(('popen', 5000001 + count(calls, 'popen')))
+    driver and driver(Path(args[5]))
+    return types.SimpleNamespace(pid=calls[-1][1], wait=lambda timeout=None: throw(wait), poll=lambda: 0)
+  h.update(read=lambda p: throw(OSError('fake PID/stat read fault')) if stat_fault and str(p)[:6] == '/proc/' else real(p),
+           stop=lambda group, seconds=6.0: calls.append(('stop', group)) or throw(stop),
+           subprocess=types.SimpleNamespace(**{**vars(subprocess), 'Popen': popen}))
+  return calls
+
+def driver(outcome, status, code, ret):
+  def files(pdir):
+    write(pdir / 'driver.env', f'IDENTITY_RETURN={ret}\nM_OUTCOME={outcome}\nM_STATUS={status}\nM_CODE={code}\n'
+          'M_LIMIT=89921\nM_GROUP=5100001\nM_STOP=EMPTY\nDRIVER_END=COMPLETE\n')
+    write(pdir / 'commands.tsv', 'seq\n3\tidentity\tWORK\t89921\n')
+    write(pdir / '03-identity.out', 'PACKAGE=x\n')
+  return files
+
+def prepare(work):
+  def make(temp, got):
+    work.append(Path(tempfile.mkdtemp(prefix='m3-identity-work.', dir=temp)))
+    write(work[0] / 'definitions.sh', ': fake\n')
+    return work[0], []
+  return make
+
+def native(name, outcomes=None, **fake):  # fake binding, source, work root, and provision
+  h, temp, work, probes = helper(), fresh(name), [], []
+  (temp / R / 'guard').mkdir(parents=True)
+  write(temp / 'm3-identity-keep/own.txt', 'keep\n')
+  h.update(binding=lambda g: h['now_ms'](), check_source=lambda *a: {}, prepare=prepare(work), provision=lambda r, s: 'f' * 64)
+  if outcomes:
+    h['native_probe'] = lambda w, r, mode, s: probes.append(mode) or outcomes[mode]
+  calls = fakes(h, **fake)
+  status = quiet(h['native'])
+  return status, kvf(temp / R / 'result.env'), probes, calls, work[0], temp
+
+def a(name, outcomes, observation):
+  status, r, probes = native(name, outcomes)[:3]
+  got = (r.get('TERMINAL_CLASSIFICATION'), r.get('OBSERVATION'), probes, status)
+  return got[:3] == ('EVIDENCE_LIMIT', observation, list(outcomes)) and status != 0, got, r
+
+def a1(): return a('a1', {'B': 'ORIGINAL_TIMEOUT', 'T': 'ORIGINAL_TIMEOUT'}, 'STOP_LOCATION_OBSERVED')[:2]
+def a2(): return a('a2', {'B': 'COMPLETED'}, 'NOT_REPRODUCED')[:2]
+def a3(): return a('a3', {'B': 'DIFFERENT_FAILURE'}, 'DIFFERENT_FAILURE')[:2]
+
+def a4():
+  runs = [a('a4' + t[0], {'B': 'ORIGINAL_TIMEOUT', 'T': t}, o)
+          for t, o in (('COMPLETED', 'TRACE_PERTURBED'), ('DIFFERENT_FAILURE', 'TRACE_DIFFERENT_FAILURE'))]
+  return all(x[0] for x in runs), [x[1] for x in runs]
+
+TICKS, GROUP, BASHRC = int(1000.0 * os.sysconf('SC_CLK_TCK')), 4242, b'export WM_PROJECT_VERSION=v2512\n'
+OLD = [(1, 'S', 0, 1, 1, 0, 'init'), (2, 'S', 0, 0, 2, 0, 'kthreadd'), (900, 'S', 1, 900, 5, 0, 'cron')]
+NEW = [(5000, 'I', 2, 0, TICKS + 50, 0, 'kworker'), (5001, 'S', 1, 5001, TICKS + 60, 1001, 'bash'),
+       (5002, 'Z', 1, 5002, TICKS + 70, 0, 'dpkg')]
+LEADER = (GROUP, 'S', 1, GROUP, TICKS + 1, 1001, 'bash')
+INSTALL = rec(START_MS=1, START_UPTIME='1000.00', END_MS=2, CHILD_GROUP=GROUP, INSTALL_RESULT='SUCCEEDED')
+NO = ('NOT_VERIFIED', 'INSTALL_STOP_UNVERIFIED', False)
+
+def provision(name, before, after, child='STOPPED', env=INSTALL):  # after: records after the stop
+  h, temp, calls = helper(), fresh(name), []
+  for rel, data in (('install/install.env', env), ('install/lib.sh', LIB), ('bashrc', BASHRC)):
+    write(temp / R / rel, data)
+  h.update(stop=lambda group, seconds=6.0: calls.append('stop') or child, BASHRC=str(temp / R / 'bashrc'),
+           procs=lambda: calls.append('procs') or (after if 'stop' in calls else before))
+  st = {'stopped': True}
+  try:
+    value, code = h['provision'](temp / R, st), ''
+  except h['Stop'] as x:
+    value, code = '', x.args[0]
+  r = kvf(temp / R / 'install/stop.env')
+  return (r.get('INSTALL_STOP'), code, st['stopped']), value, calls, r.get('NEW_ROOT_PROCESSES')
+
+def b1():
+  proof, value, calls, new = provision('b1', OLD + [LEADER] + NEW[:1], OLD + NEW)
+  return proof == ('VERIFIED', '', True) and value == sha(BASHRC) and calls == ['stop', 'procs'], (proof, calls)
+
+def b2():
+  rows = OLD + [(6100, 'S', 1, 7777, TICKS + 30, 0, 'python3')]
+  proof, value, calls, new = provision('b2', rows, rows, child='EMPTY')
+  return proof == NO and '6100' in (new or ''), (proof, new)
+
+def b3():
+  start = provision('b3s', OLD, OLD, env=INSTALL.replace('START_UPTIME=1000.00\n', ''))[0]
+  reuse = provision('b3r', OLD + [LEADER], OLD + [(GROUP, 'S', 1, 8888, TICKS + 90, 0, 'reused')])[0]
+  return start == reuse == NO, ('start', start, 'reuse', reuse)
+
+def b4():
+  proof, value, calls, new = provision('b4', OLD, None)
+  return proof == NO and new == 'UNREADABLE', (proof, new)
+
+def finalize(temp):  # the fixed packet block, or nothing
+  if BLOCK is None:
+    return None
+  g = {'__name__': 'm3d_packet'}
+  exec(BLOCK, g)
+  return quiet(lambda: g['main']([str(temp)]))
+
+def walk(top):
+  return sorted((os.path.relpath(p, top), os.lstat(p)) for d, ds, fs in os.walk(top)
+                for p in (os.path.join(d, n) for n in ds + fs) if os.path.islink(p) or not os.path.isdir(p))
+
+def inventory(top):
+  path = top / 'packet.tsv'
+  text = path.read_text() if path.is_file() and not path.is_symlink() else ''
+  return {f[0]: f for f in (x.split('\t') for x in text.split('\n')[1:]) if len(f) == 6}
+
+def bounded(top, raw):  # each broken bound of the upload-visible tree
+  files, inv, env = walk(top) if top.is_dir() else [], inventory(top), kvf(top / 'packet.env')
+  size = sum(s.st_size for _, s in files)
+  why = ['raw evidence tree'] * (top == raw) + [f'{len(files)} files, {size} bytes'] * (not 0 < len(files) <= 256 or size > 8388608)
+  why += ['no NO_CASE packet.env'] * ((env.get('DIAGNOSTIC_CONTEXT'), env.get('M3_ACCEPTANCE_EVIDENCE')) != ('NO_CASE', 'false'))
+  return why + [r for r, s in files if not stat.S_ISREG(s.st_mode) or s.st_size > (65536 if '/' not in r or r.endswith('.env')
+                else 1048576) or r != 'packet.tsv' and inv.get(r, [''] * 6)[2:4] != [str(s.st_size), sha(Path(top, r).read_bytes())]]
+
+def layout(temp, stop='VERIFIED', result='EVIDENCE_LIMIT', extra={}, probes={}):
+  files = {'guard/receipt.env': rec(GUARD_RESULT='PASS', CLEANUP='REMOVED'), 'guard/a/case.env': rec(CASE='a'),
+           'install/install.env': rec(INSTALL_RESULT='SUCCEEDED'), 'install/install.log': 'Setting up\n'}
+  files.update({'install/stop.env': rec(INSTALL_STOP=stop)} if stop else {})
+  files.update({'result.env': rec(TERMINAL_CLASSIFICATION=result), 'inventory.tsv': 'path\n'} if result else {})
+  files.update({f'probe-{m}/probe.env': rec(DRIVER_GROUP_STOP='EMPTY', OPERATION_GROUP_STOP=o) for m, o in probes.items()})
+  for rel, data in {**files, **extra}.items():
+    write(temp / R / rel, data)
+
+def packet(temp):  # bounded with a non-success status, inventory, record, tree, detail
+  status, top = finalize(temp), visible(temp)
+  why = bounded(top, temp / R)
+  return not why and status not in (None, 0), inventory(top), kvf(top / 'packet.env'), top, (status, why[:3])
+
+def c1():
+  h, temp, big = helper(), fresh('c1'), b'apt output line\n' * 196608
+  layout(temp, None, None, {'install/install.log': big})
+  run = dict(x.split('=', 1) for x in ('GITHUB_ACTIONS=true GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main '
+             'GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RUNNER_OS=Linux RUNNER_ARCH=X64 GITHUB_WORKFLOW_REF=o/r/.github/workflows/'
+             f'{R}.yml@refs/heads/main M3D_T0_MS={h["now_ms"]() - 601000}').split())
+  calls = fakes(h)
+  os.environ.update(run)
+  try:
+    code = quiet(h['native'])
+  finally:
+    for key in run: del os.environ[key]
+  limit = kvf(temp / R / 'result.env').get('EVIDENCE_LIMIT', '')
+  ok, inv, env, top, said = packet(temp)
+  row = inv.get('install/install.log', [''] * 6)[1:5]
+  return ok and code != 0 and not calls and limit.startswith('TIME_LIMIT') and row == [
+    '3145728', '1048576', sha(big[:1048576]), 'PARTIAL_PREFIX'], (code, limit[:24], row[:2], said)
+
+def c2():
+  temp, log = fresh('c2'), b'Reading package lists...\n' * 120
+  layout(temp, 'NOT_VERIFIED', extra={'install/install.env': 'START_MS=1\n', 'install/install.log': log})
+  ok, inv, env, top, said = packet(temp)
+  row, got = inv.get('install/install.log', [''] * 6)[1:5], (env.get('PACKET_RESULT'), env.get('DIAGNOSTIC_TERMINAL'))
+  return ok and row[:3] == ['3000', '3000', sha(log)] and row[3] != 'COMPLETE' and got == (
+    'SEALED_WITH_LIMITS', 'EVIDENCE_LIMIT'), (row, got, said)
+
+def c3():
+  temp = fresh('c3')
+  layout(temp, None, None, {'install/install.log': 'Get:1 partial\n'})
+  ok, inv, env, top, said = packet(temp)
+  gate = BLOCK is not None and SUMMARY[END + 1:END + 2] + SUMMARY[-2:] == [S + 'sealed=$?', S + 'exit "$sealed"', '']
+  return ok and gate and UPLOAD == '${{ runner.temp }}/' + R + '/packet' and env.get('DIAGNOSTIC_TERMINAL') == 'MISSING' \
+    and {'install/stop.env', 'result.env'} <= set(env.get('MISSING_RECORDS', '').split()), (UPLOAD, gate, said)
+
+def c4():
+  temp = fresh('c4')
+  want = {'probe-B/03-identity.out': (b'o' * 1048576, 1048576, 'COMPLETE', 'VERIFIED'),
+          'probe-B/03-identity.err': (b'e' * 1048577, 1048576, 'PARTIAL_PREFIX', 'VERIFIED'),
+          'guard/receipt.env': (rec(GUARD_RESULT='FAIL', CLEANUP='CLEANUP_UNVERIFIED').encode(), 65, 'STOP_UNVERIFIED', 'UNVERIFIED'),
+          'probe-T/03-identity.out': (b'PACKAGE=x\n', 10, 'STOP_UNVERIFIED', 'UNVERIFIED')}
+  layout(temp, extra={k: v[0] for k, v in want.items()}, probes={'B': 'EMPTY', 'T': 'NOT_STOPPED'})
+  ok, inv, env, top, said = packet(temp)
+  bad = [k for k, (data, kept, state, stop) in want.items()
+         if inv.get(k, [''])[1:] != [str(len(data)), str(kept), sha(data[:kept]), state, stop]]
+  return ok and not bad, (bad, said)
+
+def c5():
+  temp = fresh('c5')
+  layout(temp, extra={k: b'z' * 2200000 for k in ('install/install.log', 'probe-B/trace.txt', 'probe-T/trace.txt',
+                                                   'guard/b/03-identity.out')}, probes={'B': 'EMPTY', 'T': 'EMPTY'})
+  raw = sum(s.st_size for _, s in walk(temp / R))
+  ok, inv, env, top, said = packet(temp)
+  size = sum(s.st_size for _, s in walk(top)) if top.is_dir() else 0
+  cut = sum(v[4] == 'PARTIAL_PREFIX' for v in inv.values())
+  return ok and raw > 8388608 and 0 < size <= 8388608 and cut == 4, (raw, size, cut, said)
+
+def c6():
+  temp = fresh('c6')
+  layout(temp, extra={f'guard/a/f{i:03d}.out': f'{i}\n' for i in range(257)})
+  raw = len(walk(temp / R))
+  ok, inv, env, top, said = packet(temp)
+  files, out = len(walk(top)) if top.is_dir() else 0, sum(v[4][:8] == 'EXCLUDED' for v in inv.values())
+  return ok and raw > 256 and 0 < files <= 256 and out, (raw, files, out, said)
+
+def c7():
+  temp, bad = fresh('c7'), {'identities.env': b'A=' + b'r' * 65514 + b'\nRECORD_END=COMPLETE\n', 'install/bad name.log': 'x\n'}
+  layout(temp, extra=bad)
+  os.symlink('install.env', temp / R / 'install/link.log')
+  ok, inv, env, top, said = packet(temp)
+  entered = sorted({*bad, 'install/link.log'} & {r for r, _ in (walk(top) if top.is_dir() else [])})
+  out = sum(v[4][:8] == 'EXCLUDED' for v in inv.values())
+  return ok and not entered and out >= 3, (entered, out, said)
+
+SAFE = (1, 'CLEANUP_UNVERIFIED', True)
+
+def d(name, **fake):
+  status, r, probes, calls, work, temp = native(name, **fake)
+  return (count(calls, 'stop'), count(calls, 'popen'), r.get('CLEANUP'), work.is_dir()), r, calls, temp
+
+def d1():
+  proof, h, temp, work = d('d1', stat_fault=True)[0], helper(), fresh('d1g'), []
+  h.update(check_source=lambda *a: {}, prepare=prepare(work))
+  calls = fakes(h, stat_fault=True)
+  try:
+    code = quiet(h['self_test'])
+  finally:
+    os.environ.pop('M3D_FIXTURE_SECRET', None)
+  guard = (count(calls, 'stop'), count(calls, 'popen'), kvf(temp / R / 'guard/receipt.env').get('CLEANUP'), work[0].is_dir())
+  return proof[0] and guard[0] and proof[1:] == guard[1:] == SAFE and code != 0, ('native', proof, 'guard', guard)
+
+def d2():
+  proof, r = d('d2', wait=RuntimeError('fake wait fault'))[:2]
+  return proof[0] and proof[1:] == SAFE and r.get('B_RESULT') == 'NOT_RUN', proof
+
+def d3():
+  raised = d('d3r', stop=OSError('unreadable stop evidence'))[0][1:]
+  unread = d('d3u', stop='NOT_STOPPED', driver=driver('TIMEOUT', 124, 'TIMEOUT', 1))[0][1:]
+  return raised == unread == SAFE, ('stop raises', raised, 'stop unreadable', unread)
+
+def d4():
+  proof, r, calls, temp = d('d4', driver=driver('COMPLETED', 0, '', 0))
+  groups = [c[1] for c in calls if c[0] == 'stop']
+  return (proof[1:] == (1, 'REMOVED', False) and r.get('B_RESULT') == 'COMPLETED' and 5100001 in groups
+          and 'definitions.sh' in (temp / R / 'work-removed.tsv').read_text() and (temp / R / 'probe-B/probe.env').is_file()
+          and (temp / 'm3-identity-keep/own.txt').is_file()), (proof, groups)
+
+results = {}
+for name in [f'{x}{i}' for x, n in zip('ABCD', (4, 4, 7, 4)) for i in range(1, n + 1)]:
+  try:
+    ok, detail = globals()[name.lower()]()
+  except Exception as error:
+    ok, detail = False, f'stopped with {error!r}'
+  results[name] = bool(ok)
+  print(f"S110 CASE {name} {'PASS' if ok else 'FAIL'}: {detail}"[:600])
+for family, x in zip(('SP1', 'SP2', 'SP3', 'SP4'), 'ABCD'):
+  bad = [n for n in results if n[0] == x and not results[n]]
+  print(f'S110 FAMILY {family}', ' '.join(['FAIL'] + bad) if bad else 'PASS')
+failed = list(results.values()).count(False)
+print(f'S110 CORRECTION GROUP: {len(results)} cases, {failed} failed, {len(CALLS)} real calls')
+sys.exit(1 if failed or CALLS or len(results) != 19 else 0)
+PY
+    mkdir -m 700 -- "${workspace}/correction"
+    status=0
+    out="$(env -i PATH="$PATH" LC_ALL=C python3 -I -B "${workspace}/correction.py" "$helper" "$carrier" \
+        "${workspace}/correction" 2>&1)" || status=$?
+    [[ "$status" == 0 ]] || _fail "S110: the nineteen SP1 to SP4 correction cases pass" "$out"
+
+    # The workflow: manual only with no input, read-only contents, one 15-minute
+    # job, the fixed steps, the two fixed helper calls, the pinned provision
+    # through the bounded runner of M, and an always eligible summary and upload.
+    bytes="$(wc -c < "$carrier")"
+    (( bytes <= 16384 )) || _fail "S110: the workflow has at most 16384 bytes" "actual: ${bytes}"
+    assert_eq "name on permissions jobs" "$(grep -oE '^[a-z]+:' "$carrier" | tr -d ':' | paste -sd ' ' -)" \
+        "S110: the workflow has only the four top-level keys"
+    assert_eq "$(printf '%s\n' 'on:' '  workflow_dispatch:' '' 'permissions:' '  contents: read' '' 'jobs:' \
+        '  identity-diagnostic:' '    name: M3 identity diagnostic' '    runs-on: ubuntu-24.04' '    timeout-minutes: 15' \
+        '    defaults:' '      run:' '        shell: bash' '    steps:')" \
+        "$(sed -n -e '/^on:$/,/^    steps:$/p' "$carrier")" \
+        "S110: one manual trigger with no input, read-only contents, and one 15-minute job"
+    assert_eq "1" "$(awk '/^jobs:$/ { j = 1; next } j && /^  [^ ]/ { n++ } END { print n + 0 }' "$carrier")" \
+        "S110: the workflow has one job"
+    assert_eq "Start the diagnostic clock|Check out the repository|Run the synthetic identity guards|Provision the pinned OpenFOAM package|Run the identity diagnostic|Write the job summary|Upload the diagnostic evidence" \
+        "$(sed -n -e 's/^      - name: //p' "$carrier" | paste -sd '|' -)" "S110: the fixed step list"
+    for text in \
+        "Check out the repository|        uses: actions/checkout@v5|        with:|          persist-credentials: false|          fetch-depth: 1" \
+        "Run the synthetic identity guards|        id: guards|        run: python3 .github/scripts/m3-identity-diagnostic.py --self-test" \
+        "Run the identity diagnostic|        if: \${{ !cancelled() && steps.guards.outcome == 'success' }}|        run: python3 .github/scripts/m3-identity-diagnostic.py" \
+        "Upload the diagnostic evidence|        if: \${{ always() }}|        uses: actions/upload-artifact@v4|        with:|          name: m3-identity-diagnostic|          path: \${{ runner.temp }}/m3-identity-diagnostic/packet|          include-hidden-files: true|          if-no-files-found: error|          retention-days: 90"; do
+        name="${text%%|*}"
+        assert_eq "      - name: ${text}" \
+            "$(awk -v n="$name" '$0 == "      - name: " n { on = 1; print; next } /^      - name: / { on = 0 } on && NF' "$carrier" |
+                paste -sd '|' -)" "S110: the step [${name}] is exact"
+    done
+    assert_eq "        if: \${{ always() }}" \
+        "$(awk '$0 == "      - name: Write the job summary" { getline; print }' "$carrier")" "S110: the summary is always eligible"
+    for text in "            curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash" \
+                "            sudo apt-get update" "            sudo apt-get install -y --no-install-recommends \"\$1\"" \
+                "          ' _ openfoam2512-default=2512.0-2 > \"\${idir}/install.log\" 2>&1" \
+                "          run_bounded \"\${idir}/status\" \"\${idir}/timeout.log\" 15 \"\$seconds\" bash -c '" \
+                "          (( seconds <= 165 )) || seconds=165" "          source \"\${idir}/lib.sh\""; do
+        assert_eq "1" "$(grep -cxF -- "$text" "$carrier")" "S110: the provision holds the line [${text}] once"
+    done
+    for text in "3 python3" "4 sudo" "1 f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5" \
+                "0 secrets." "0 id-token" "0 : write" "0 inputs" "0 pull_request" "0 push:" "0 schedule" "0 workflow_call" \
+                "0 continue-on-error" "0 token" "0 GITHUB_TOKEN"; do
+        assert_eq "${text%% *}" "$(grep -cF -- "${text#* }" "$carrier")" "S110: the workflow holds [${text#* }] ${text%% *} times"
+    done
+
+    # The helper: at most 32768 bytes, standard-library imports only, the frozen
+    # source hashes, the two fixed entries, no provision vector, and a driver that
+    # calls metric_identity only.
+    bytes="$(wc -c < "$helper")"
+    (( bytes <= 32768 )) || _fail "S110: the helper has at most 32768 bytes" "actual: ${bytes}"
+    assert_eq "import hashlib|import os|import re|import resource|import shlex|import shutil|import signal|import subprocess|import sys|import tempfile|import time|from pathlib import Path" \
+        "$(grep -E '^[[:space:]]*(import|from)[[:space:]]' "$helper" | paste -sd '|' -)" "S110: the helper imports only the standard library"
+    for text in 65446acba49eac2b371c6dc8afabceac052a1b9a90fae870f6af6b4b191ecb92 \
+                f45ab757cb0d9b2d18eac5e0208643a6d43a32a634a35ff1d0456857b95129f5 \
+                2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661 \
+                9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b \
+                8ba5373049732316ad06dacb08ec8ee4081330efa6542b51b4901f0fc06714ba \
+                89214fbad0e5d2d65243562fb87cb551cbeae7bc29111d1af863c55111654612 \
+                2578396818831bd18856bf7735682cf127f1cbfc9709fd5afba6ba37f2ee1b83 \
+                f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5 \
+                "{(): 'native', ('--self-test',): 'self-test'}.get(tuple(argv))"; do
+        assert_eq "1" "$(grep -cF -- "$text" "$helper")" "S110: the helper holds [${text}] once"
+    done
+    for text in shell=True os.system 'eval(' 'exec(' __import__ importlib urllib socket http.client ctypes pickle \
+                add-debian-repo 'apt-get install' postProcess run_batch foamToVTK vtk; do
+        assert_eq "0" "$(grep -ciF -- "$text" "$helper")" "S110: the helper holds no [${text}]"
+    done
+    assert_eq "metric_compare metric_foam_op metric_identity metric_now_ms metric_require metric_source" \
+        "$(grep -oE 'metric_[a-z_]+' "$helper" | sort -u | paste -sd ' ' -)" \
+        "S110: the helper names no other collector function than its fixed source markers"
+    driver="$(awk "/^DRIVER = r'''/ { on = 1 } on { print } on && /^'''\$/ { on = 0 }" "$helper")"
+    assert_eq "metric_identity metric_now_ms" "$(grep -oE 'metric_[a-z_]+' <<< "$driver" | sort -u | paste -sd ' ' -)" \
+        "S110: the driver calls metric_identity only"
+    assert_eq "1 1 1 1" "$(grep -cxF 'source "$1"' <<< "$driver") $(grep -cxF '    export BASH_ENV="$7"' <<< "$driver") $(grep -cxF 'exec 3> "${M_DIR}/trace.txt"' <<< "$driver") $(grep -cxF 'metric_identity || status=$?' <<< "$driver")" \
+        "S110: the driver loads the definitions first, has one trace descriptor, and sets BASH_ENV only for T"
+    assert_eq "1 1" "$(grep -cxF 'BASH_XTRACEFD=3' "$helper") $(grep -cxF "PS4='+IDTRACE \${EPOCHREALTIME} \${BASHPID} \${LINENO} '" "$helper")" \
+        "S110: the trace prelude writes the fixed frames to descriptor 3"
+
+    # The one --self-test call, with a fixture-only token in its environment.
+    temp="${workspace}/runner_temp"
+    mkdir -p -- "$temp"
+    secret="s110-fixture-token-${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+    status=0
+    out="$(cd -- "$REPO_ROOT" && RUNNER_TEMP="$temp" M3D_S110_TOKEN="$secret" \
+        python3 .github/scripts/m3-identity-diagnostic.py --self-test 2>&1)" || status=$?
+    [[ "$status" == 0 ]] || _fail "S110: the one --self-test call ends with status 0" "status: ${status}" "$out"
+    assert_contains "$out" "GUARD_RESULT=PASS" "S110: the self-test reports the guard result"
+    root="${temp}/m3-identity-diagnostic"
+    guard="${root}/guard"
+    receipt="${guard}/receipt.env"
+    assert_eq "m3-identity-diagnostic" "$(ls -A -- "$temp")" "S110: the guards remove their work root"
+    assert_eq "guard" "$(ls -A -- "$root")" "S110: the self-test writes only the guard evidence"
+    assert_eq "RECORD_END=COMPLETE" "$(tail -n 1 -- "$receipt")" "S110: the guard receipt is complete"
+    for key in GUARD_RESULT=PASS GUARD_LABEL=CONTROL_ONLY DIAGNOSTIC_CONTEXT=NO_CASE M3_ACCEPTANCE_EVIDENCE=false \
+               COUNTER_MODEL=CONTROL_7000_MS SOURCE_RESULT=PASS GUARD_CASES=4 NEGATIVE_CHECKS=8 CLEANUP=REMOVED \
+               SECRET_SCAN=CLEAN "CASE_success=0 COMPLETED 0 - B" "CASE_stalled=1 TIMEOUT 124 TIMEOUT T" \
+               "CASE_nonzero=1 FAILED 7 ENVIRONMENT_MISMATCH T" "CASE_overflow=1 FILE_LIMIT 153 RESOURCE_LIMIT B" \
+               "SOURCE_DEFINITIONS=88598 2c8682abfe8dd8a1cf89b9a268f7fc361b6b6180dde4374a2a318bcfe6899661" \
+               "SOURCE_IDENTITY_SCRIPT=956 9a43acb03f1fc7d7008be6236a5d8b8e48125646395c10879b7c0945e9387b7b" \
+               "SOURCE_CLOCK_STOP_OP=7863 8ba5373049732316ad06dacb08ec8ee4081330efa6542b51b4901f0fc06714ba" \
+               "SOURCE_REQUIRE_VALUES=1083 89214fbad0e5d2d65243562fb87cb551cbeae7bc29111d1af863c55111654612" \
+               "SOURCE_IDENTITY_FUNCTION=2521 2578396818831bd18856bf7735682cf127f1cbfc9709fd5afba6ba37f2ee1b83" \
+               "SOURCE_BOUNDED_RUNNER=2722 f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5" \
+               "HELPER_SHA256=$(sha256sum < "$helper" | cut -d ' ' -f 1)"; do
+        assert_eq "1" "$(grep -cxF -- "$key" "$receipt")" "S110: the guard receipt holds [${key}]"
+    done
+    for name in ARGUMENTS SOURCE PATH RECORD CLASSIFY SECRET STOP CLEANUP; do
+        assert_eq "1" "$(grep -cxF -- "NEG_${name}=PASS" "$receipt")" "S110: the pure negative check ${name} passes"
+    done
+    for name in success stalled nonzero overflow; do
+        assert_eq "1 1 0" "$(grep -cxF -- "CASE_${name}_RESULT=PASS" "$receipt") $(grep -cxF RESULT=PASS "${guard}/${name}/case.env") $(grep -c '=FAIL$' "${guard}/${name}/case.env")" \
+            "S110: the ${name} guard passes every check"
+        assert_eq "LABEL=CONTROL_ONLY" "$(grep -x 'LABEL=.*' "${guard}/${name}/case.env")" "S110: the ${name} guard is CONTROL_ONLY"
+        assert_eq $'1 3\tidentity\tWORK\t7000' "$(tail -n +2 "${guard}/${name}/commands.tsv" | wc -l) $(tail -n +2 "${guard}/${name}/commands.tsv" | cut -f 1-4)" \
+            "S110: the ${name} guard runs one identity operation, sequence 3, with the 7000 ms control limit"
+    done
+
+    # The retained guard evidence, independent of the receipt.
+    assert_eq $'PACKAGE=openfoam2512-default\nPACKAGE_VERSION=2512.0-2' "$(cat -- "${guard}/stalled/03-identity.out")" \
+        "S110: the stalled guard keeps its partial output before the stalled query"
+    text="$(tail -n 1 -- "${guard}/stalled/trace.txt")"
+    pattern='^\++IDTRACE [0-9]+\.[0-9]+ [0-9]+ [0-9]+ dpkg-query .* openfoam2512$'
+    [[ "$text" =~ $pattern ]] || _fail "S110: the last trace frame of the stalled guard is the stalled core-package query" "frame: ${text}"
+    assert_eq "0 0" "$(wc -c < "${guard}/success/trace.txt") $(wc -c < "${guard}/overflow/trace.txt")" \
+        "S110: the untraced guards leave the trace descriptor empty"
+    assert_contains "$(cat -- "${guard}/nonzero/trace.txt")" ": M3D_SECRET_PROBE=absent" \
+        "S110: the traced bashrc sees no fixture secret"
+    assert_eq "" "$(cat -- "${guard}/stalled/trace.txt" "${guard}/nonzero/trace.txt" | grep -F M3D_FAKE_TOOL_SENTINEL || true)" \
+        "S110: no fake tool outside the identity Bash is traced"
+    read -r _ observed retained _ state <<< "$(grep '^FILE_STDOUT=' "${guard}/overflow/case.env" | cut -d '=' -f 2-)"
+    (( observed > 1048576 && retained == 65536 )) && [[ "$state" == PARTIAL_PREFIX ]] ||
+        _fail "S110: the overflow guard keeps a bounded prefix and no complete stream" "observed: ${observed}" "retained: ${retained}" "state: ${state}"
+    assert_eq "" "$(grep -rlF -- "$secret" "$temp" || true)" "S110: the fixture token is in no retained file"
+    assert_eq "" "$(find "$temp" \( -type l -o -name '*.csv' -o -name '*.vtu' -o -name '*.vtk' -o -name 'forbidden-ran' \) -print)" \
+        "S110: no link, Case file, or forbidden-command marker is retained"
+    assert_eq "" "$(find "${REPO_ROOT}/.github" -name '__pycache__' -print)" "S110: the self-test writes no bytecode"
+    assert_eq "1" "$(( $(find "$guard" -type f | wc -l) <= 256 && $(find "$guard" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }') <= 524288 ))" \
+        "S110: the guard evidence has at most 256 files and 524288 bytes"
+}
+
 # ---- the observation list ---------------------------------------------------
 
 AB_OBSERVATIONS=(
@@ -11340,6 +11854,7 @@ AB_OBSERVATIONS=(
     s107_readback_keeps_the_frozen_blocks_and_interface
     s108_readback_pass_needs_a_clean_native_exit
     s109_readback_pass_needs_the_final_records
+    s110_identity_diagnostic_carrier
 )
 
 # One observation runs in this process when the caller names it. The scenario

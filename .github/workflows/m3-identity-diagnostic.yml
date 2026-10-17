@@ -1,0 +1,285 @@
+name: m3-identity-diagnostic
+
+# The bounded M3 identity diagnostic carrier (Issue #80, admission 6209387364 of
+# approved proposal 6207516357, Sections 3 to 8). Manual only, with no input.
+#
+# One job, in this order: the clock start T0; the checkout; the four synthetic
+# identity guards (CONTROL_ONLY); one pinned package provision through the
+# bounded runner of M; then the stop proof of the provision, one untraced
+# baseline B of the original metric_identity, and at most one trace T after the
+# original identity TIMEOUT of B. All package and probe work ends by T0 + 720
+# seconds. No Case, Stage, selector, metric calculation, or reader runs, and no
+# result is M3 acceptance evidence. The summary seals a bounded text packet
+# (correction 6219483894, Section 4); the upload takes only that packet, never the
+# raw root. Both are always eligible; their success never replaces a diagnostic
+# result.
+#
+# This file grants no dispatch. A native run needs a separate human Owner
+# decision after integration.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity-diagnostic:
+    name: M3 identity diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Start the diagnostic clock
+        run: |
+          set -euo pipefail
+          t0="$(date +%s%3N)"
+          echo "M3D_T0_MS=${t0}" >> "$GITHUB_ENV"
+          echo "diagnostic clock start: ${t0} ms; the package and probe work ends by $(( t0 + 720000 )) ms"
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run the synthetic identity guards
+        id: guards
+        run: python3 .github/scripts/m3-identity-diagnostic.py --self-test
+
+      - name: Provision the pinned OpenFOAM package
+        run: |
+          set -euo pipefail
+          idir="${RUNNER_TEMP}/m3-identity-diagnostic/install"
+          mkdir -m 700 -- "$idir"
+          read -r uptime _ < /proc/uptime
+          start="$(date +%s%3N)"
+          seconds=$(( (M3D_T0_MS + 720000 - start) / 1000 - 16 ))
+          (( seconds <= 165 )) || seconds=165
+          {
+            echo "MECHANISM=run_bounded and classify_result of the bounded-runner library of M, 15 s grace"
+            echo "VECTOR=curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash; sudo apt-get update; sudo apt-get install -y --no-install-recommends openfoam2512-default=2512.0-2"
+            echo "LIMITATION=the bootstrap URL and the package repositories are not immutable"
+            echo "START_MS=${start}"
+            echo "START_UPTIME=${uptime}"
+            echo "WORK_SECONDS=${seconds}"
+          } > "${idir}/install.env"
+          # The bounded runner of M: the lines of its library heredoc, ten leading
+          # spaces removed, then the frozen SHA-256 before any use.
+          sed -e 's/^ \{10\}//' .github/workflows/openfoam-evidence.yml |
+            awk -v q="'" '$0 == "EVIDENCE_LIB" { on = 0 } on { print } $0 == "cat > \"$LIB\" <<" q "EVIDENCE_LIB" q { on = 1 }' \
+            > "${idir}/lib.sh"
+          lib="$(sha256sum < "${idir}/lib.sh" | cut -d ' ' -f 1)"
+          if [[ "$lib" != f7a1f172248b7c744d25cfbd3f00102c00b9e5ca793b403e654112478a480bf5 ]] ||
+             [[ -e /usr/lib/openfoam/openfoam2512 ]] || (( seconds < 30 )); then
+            printf 'INSTALL_RESULT=NOT_ATTEMPTED\nRECORD_END=COMPLETE\n' >> "${idir}/install.env"
+            echo "provision: NOT_ATTEMPTED: runner library ${lib}, ${seconds} s, or an existing openfoam2512 tree" >&2
+            exit 1
+          fi
+          source "${idir}/lib.sh"
+          run_bounded "${idir}/status" "${idir}/timeout.log" 15 "$seconds" bash -c '
+            set -euo pipefail
+            curl -fsSL https://dl.openfoam.com/add-debian-repo.sh | sudo bash
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "$1"
+          ' _ openfoam2512-default=2512.0-2 > "${idir}/install.log" 2>&1
+          result="$(classify_result "${idir}/status" "${idir}/timeout.log")"
+          {
+            echo "END_MS=$(date +%s%3N)"
+            echo "WRAPPER_STATUS=${TIMEOUT_WRAPPER_STATUS}"
+            echo "CHILD_GROUP=$(cat -- "${idir}/status.pgid" 2> /dev/null || echo NOT_RECORDED)"
+            echo "INSTALL_RESULT=${result}"
+            echo "RECORD_END=COMPLETE"
+          } >> "${idir}/install.env"
+          echo "provision: ${result}"
+          [[ "$result" == SUCCEEDED ]]
+
+      - name: Run the identity diagnostic
+        if: ${{ !cancelled() && steps.guards.outcome == 'success' }}
+        run: python3 .github/scripts/m3-identity-diagnostic.py
+
+      - name: Write the job summary
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          root="${RUNNER_TEMP}/m3-identity-diagnostic"
+          # Seal the bounded text packet first (correction 6219483894, Section 4). The upload
+          # takes only root/packet, never the raw root; without a packet the upload fails.
+          python3 -I - "$RUNNER_TEMP" <<'M3D_PACKET'
+          # The sealed packet: bounded prefixes of the raw evidence root, read without links, go into one
+          # new owned staging tree; the checked tree is then renamed to the fixed upload path.
+          # Status 0: sealed without a limit; 1: sealed with a limit; 2: no packet path.
+          import codecs, hashlib, os, re, stat, sys, tempfile
+
+          STREAM, RECORD, PACKET, FILES = 1048576, 65536, 8388608, 256
+          POOL = {'install': 2097152, 'guard': 524288, 'probe-B': 2097152, 'probe-T': 3145728, 'meta': 524288 - 2 * RECORD}
+          NEED = ('guard/receipt.env', 'install/install.env', 'install/stop.env', 'result.env', 'inventory.tsv')
+          SAFE, OWN = re.compile(r'\w[\w.-]*(/\w[\w.-]*)*', re.A), ('packet.env', 'packet.tsv')
+          RAW = re.compile(r'(.*/)?(core(\.\d+)?|.*\.(vtu|vtk|vtp|csv|deb))')
+
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def scan(top, rel=''):
+              # Each entry below top, sorted, links not followed: (relative path, lstat).
+              out = []
+              for entry in sorted(os.scandir(os.path.join(top, rel)), key=lambda e: e.name):
+                  path, info = rel + entry.name, entry.stat(follow_symlinks=False)
+                  out += scan(top, path + '/') if stat.S_ISDIR(info.st_mode) else [(path, info)]
+              return out
+
+
+          def prefix(path, cap):
+              # One bounded read of a regular file without a link: (observed bytes, prefix).
+              with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as f:
+                  info = os.fstat(f.fileno())
+                  if not stat.S_ISREG(info.st_mode):
+                      raise OSError(f'{path} is no regular file')
+                  data = f.read(cap)
+              return max(info.st_size, len(data)), data
+
+
+          def record(path):
+              # The values of one complete KEY=value record of at most RECORD bytes, else {}.
+              try:
+                  data = prefix(path, RECORD + 1)[1]
+              except OSError:
+                  return {}
+              if len(data) > RECORD or not data.endswith(b'\nRECORD_END=COMPLETE\n'):
+                  return {}
+              return dict(x.partition('=')[::2] for x in data.decode('utf-8', 'replace').split('\n') if '=' in x)
+
+
+          def text(data):
+              try:
+                  codecs.getincrementaldecoder('utf-8')().decode(data)
+              except UnicodeDecodeError:
+                  return False
+              return b'\0' not in data
+
+
+          def proofs(src):
+              # The writer-stop proof of each part, from its own complete record.
+              done = ('EMPTY', 'STOPPED')
+              proof = {'': bool(record(os.path.join(src, 'result.env'))),
+                       'guard': bool(record(os.path.join(src, 'guard/receipt.env'))),
+                       'install': record(os.path.join(src, 'install/stop.env')).get('INSTALL_STOP') == 'VERIFIED'}
+              for part in ('probe-B', 'probe-T'):
+                  r = record(os.path.join(src, part, 'probe.env'))
+                  proof[part] = r.get('DRIVER_GROUP_STOP') in done and r.get('OPERATION_GROUP_STOP') in done
+              return proof
+
+
+          def seal(temp):
+              src = os.path.join(temp, 'm3-identity-diagnostic')
+              dst = os.path.join(src, 'packet')
+              for path in (temp, src):
+                  info = os.lstat(path)
+                  if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or os.path.realpath(path) != path:
+                      raise OSError(f'{path} is no owned directory without a link')
+              if os.path.lexists(dst):
+                  raise OSError(f'{dst} exists')
+              stage, proof, pool = tempfile.mkdtemp(prefix='m3-identity-packet.', dir=temp), proofs(src), dict(POOL)
+              hidden = [v for k, v in os.environb.items()
+                        if re.search(rb'TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE', k.upper()) and len(v) >= 8]
+              rows, kept, cut = [], {}, []
+              # Records first, so a flood of streams cannot push out a record; each member is checked.
+              for rel, info in sorted(scan(src), key=lambda x: ('/' in x[0] and not x[0].endswith('.env'), x[0])):
+                  meta, part = '/' not in rel or rel.endswith('.env'), rel.split('/')[0] if '/' in rel else ''
+                  name = 'guard' if part == 'guard' else 'meta' if meta else part
+                  why = ('LINK_OR_SPECIAL' if not stat.S_ISREG(info.st_mode) else 'UNSAFE_PATH' if not SAFE.fullmatch(rel)
+                         else 'UNKNOWN_LAYOUT' if part not in proof or rel in OWN else 'RAW_TYPE' if RAW.fullmatch(rel)
+                         else 'FILE_LIMIT' if len(kept) >= FILES - 2 else 'RECORD_LIMIT' if meta and info.st_size > RECORD
+                         else 'RESERVE_LIMIT' if pool[name] < (info.st_size if meta else 1) else '')
+                  if not why:
+                      observed, data = prefix(os.path.join(src, rel), info.st_size if meta else min(STREAM, pool[name]))
+                      why = 'NON_TEXT' if not text(data) else 'SECRET' if any(v in data for v in hidden) else ''
+                  if why:
+                      rows.append(f'{rel if SAFE.fullmatch(rel) else ascii(rel)}\t{info.st_size}\t0\t-\tEXCLUDED_{why}\t-')
+                      cut.append('EXCLUDED_' + why)
+                      continue
+                  out = os.path.join(stage, rel)
+                  os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
+                  with open(out, 'xb') as f:
+                      f.write(data)
+                  pool[name] -= len(data)
+                  state = 'PARTIAL_PREFIX' if observed > len(data) else 'COMPLETE' if proof[part] else 'STOP_UNVERIFIED'
+                  kept[rel] = (len(data), sha(data))
+                  rows.append(f"{rel}\t{observed}\t{len(data)}\t{sha(data)}\t{state}\t{'VERIFIED' if proof[part] else 'UNVERIFIED'}")
+                  cut += [state] * (state != 'COMPLETE')
+              missing = [x for x in NEED if x not in kept or x.endswith('.env') and not record(os.path.join(stage, x))]
+              terminal = re.sub(r'[^\w.-]', '_', record(os.path.join(src, 'result.env')).get('TERMINAL_CLASSIFICATION', 'MISSING'))
+              limits = [f'{len(cut)} limited members: {" ".join(sorted(set(cut)))}'] * bool(cut) + ['missing records'] * bool(missing)
+              env = (f'PACKET_SCHEMA=m3-identity-packet/1\nDIAGNOSTIC_CONTEXT=NO_CASE\nM3_ACCEPTANCE_EVIDENCE=false\n'
+                     f'PACKAGING_ONLY=true\nPACKET_RESULT={"SEALED_WITH_LIMITS" if limits else "SEALED"}\n'
+                     f'PACKET_LIMITS={"; ".join(limits) or "NONE"}\nDIAGNOSTIC_TERMINAL={terminal[:64]}\n'
+                     f'MISSING_RECORDS={" ".join(missing) or "NONE"}\nMEMBERS={len(kept)}\n'
+                     f'MEMBER_BYTES={sum(n for n, _ in kept.values())}\nRECORD_END=COMPLETE\n').encode()
+              inv = ('path\tobserved_bytes\tretained_bytes\tsha256\tstate\twriter_stop\n' + ''.join(r + '\n' for r in rows)
+                     + f'packet.env\t{len(env)}\t{len(env)}\t{sha(env)}\tCOMPLETE\tVERIFIED\n').encode()
+              if len(inv) > RECORD:
+                  raise OSError('the inventory would hold more than 65536 bytes')
+              for own, data in zip(OWN, (env, inv)):
+                  with open(os.path.join(stage, own), 'xb') as f:
+                      f.write(data)
+              files = scan(stage)
+              if sorted(r for r, _ in files) != sorted([*kept, *OWN]) or len(files) > FILES or \
+                      sum(i.st_size for _, i in files) > PACKET or any(not stat.S_ISREG(i.st_mode) for _, i in files):
+                  raise OSError('the staged packet breaks a bound')
+              for rel, (size, digest) in kept.items():
+                  data = prefix(os.path.join(stage, rel), size + 1)[1]
+                  if (len(data), sha(data)) != (size, digest):
+                      raise OSError(f'{rel} does not hold its inventory bytes')
+              if os.path.lexists(dst):
+                  raise OSError(f'{dst} exists')
+              os.rename(stage, dst)
+              return limits
+
+
+          def main(argv):
+              try:
+                  limits = seal(argv[0])
+              except Exception as error:  # no packet path: the upload finds no file and fails
+                  print(f'm3 identity packet: NOT_SEALED: {error!r}'[:400], file=sys.stderr)
+                  return 2
+              print(f"m3 identity packet: {'SEALED_WITH_LIMITS: ' + '; '.join(limits) if limits else 'SEALED'}"[:400])
+              return 1 if limits else 0
+
+
+          if __name__ == '__main__':
+              sys.exit(main(sys.argv[1:]))
+          M3D_PACKET
+          sealed=$?
+          {
+            echo "## M3 identity diagnostic"
+            echo
+            echo "No Case runs. A guard PASS is CONTROL_ONLY. No result is M3 acceptance evidence."
+            echo "The sealed packet is packaging only; its status never replaces a diagnostic result."
+            for record in guard/receipt.env install/install.env install/stop.env result.env packet/packet.env; do
+              echo
+              echo "### ${record}"
+              echo
+              if [[ -f "${root}/${record}" && ! -L "${root}/${record}" ]]; then
+                echo '```text'
+                { head -c 16384 -- "${root}/${record}"; echo; } | tr -d '`'
+                echo '```'
+              else
+                echo "NOT_AVAILABLE"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$sealed"
+
+      - name: Upload the diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-identity-diagnostic
+          path: ${{ runner.temp }}/m3-identity-diagnostic/packet
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
