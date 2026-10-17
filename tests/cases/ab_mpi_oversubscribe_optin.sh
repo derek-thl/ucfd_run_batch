@@ -11451,7 +11451,7 @@ def bounded(top, raw):  # each broken bound of the upload-visible tree
                 else 1048576) or r != 'packet.tsv' and inv.get(r, [''] * 6)[2:4] != [str(s.st_size), sha(Path(top, r).read_bytes())]]
 
 def layout(temp, stop='VERIFIED', result='EVIDENCE_LIMIT', extra={}, probes={}):
-  files = {'guard/receipt.env': rec(CLEANUP='REMOVED'), 'guard/a/case.env': rec(CASE='a'),
+  files = {'guard/receipt.env': rec(GUARD_RESULT='PASS', CLEANUP='REMOVED'), 'guard/a/case.env': rec(CASE='a'),
            'install/install.env': rec(INSTALL_RESULT='SUCCEEDED'), 'install/install.log': 'Setting up\n'}
   files.update({'install/stop.env': rec(INSTALL_STOP=stop)} if stop else {})
   files.update({'result.env': rec(TERMINAL_CLASSIFICATION=result), 'inventory.tsv': 'path\n'} if result else {})
@@ -11502,6 +11502,7 @@ def c4():
   temp = fresh('c4')
   want = {'probe-B/03-identity.out': (b'o' * 1048576, 1048576, 'COMPLETE', 'VERIFIED'),
           'probe-B/03-identity.err': (b'e' * 1048577, 1048576, 'PARTIAL_PREFIX', 'VERIFIED'),
+          'guard/receipt.env': (rec(GUARD_RESULT='FAIL', CLEANUP='CLEANUP_UNVERIFIED').encode(), 65, 'STOP_UNVERIFIED', 'UNVERIFIED'),
           'probe-T/03-identity.out': (b'PACKAGE=x\n', 10, 'STOP_UNVERIFIED', 'UNVERIFIED')}
   layout(temp, extra={k: v[0] for k, v in want.items()}, probes={'B': 'EMPTY', 'T': 'NOT_STOPPED'})
   ok, inv, env, top, said = packet(temp)
