@@ -165,8 +165,9 @@ jobs:
           def proofs(src):
               # The writer-stop proof of each part, from its own complete record.
               done = ('EMPTY', 'STOPPED')
+              guard = record(os.path.join(src, 'guard/receipt.env'))
               proof = {'': bool(record(os.path.join(src, 'result.env'))),
-                       'guard': bool(record(os.path.join(src, 'guard/receipt.env'))),
+                       'guard': (guard.get('GUARD_RESULT'), guard.get('CLEANUP'), 'GUARD_STOP' in guard) == ('PASS', 'REMOVED', False),
                        'install': record(os.path.join(src, 'install/stop.env')).get('INSTALL_STOP') == 'VERIFIED'}
               for part in ('probe-B', 'probe-T'):
                   r = record(os.path.join(src, part, 'probe.env'))
