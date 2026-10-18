@@ -11506,7 +11506,7 @@ def c4():
           'probe-T/03-identity.out': (b'PACKAGE=x\n', 10, 'STOP_UNVERIFIED', 'UNVERIFIED')}
   layout(temp, extra={k: v[0] for k, v in want.items()}, probes={'B': 'EMPTY', 'T': 'NOT_STOPPED'})
   ok, inv, env, top, said = packet(temp)
-  bad = [k for k, (data, kept, state, stop) in want.items()
+  bad = [inv[k] for k, (data, kept, state, stop) in want.items()
          if inv.get(k, [''])[1:] != [str(len(data)), str(kept), sha(data[:kept]), state, stop]]
   return ok and not bad, (bad, said)
 
