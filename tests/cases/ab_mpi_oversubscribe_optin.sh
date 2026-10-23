@@ -9156,7 +9156,7 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
     # line and its line ending.
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S99: the VTU header reader block is unchanged"
-    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "108588 c0d50f2953deef4ff2763f4042858678bcf1e9b5e7a6ba566c5578f5833c945a" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S99: the M3 mean-speed block is unchanged"
     # The receipt runs once, after the collection, as the last capture item.
     body="$(ab_step_run_body "Capture the evidence")"
@@ -10938,7 +10938,7 @@ s107_readback_keeps_the_frozen_blocks_and_interface() {
     workspace="$(new_workspace s107_interface)"
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S107: the VTU header reader block is unchanged"
-    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "108588 c0d50f2953deef4ff2763f4042858678bcf1e9b5e7a6ba566c5578f5833c945a" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S107: the M3 mean-speed block is unchanged"
     body="$(ab_step_run_body "Capture the evidence")"
     assert_eq $'metric_collect\nfr_capture\nvr_capture' \

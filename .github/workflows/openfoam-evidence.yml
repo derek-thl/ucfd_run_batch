@@ -5417,9 +5417,10 @@ jobs:
           # operation also has a kernel file-size limit (RLIMIT_FSIZE) and no core dump.
           # The total work, cleanup included, ends by the earlier of 180 seconds after
           # its start and 10 seconds before the capture work limit. The selection has 10
-          # seconds, the calculation 60, the inputs, copy, checks, and evidence 90
-          # together, and the cleanup 20. The cleanup time stays free before each other
-          # operation.
+          # seconds, the calculation 60, the inputs, copy, checks, and evidence 80
+          # together, the final log copy and inventory 10, and the cleanup 20. Each other
+          # operation keeps the unused final time and the cleanup time free, and a final
+          # operation keeps the unused cleanup time free.
           #
           # MEAN_SPEED_VERDICT=AVAILABLE needs valid output, unchanged inputs, retained
           # evidence, and a completed cleanup. Every other end gives UNAVAILABLE, no
@@ -5436,7 +5437,8 @@ jobs:
           METRIC_TOTAL_MS=180000
           METRIC_SELECT_MS=10000
           METRIC_CALC_MS=60000
-          METRIC_WORK_MS=90000
+          METRIC_WORK_MS=80000
+          METRIC_FINAL_MS=10000
           METRIC_CLEANUP_MS=20000
           METRIC_KILL_GRACE_MS=5000
           METRIC_STOP_RESERVE_MS=1000
@@ -6045,8 +6047,10 @@ jobs:
           # metric_op <label> <class> <command> [args...] - one bounded operation with
           # standard input from /dev/null and its two logs in M_LOG_DIR, or in M_OUT_FILE
           # and M_ERR_FILE. The limit is the smallest of the class time left and the time
-          # left before the metric end; each class except CLEANUP and FINAL also keeps the
-          # cleanup time free. timeout makes a new process group, and its PID is the
+          # left before the metric end. SELECT, CALC, and WORK also keep the unused FINAL
+          # time and the full cleanup time free; FINAL keeps the unused cleanup time
+          # free. Each class has its own ledger, and no ledger is refilled or reset.
+          # timeout makes a new process group, and its PID is the
           # group ID. The command gets SIGTERM 6 seconds before the limit, and SIGKILL 1
           # second before it. A limit at or below 6 seconds starts nothing. prlimit sets
           # the kernel file-size limit of the command and its children: M_FSIZE, or
@@ -6057,7 +6061,7 @@ jobs:
           # and writes one row to commands.tsv. M_OP_END, when set, is an earlier
           # absolute end for this operation, so a cleanup step never restarts a limit.
           metric_op() {
-              local label="$1" class="$2" start limit left term argument quoted
+              local label="$1" class="$2" start limit left term argument quoted final_left cleanup_left
               shift 2
               M_FILE_LIMIT="${M_FSIZE:-$METRIC_OP_FILE_LIMIT}"
               M_SEQ=$(( M_SEQ + 1 ))
@@ -6079,13 +6083,19 @@ jobs:
               case "$class" in
                   SELECT) limit=$(( METRIC_SELECT_MS - M_SELECT_USED )) ;;
                   CALC) limit=$(( METRIC_CALC_MS - M_CALC_USED )) ;;
-                  WORK|FINAL) limit=$(( METRIC_WORK_MS - M_WORK_USED )) ;;
+                  WORK) limit=$(( METRIC_WORK_MS - M_WORK_USED )) ;;
+                  FINAL) limit=$(( METRIC_FINAL_MS - M_FINAL_USED )) ;;
                   CLEANUP) limit=$(( METRIC_CLEANUP_MS - M_CLEANUP_USED )) ;;
                   *) limit=0 ;;
               esac
+              final_left=$(( METRIC_FINAL_MS - M_FINAL_USED ))
+              (( final_left > 0 )) || final_left=0
+              cleanup_left=$(( METRIC_CLEANUP_MS - M_CLEANUP_USED ))
+              (( cleanup_left > 0 )) || cleanup_left=0
               case "$class" in
-                  CLEANUP|FINAL) left=$(( M_END_MS - start )) ;;
-                  *) left=$(( M_END_MS - METRIC_CLEANUP_MS - start )) ;;
+                  CLEANUP) left=$(( M_END_MS - start )) ;;
+                  FINAL) left=$(( M_END_MS - cleanup_left - start )) ;;
+                  *) left=$(( M_END_MS - final_left - METRIC_CLEANUP_MS - start )) ;;
               esac
               if [[ -n "$M_OP_END" ]] && (( M_OP_END - start < left )); then
                   left=$(( M_OP_END - start ))
@@ -6120,7 +6130,8 @@ jobs:
               case "$class" in
                   SELECT) M_SELECT_USED=$(( M_SELECT_USED + M_ELAPSED )) ;;
                   CALC) M_CALC_USED=$(( M_CALC_USED + M_ELAPSED )) ;;
-                  WORK|FINAL) M_WORK_USED=$(( M_WORK_USED + M_ELAPSED )) ;;
+                  WORK) M_WORK_USED=$(( M_WORK_USED + M_ELAPSED )) ;;
+                  FINAL) M_FINAL_USED=$(( M_FINAL_USED + M_ELAPSED )) ;;
                   CLEANUP) M_CLEANUP_USED=$(( M_CLEANUP_USED + M_ELAPSED )) ;;
               esac
               printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$M_SEQ" "$label" "$class" "$limit" \
@@ -6258,8 +6269,9 @@ jobs:
                 echo "SELECTION_USED_MS=${M_SELECT_USED}"
                 echo "CALCULATION_USED_MS=${M_CALC_USED}"
                 echo "WORK_USED_MS=${M_WORK_USED}"
+                echo "FINAL_USED_MS=${M_FINAL_USED}"
                 echo "CLEANUP_USED_MS=${M_CLEANUP_USED}"
-                echo "LIMITS=total ${METRIC_TOTAL_MS} ms; selection ${METRIC_SELECT_MS} ms; calculation ${METRIC_CALC_MS} ms; inputs, copy, checks, and evidence ${METRIC_WORK_MS} ms; cleanup ${METRIC_CLEANUP_MS} ms, with at most ${METRIC_CHECK_MS} ms for the process check and at least ${METRIC_REMOVE_MS} ms for the removal; ${METRIC_MAX_FILES} input files; ${METRIC_MAX_INPUT_BYTES} input bytes; ${METRIC_MAX_TASK_BYTES} task bytes; ${METRIC_LOG_LIMIT} bytes for each log; ${METRIC_LOGS_LIMIT} log bytes; ${METRIC_EVIDENCE_LIMIT} evidence bytes; file limit ${METRIC_OP_FILE_LIMIT} bytes for each operation except the copy and the calculation; ${METRIC_RECORD_LIMIT} bytes for the time record"
+                echo "LIMITS=total ${METRIC_TOTAL_MS} ms; selection ${METRIC_SELECT_MS} ms; calculation ${METRIC_CALC_MS} ms; inputs, copy, checks, and evidence ${METRIC_WORK_MS} ms; final log copy and inventory ${METRIC_FINAL_MS} ms; cleanup ${METRIC_CLEANUP_MS} ms, with at most ${METRIC_CHECK_MS} ms for the process check and at least ${METRIC_REMOVE_MS} ms for the removal; ${METRIC_MAX_FILES} input files; ${METRIC_MAX_INPUT_BYTES} input bytes; ${METRIC_MAX_TASK_BYTES} task bytes; ${METRIC_LOG_LIMIT} bytes for each log; ${METRIC_LOGS_LIMIT} log bytes; ${METRIC_EVIDENCE_LIMIT} evidence bytes; file limit ${METRIC_OP_FILE_LIMIT} bytes for each operation except the copy and the calculation; ${METRIC_RECORD_LIMIT} bytes for the time record"
               } > "${M_DIR}/result.env"
           }
 
@@ -6635,10 +6647,11 @@ jobs:
           # metric_work - the source, environment, selection, snapshot, calculation,
           # output, and input checks, in order. The first failure ends the work.
           metric_work() {
-              local line="" same
+              local line="" same final_left=$(( METRIC_FINAL_MS - M_FINAL_USED ))
+              (( final_left > 0 )) || final_left=0
               M_POINT=admission
-              if (( M_END_MS - METRIC_CLEANUP_MS - $(metric_now_ms) <= METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )); then
-                  metric_fail TIMEOUT "no time was left for the metric collection, which must end by ${M_END_MS} ms with ${METRIC_CLEANUP_MS} ms kept for the cleanup"
+              if (( M_END_MS - final_left - METRIC_CLEANUP_MS - $(metric_now_ms) <= METRIC_KILL_GRACE_MS + METRIC_STOP_RESERVE_MS )); then
+                  metric_fail TIMEOUT "no time was left for the metric collection, which must end by ${M_END_MS} ms with ${final_left} ms kept for the final evidence and ${METRIC_CLEANUP_MS} ms for the cleanup"
                   return 1
               fi
               M_POINT=source
@@ -7295,7 +7308,7 @@ jobs:
                   readonly ORIGINAL_RUNNER_UID
               fi
               M_OUT_FILE="" M_ERR_FILE="" M_OUT="" M_ERR="" M_LOG_DIR="$M_DIR"
-              M_SELECT_USED=0 M_CALC_USED=0 M_WORK_USED=0 M_CLEANUP_USED=0
+              M_SELECT_USED=0 M_CALC_USED=0 M_WORK_USED=0 M_FINAL_USED=0 M_CLEANUP_USED=0
               M_GROUPS=() M_FILES=()
               M_STOP=EMPTY M_OUTCOME=NOT_STARTED M_STATUS=124 M_GROUP=- M_LIMIT=0 M_ELAPSED=0
               M_CLEANUP=NOT_NEEDED M_VALUE=UNAVAILABLE
