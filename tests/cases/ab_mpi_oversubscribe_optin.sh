@@ -7214,7 +7214,7 @@ s81_collect_keeps_the_workflow_interface() {
         "S81: the exact calculation vector appears once"
     assert_eq "2" "$(grep -cE '^[[:space:]]*metric_foam_op [A-Za-z-]+ [A-Z]+ ' <<< "$body")" \
         "S81: the metric work runs only the two OpenFOAM vectors"
-    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=90000' \
+    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=80000' 'METRIC_FINAL_MS=10000' \
                     'METRIC_CLEANUP_MS=20000' 'METRIC_KILL_GRACE_MS=5000' 'METRIC_STOP_RESERVE_MS=1000' \
                     'METRIC_MAX_FILES=256' 'METRIC_MAX_INPUT_BYTES=2147483648' 'METRIC_MAX_TASK_BYTES=4294967296' \
                     'METRIC_LOG_LIMIT=1048576' 'METRIC_LOGS_LIMIT=8388608' 'METRIC_EVIDENCE_LIMIT=10485760' \
