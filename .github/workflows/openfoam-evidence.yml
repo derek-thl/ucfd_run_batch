@@ -6044,22 +6044,11 @@ jobs:
               return 0
           }
 
-          # metric_op <label> <class> <command> [args...] - one bounded operation with
-          # standard input from /dev/null and its two logs in M_LOG_DIR, or in M_OUT_FILE
-          # and M_ERR_FILE. The limit is the smallest of the class time left and the time
-          # left before the metric end. SELECT, CALC, and WORK also keep the unused FINAL
-          # time and the full cleanup time free; FINAL keeps the unused cleanup time
-          # free. Each class has its own ledger, and no ledger is refilled or reset.
-          # timeout makes a new process group, and its PID is the
-          # group ID. The command gets SIGTERM 6 seconds before the limit, and SIGKILL 1
-          # second before it. A limit at or below 6 seconds starts nothing. prlimit sets
-          # the kernel file-size limit of the command and its children: M_FSIZE, or
-          # METRIC_OP_FILE_LIMIT. A write past it gives SIGXFSZ (status 153). The core
-          # limit of 1 byte stops each core dump, also through a core pipe. Sets M_OUT,
-          # M_ERR, M_STATUS, M_OUTCOME (COMPLETED, FAILED, FILE_LIMIT, TIMEOUT,
-          # NOT_STOPPED, or NOT_STARTED), M_LIMIT, M_FILE_LIMIT, M_GROUP, and M_ELAPSED,
-          # and writes one row to commands.tsv. M_OP_END, when set, is an earlier
-          # absolute end for this operation, so a cleanup step never restarts a limit.
+          # metric_op <label> <class> <command> [args...].
+          # Use least class/end/M_OP_END time; never refill ledgers.
+          # SELECT/CALC/WORK keep unused FINAL + full cleanup; FINAL keeps unused cleanup.
+          # TERM at end-6s; KILL at end-1s; no start at <=6s.
+          # Set status/outcome; keep two logs; append commands.tsv.
           metric_op() {
               local label="$1" class="$2" start limit left term argument quoted final_left cleanup_left
               shift 2

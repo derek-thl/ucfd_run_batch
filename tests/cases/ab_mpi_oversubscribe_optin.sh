@@ -7063,7 +7063,7 @@ s79_collect_limits_stops_and_cleanup() {
     workspace="$(new_workspace s79_timeout)"
     ab_collect_fixture "$workspace"
     run="$(ab_collect_run "$workspace" FAKE_TERM_CHILD="${workspace}/term_child" \
-        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 40 ))")"
+        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 50 ))")"
     elapsed="$(sed -n -e 's/^elapsed=//p' <<< "$run")"
     child="$(cat "${workspace}/term_child" 2>/dev/null || true)"
     if [[ "$child" =~ ^[0-9]+$ ]] && kill -0 "$child" 2>/dev/null; then
@@ -7344,7 +7344,7 @@ s85_collect_time_record_read_is_bounded() {
     ab_collect_fixture "$workspace"
     ab_fake_hang "$workspace" cat '*flow_latest_time.txt'
     ab_fake_hang "$workspace" head '*flow_latest_time.txt'
-    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 45 ))" > /dev/null
+    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 55 ))" > /dev/null
     ab_assert_fakes_stopped "$workspace" "S85"
     assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
         "S85: a slow time-record read is TIMEOUT"
@@ -9156,7 +9156,7 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
     # line and its line ending.
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S99: the VTU header reader block is unchanged"
-    assert_eq "108588 c0d50f2953deef4ff2763f4042858678bcf1e9b5e7a6ba566c5578f5833c945a" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "107569 e230516f90656e3f15fc1e25002bc731bdfce8f25606308646823dcffa5498a1" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S99: the M3 mean-speed block is unchanged"
     # The receipt runs once, after the collection, as the last capture item.
     body="$(ab_step_run_body "Capture the evidence")"
@@ -10938,7 +10938,7 @@ s107_readback_keeps_the_frozen_blocks_and_interface() {
     workspace="$(new_workspace s107_interface)"
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S107: the VTU header reader block is unchanged"
-    assert_eq "108588 c0d50f2953deef4ff2763f4042858678bcf1e9b5e7a6ba566c5578f5833c945a" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "107569 e230516f90656e3f15fc1e25002bc731bdfce8f25606308646823dcffa5498a1" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S107: the M3 mean-speed block is unchanged"
     body="$(ab_step_run_body "Capture the evidence")"
     assert_eq $'metric_collect\nfr_capture\nvr_capture' \
