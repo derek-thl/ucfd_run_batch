@@ -870,8 +870,8 @@ o20_bounded_failure_streams() {
     ad_metric_load
     ad_fx o20a; AD_OUT=$'partial out\n' AD_ERR=$'partial err\n'
     ad_op read WORK 1000 124
-    ad_check "o20: stopped operation keeps partial streams" "TIMEOUT|partial out|partial err" \
-        "${M_OUTCOME}|$(cat "$M_OUT")|$(cat "$M_ERR")"
+    ad_check "o20: stopped operation keeps partial streams" $'TIMEOUT|partial out\n0|partial err\n0' \
+        "${M_OUTCOME}|$(cat "$M_OUT"; printf %s "$?")|$(cat "$M_ERR"; printf %s "$?")"
     ad_check "o20: a 1048576-byte log stays" "YES 1048576 TIMEOUT log-sizes,copy-logs [a.log] [] []" \
         "$(ad_retain o20b $'1048576\ta.log\n' "")"
     ad_check "o20: 1048577-byte log excluded with size, hash, failure" \
