@@ -19,7 +19,9 @@ on:
       - '.github/workflows/openfoam-evidence.yml'
       - '.github/workflows/openfoam-m3-mesh-diagnostic.yml'
       - '.github/workflows/openfoam-m3-metric-validation.yml'
+      - '.github/workflows/m3-identity-diagnostic.yml'
       - '.github/scripts/check-shellcheck-baseline.sh'
+      - '.github/scripts/m3-identity-diagnostic.py'
       - '.github/shellcheck-baseline.gcc'
       - '.openfoam-version'
   pull_request:
@@ -36,7 +38,9 @@ on:
       - '.github/workflows/openfoam-evidence.yml'
       - '.github/workflows/openfoam-m3-mesh-diagnostic.yml'
       - '.github/workflows/openfoam-m3-metric-validation.yml'
+      - '.github/workflows/m3-identity-diagnostic.yml'
       - '.github/scripts/check-shellcheck-baseline.sh'
+      - '.github/scripts/m3-identity-diagnostic.py'
       - '.github/shellcheck-baseline.gcc'
       - '.openfoam-version'
   workflow_dispatch:
