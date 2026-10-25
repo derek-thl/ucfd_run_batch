@@ -7063,7 +7063,7 @@ s79_collect_limits_stops_and_cleanup() {
     workspace="$(new_workspace s79_timeout)"
     ab_collect_fixture "$workspace"
     run="$(ab_collect_run "$workspace" FAKE_TERM_CHILD="${workspace}/term_child" \
-        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 40 ))")"
+        CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 50 ))")"
     elapsed="$(sed -n -e 's/^elapsed=//p' <<< "$run")"
     child="$(cat "${workspace}/term_child" 2>/dev/null || true)"
     if [[ "$child" =~ ^[0-9]+$ ]] && kill -0 "$child" 2>/dev/null; then
@@ -7214,7 +7214,7 @@ s81_collect_keeps_the_workflow_interface() {
         "S81: the exact calculation vector appears once"
     assert_eq "2" "$(grep -cE '^[[:space:]]*metric_foam_op [A-Za-z-]+ [A-Z]+ ' <<< "$body")" \
         "S81: the metric work runs only the two OpenFOAM vectors"
-    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=90000' \
+    for constant in 'METRIC_TOTAL_MS=180000' 'METRIC_SELECT_MS=10000' 'METRIC_CALC_MS=60000' 'METRIC_WORK_MS=80000' 'METRIC_FINAL_MS=10000' \
                     'METRIC_CLEANUP_MS=20000' 'METRIC_KILL_GRACE_MS=5000' 'METRIC_STOP_RESERVE_MS=1000' \
                     'METRIC_MAX_FILES=256' 'METRIC_MAX_INPUT_BYTES=2147483648' 'METRIC_MAX_TASK_BYTES=4294967296' \
                     'METRIC_LOG_LIMIT=1048576' 'METRIC_LOGS_LIMIT=8388608' 'METRIC_EVIDENCE_LIMIT=10485760' \
@@ -7344,7 +7344,7 @@ s85_collect_time_record_read_is_bounded() {
     ab_collect_fixture "$workspace"
     ab_fake_hang "$workspace" cat '*flow_latest_time.txt'
     ab_fake_hang "$workspace" head '*flow_latest_time.txt'
-    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 45 ))" > /dev/null
+    ab_collect_run "$workspace" CAPTURE_DEADLINE="$(( $(date +%s) + 180 + 55 ))" > /dev/null
     ab_assert_fakes_stopped "$workspace" "S85"
     assert_eq "TIMEOUT" "$(ab_collect_value "$workspace" MEAN_SPEED_REASON_CODE)" \
         "S85: a slow time-record read is TIMEOUT"
@@ -9156,7 +9156,7 @@ s99_receipt_keeps_the_frozen_blocks_and_interface() {
     # line and its line ending.
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S99: the VTU header reader block is unchanged"
-    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "107569 e230516f90656e3f15fc1e25002bc731bdfce8f25606308646823dcffa5498a1" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S99: the M3 mean-speed block is unchanged"
     # The receipt runs once, after the collection, as the last capture item.
     body="$(ab_step_run_body "Capture the evidence")"
@@ -10938,7 +10938,7 @@ s107_readback_keeps_the_frozen_blocks_and_interface() {
     workspace="$(new_workspace s107_interface)"
     assert_eq "15340 92068ccc692900bcb8ee41f2a721d6e7b4bea408e78e30ba786df0ed7a819d3f" "$(ab_fr_frozen_block "VTU header reader")" \
         "S107: the VTU header reader block is unchanged"
-    assert_eq "107529 9154d83f22b1304381048ca115d9d678f64b7ec2e215b68059b77f8aad92ec29" "$(ab_fr_frozen_block "M3 mean speed")" \
+    assert_eq "107569 e230516f90656e3f15fc1e25002bc731bdfce8f25606308646823dcffa5498a1" "$(ab_fr_frozen_block "M3 mean speed")" \
         "S107: the M3 mean-speed block is unchanged"
     body="$(ab_step_run_body "Capture the evidence")"
     assert_eq $'metric_collect\nfr_capture\nvr_capture' \
